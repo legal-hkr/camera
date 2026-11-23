@@ -93,6 +93,12 @@ class CameraProbe(private val manager: CameraManager) {
         put("settingsOverrides", jsonOf(get(CameraCharacteristics.CONTROL_AVAILABLE_SETTINGS_OVERRIDES)))
         put("lowLightBoost", Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM && get(CameraCharacteristics.CONTROL_AE_AVAILABLE_MODES)?.contains(CameraMetadata.CONTROL_AE_MODE_ON_LOW_LIGHT_BOOST_BRIGHTNESS_PRIORITY) == true)
         put("dynamicRangeProfiles", jsonOf(get(CameraCharacteristics.REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES)))
+        // Which profiles one capture request may target together (an 8-bit analysis stream next to an HLG preview needs STANDARD in HLG10's list)
+        get(CameraCharacteristics.REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES)?.let { ranges ->
+            put("dynamicRangeRequestConstraints", buildJsonObject {
+                for (profile in ranges.supportedProfiles) put(Names.dynamicRange(profile), jsonOf(ranges.getProfileCaptureRequestConstraints(profile).map { Names.dynamicRange(it) }))
+            })
+        }
         put("recommendedTenBitProfile", jsonOf(get(CameraCharacteristics.REQUEST_RECOMMENDED_TEN_BIT_DYNAMIC_RANGE_PROFILE)?.let { Names.dynamicRange(it) }))
         put("colorSpaceProfiles", jsonOf(get(CameraCharacteristics.REQUEST_AVAILABLE_COLOR_SPACE_PROFILES)))
         put("streamUseCases", jsonOf(get(CameraCharacteristics.SCALER_AVAILABLE_STREAM_USE_CASES)?.map { Names.streamUseCase(it) }))

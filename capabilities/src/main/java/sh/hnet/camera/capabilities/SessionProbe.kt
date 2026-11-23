@@ -166,6 +166,44 @@ class SessionProbe(private val manager: CameraManager) {
                 if (hlg && jpegR != null) add(Combination("motion photo: preview HLG + video 1080p HLG + JPEG_R", listOf(preview(h), video(fhd, h), still(ImageFormat.JPEG_R, jpegR)), fps30))
                 if (yuv != null) add(Combination("motion photo: preview + video 1080p + YUV full size", listOf(preview(), video(fhd), Output("still", ImageFormat.YUV_420_888, yuv)), fps30))
             }
+            addAll(photoLadders(map, hlg, previewUsage, videoUsage, previewUseCase, videoUseCase, stillUseCase))
+        }
+    }
+
+    /**
+     * The camera app's photo sessions (LOGIKA §2.1), best first, for 4:3 and 16:9: preview, the motion photo's video stream in the preview's size, the still and a small analysis stream
+     * (QR codes, the finder glass' blur) – 8-bit YUV or, next to an HLG preview, 10-bit P010, since one request may not mix every profile.
+     */
+    private fun photoLadders(map: StreamConfigurationMap, hlg: Boolean, previewUsage: Long, videoUsage: Long, previewUseCase: Long?, videoUseCase: Long?, stillUseCase: Long?): List<Combination> {
+        fun sizes(format: Int): List<Size> = runCatching { map.getOutputSizes(format)?.toList() }.getOrNull().orEmpty()
+        fun largestOf(format: Int, width: Int, height: Int) = sizes(format).filter { it.width * height == it.height * width }.maxByOrNull { area(it) }
+        fun smallestAtLeast(format: Int, width: Int) = sizes(format).filter { it.width >= width && it.width * 3 == it.height * 4 }.minByOrNull { area(it) }
+        val fps30 = Range(30, 30)
+        val h = DynamicRangeProfiles.HLG10
+        return buildList {
+            for ((name, w, ht) in listOf(Triple("4:3", 4, 3), Triple("16:9", 16, 9))) {
+                val previewSize = sizes(ImageFormat.PRIVATE).filter { it.width <= 1920 && it.width * ht == it.height * w }.maxByOrNull { area(it) } ?: continue
+                val jpegR = largestOf(ImageFormat.JPEG_R, w, ht)
+                val jpeg = largestOf(ImageFormat.JPEG, w, ht)
+                val yuvSmall = smallestAtLeast(ImageFormat.YUV_420_888, 320)
+                val p010Small = smallestAtLeast(ImageFormat.YCBCR_P010, 320)
+                fun preview(profile: Long) = Output("preview", ImageFormat.PRIVATE, previewSize, previewUsage, profile, previewUseCase ?: 0)
+                fun motion(profile: Long) = Output("motion", ImageFormat.PRIVATE, previewSize, videoUsage, profile, videoUseCase ?: 0)
+                fun still(format: Int, size: Size) = Output("still", format, size, useCase = stillUseCase ?: 0)
+                fun analysis(profile: Long) = (if (profile == h) p010Small?.let { Output("analysis", ImageFormat.YCBCR_P010, it, profile = h) } else yuvSmall?.let { Output("analysis", ImageFormat.YUV_420_888, it) })
+                val stills = listOfNotNull(jpegR?.let { "JPEG_R" to still(ImageFormat.JPEG_R, it) }, jpeg?.let { "JPEG" to still(ImageFormat.JPEG, it) })
+                val profiles = if (hlg) listOf("HLG" to h, "SDR" to DynamicRangeProfiles.STANDARD) else listOf("SDR" to DynamicRangeProfiles.STANDARD)
+                for ((stillName, stillOutput) in stills) for ((profileName, profile) in profiles) {
+                    val prefix = "app photo $name: preview $profileName + $stillName"
+                    val analysisOutput = analysis(profile)
+                    if (analysisOutput != null) add(Combination("$prefix + motion + analysis", listOf(preview(profile), motion(profile), stillOutput, analysisOutput), fps30))
+                    add(Combination("$prefix + motion", listOf(preview(profile), motion(profile), stillOutput), fps30))
+                    if (analysisOutput != null) add(Combination("$prefix + analysis", listOf(preview(profile), stillOutput, analysisOutput), fps30))
+                    add(Combination(prefix, listOf(preview(profile), stillOutput), fps30))
+                    // The 8-bit analysis stream next to an HLG preview, for when P010 is refused
+                    if (profile == h && yuvSmall != null) add(Combination("$prefix + motion + YUV analysis", listOf(preview(profile), motion(profile), stillOutput, Output("analysis", ImageFormat.YUV_420_888, yuvSmall)), fps30))
+                }
+            }
         }
     }
 }
