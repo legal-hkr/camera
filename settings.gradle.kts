@@ -20,7 +20,9 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "Camera"
-// Device capability detection (platform API only), shared by the diagnostics app and, later, the camera app
+// The camera app (sh.hnet.camera)
+include(":app")
+// Device capability detection (platform API only), shared by the camera app and the diagnostics app
 include(":capabilities")
 // Diagnostics app (sh.hnet.camera.diag): measures what the phone really offers before the camera app is designed
 include(":diag")
