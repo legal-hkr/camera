@@ -590,6 +590,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, onOpenSettings: () -> Uni
     }
 
     val wifiRefused = stringResource(R.string.msg_wifi_refused)
+    val noContactsApp = stringResource(R.string.msg_no_contacts_app)
     qrSheet?.let { content ->
         QrSheet(
             content,
@@ -599,6 +600,10 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, onOpenSettings: () -> Uni
             onWifiRefused = {
                 qrSheet = null
                 explain(wifiRefused)
+            },
+            onNoContactsApp = {
+                qrSheet = null
+                explain(noContactsApp)
             },
         )
     }

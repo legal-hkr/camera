@@ -129,5 +129,8 @@
     <string name="button_copy_password">Copy password</string>
     <string name="button_connect">Connect</string>
     <string name="msg_wifi_refused">This network can’t be added automatically. The system doesn’t support passwords shorter than 8 characters or with non-ASCII characters, or WEP and enterprise networks. Copy the password and connect in Wi-Fi settings.</string>
+    <string name="title_qr_contact">Business card</string>
+    <string name="button_add_contact">Add to contacts</string>
+    <string name="msg_no_contacts_app">No app to save contacts.</string>
     <string name="label_macro">Macro</string>
 </resources>

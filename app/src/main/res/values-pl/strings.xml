@@ -128,5 +128,8 @@
     <string name="button_copy_password">Kopiuj hasło</string>
     <string name="button_connect">Połącz</string>
     <string name="msg_wifi_refused">Nie można dodać tej sieci automatycznie. System nie obsługuje haseł krótszych niż 8 znaków ani ze znakami spoza ASCII, a także sieci WEP i sieci z logowaniem firmowym. Skopiuj hasło i połącz się w ustawieniach Wi-Fi.</string>
+    <string name="title_qr_contact">Wizytówka</string>
+    <string name="button_add_contact">Dodaj do kontaktów</string>
+    <string name="msg_no_contacts_app">Brak aplikacji do zapisania kontaktu.</string>
     <string name="label_macro">Makro</string>
 </resources>

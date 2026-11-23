@@ -8,8 +8,10 @@ import android.content.ClipDescription
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.net.wifi.WifiNetworkSuggestion
 import android.os.PersistableBundle
+import android.provider.ContactsContract
 import android.provider.Settings
 import androidx.annotation.DrawableRes
 import androidx.compose.foundation.Canvas
@@ -45,7 +47,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import androidx.core.content.FileProvider
 import androidx.core.net.toUri
+import java.io.File
 import kotlin.math.hypot
 import sh.hnet.camera.R
 import sh.hnet.camera.camera.QrContent
@@ -79,6 +83,7 @@ fun qrIcon(content: QrContent) = when (content) {
     is QrContent.Link -> R.drawable.ic_link
     is QrContent.Wifi -> R.drawable.ic_wifi
     is QrContent.Text -> R.drawable.ic_notes
+    is QrContent.Contact -> R.drawable.ic_contact_page
 }
 
 /** The suggestion chip's words for a code: the link's domain, the network's name, the text's first words. */
@@ -87,6 +92,7 @@ fun qrChipText(content: QrContent) = when (content) {
     is QrContent.Link -> content.domain
     is QrContent.Wifi -> stringResource(R.string.label_qr_wifi, content.ssid)
     is QrContent.Text -> content.preview
+    is QrContent.Contact -> content.label ?: stringResource(R.string.title_qr_contact)
 }
 
 /**
@@ -94,7 +100,7 @@ fun qrChipText(content: QrContent) = when (content) {
  * another app (the camera has no Internet); a network is offered to the system's own add-network dialog.
  */
 @Composable
-fun QrSheet(content: QrContent, onDismiss: () -> Unit, onNoApp: () -> Unit, onWifiRefused: () -> Unit) {
+fun QrSheet(content: QrContent, onDismiss: () -> Unit, onNoApp: () -> Unit, onWifiRefused: () -> Unit, onNoContactsApp: () -> Unit) {
     val context = LocalContext.current
     val colors = MaterialTheme.colorScheme
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = colors.surfaceContainerLow) {
@@ -104,16 +110,34 @@ fun QrSheet(content: QrContent, onDismiss: () -> Unit, onNoApp: () -> Unit, onWi
                     Icon(painterResource(qrIcon(content)), contentDescription = null, tint = colors.onSecondaryContainer)
                 }
                 Spacer(Modifier.width(16.dp))
-                Text(stringResource(if (content is QrContent.Wifi) R.string.title_qr_wifi else R.string.title_qr_code), style = MaterialTheme.typography.titleLarge)
+                Text(
+                    stringResource(
+                        when (content) {
+                            is QrContent.Wifi -> R.string.title_qr_wifi
+                            is QrContent.Contact -> R.string.title_qr_contact
+                            else -> R.string.title_qr_code
+                        },
+                    ),
+                    style = MaterialTheme.typography.titleLarge,
+                )
             }
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 SelectionContainer {
-                    Text(if (content is QrContent.Wifi) content.ssid else content.raw.trim(), style = MaterialTheme.typography.bodyLarge)
+                    Text(
+                        when (content) {
+                            is QrContent.Wifi -> content.ssid
+                            is QrContent.Contact -> content.label ?: content.phones.firstOrNull() ?: content.emails.first()
+                            else -> content.raw.trim()
+                        },
+                        style = MaterialTheme.typography.bodyLarge,
+                    )
                 }
                 val supporting = when (content) {
                     is QrContent.Link -> listOf(stringResource(R.string.label_qr_link))
                     is QrContent.Text -> listOf(stringResource(R.string.label_qr_text))
                     is QrContent.Wifi -> listOfNotNull(stringResource(R.string.label_qr_wifi_name, content.ssid), content.security?.let { stringResource(R.string.label_qr_wifi_security, it) })
+                    // The card's details one per line; the organization when the name leads
+                    is QrContent.Contact -> listOfNotNull(content.title, content.organization.takeIf { content.name != null }) + content.phones + content.emails + content.urls + listOfNotNull(content.address)
                 }
                 supporting.forEach { Text(it, style = MaterialTheme.typography.bodyMedium, color = colors.onSurfaceVariant) }
             }
@@ -131,6 +155,10 @@ fun QrSheet(content: QrContent, onDismiss: () -> Unit, onNoApp: () -> Unit, onWi
                                 onNoApp()
                             }
                         }) { ButtonContent(R.drawable.ic_open_in_new, stringResource(R.string.button_open)) }
+                    }
+                    is QrContent.Contact -> {
+                        OutlinedButton(onClick = { contactFile(context, content)?.let { share(context, it) } }) { ButtonContent(R.drawable.ic_share, stringResource(R.string.button_share)) }
+                        Button(onClick = { if (addContact(context, content)) onDismiss() else onNoContactsApp() }) { ButtonContent(R.drawable.ic_person_add, stringResource(R.string.button_add_contact)) }
                     }
                     is QrContent.Text -> {
                         OutlinedButton(onClick = { copy(context, content.raw, sensitive = false) }) { ButtonContent(R.drawable.ic_content_copy, stringResource(R.string.button_copy)) }
@@ -190,6 +218,48 @@ private fun copy(context: Context, text: String, sensitive: Boolean) {
     val clip = ClipData.newPlainText("", text)
     if (sensitive) clip.description.extras = PersistableBundle().apply { putBoolean(ClipDescription.EXTRA_IS_SENSITIVE, true) }
     context.getSystemService(ClipboardManager::class.java).setPrimaryClip(clip)
+}
+
+/** The card as a vCard file in the app's cache, offered to other apps through the file provider. */
+private fun contactFile(context: Context, contact: QrContent.Contact): Uri? = runCatching {
+    val dir = File(context.cacheDir, "share").apply { mkdirs() }
+    val file = File(dir, "contact.vcf")
+    file.writeText(contact.vcard)
+    FileProvider.getUriForFile(context, "${context.packageName}.files", file)
+}.getOrNull()
+
+/**
+ * Hands the card to the contacts app (SPEC §7.10, owner 23 Nov 2026): the whole vCard, so nothing on it is lost; an app that takes no files gets the system's
+ * new-contact form filled in. False when no app takes either.
+ */
+private fun addContact(context: Context, contact: QrContent.Contact): Boolean {
+    contactFile(context, contact)?.let { uri ->
+        try {
+            context.startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri, "text/x-vcard").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
+            return true
+        } catch (_: ActivityNotFoundException) {
+        }
+    }
+    val form = Intent(ContactsContract.Intents.Insert.ACTION).setType(ContactsContract.RawContacts.CONTENT_TYPE).apply {
+        contact.name?.let { putExtra(ContactsContract.Intents.Insert.NAME, it) }
+        contact.organization?.let { putExtra(ContactsContract.Intents.Insert.COMPANY, it) }
+        contact.title?.let { putExtra(ContactsContract.Intents.Insert.JOB_TITLE, it) }
+        contact.phones.getOrNull(0)?.let { putExtra(ContactsContract.Intents.Insert.PHONE, it) }
+        contact.phones.getOrNull(1)?.let { putExtra(ContactsContract.Intents.Insert.SECONDARY_PHONE, it) }
+        contact.emails.getOrNull(0)?.let { putExtra(ContactsContract.Intents.Insert.EMAIL, it) }
+        contact.emails.getOrNull(1)?.let { putExtra(ContactsContract.Intents.Insert.SECONDARY_EMAIL, it) }
+        contact.address?.let { putExtra(ContactsContract.Intents.Insert.POSTAL, it) }
+    }
+    return try {
+        context.startActivity(form)
+        true
+    } catch (_: ActivityNotFoundException) {
+        false
+    }
+}
+
+private fun share(context: Context, file: Uri) {
+    context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/x-vcard").putExtra(Intent.EXTRA_STREAM, file).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION), null))
 }
 
 private fun share(context: Context, text: String) {

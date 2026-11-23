@@ -34,3 +34,38 @@ class QrContentTest {
         assertEquals("Krótki", (QrContent.of("  Krótki \n") as QrContent.Text).preview)
     }
 }
+
+class QrContactTest {
+    @Test fun vcard3() {
+        val card = "BEGIN:VCARD\r\nVERSION:3.0\r\nN:Kowalski;Jan;;;\r\nFN:Jan Kowalski\r\nORG:HNet\\, sp. z o.o.\r\nTITLE:Radca prawny\r\nTEL;TYPE=CELL:+48 600 100 200\r\nitem1.EMAIL;TYPE=INTERNET:jan@example.com\r\nURL:https://hnet.sh\r\nADR;TYPE=WORK:;;ul. Długa 1;Warszawa;;00-001;Polska\r\nEND:VCARD"
+        val contact = QrContent.of(card) as QrContent.Contact
+        assertEquals("Jan Kowalski", contact.name)
+        assertEquals("HNet, sp. z o.o.", contact.organization)
+        assertEquals("Radca prawny", contact.title)
+        assertEquals(listOf("+48 600 100 200"), contact.phones)
+        assertEquals(listOf("jan@example.com"), contact.emails)
+        assertEquals("ul. Długa 1, Warszawa, 00-001, Polska", contact.address)
+        // The code's own vCard goes to the contacts app unchanged
+        assertEquals(card, contact.vcard)
+    }
+
+    @Test fun vcard21QuotedPrintableAndFolding() {
+        val card = "BEGIN:VCARD\nVERSION:2.1\nN;CHARSET=UTF-8;ENCODING=QUOTED-PRINTABLE:=C5=81ukasz;=C5=BBak\nTEL;WORK:22\n 1234567\nEND:VCARD"
+        val contact = QrContent.of(card) as QrContent.Contact
+        assertEquals("Żak Łukasz", contact.name)
+        assertEquals(listOf("221234567"), contact.phones)
+    }
+
+    @Test fun mecard() {
+        val contact = QrContent.of("MECARD:N:Nowak,Anna;TEL:+48111222333;EMAIL:anna@example.com;ORG:Kancelaria\\;Nowak;;") as QrContent.Contact
+        assertEquals("Anna Nowak", contact.name)
+        assertEquals("Kancelaria;Nowak", contact.organization)
+        assertTrue(contact.vcard.startsWith("BEGIN:VCARD\r\nVERSION:3.0\r\nN:Nowak;Anna;;;\r\nFN:Anna Nowak\r\n"))
+        assertTrue("ORG:Kancelaria\\;Nowak\r\n" in contact.vcard)
+        assertTrue("TEL:+48111222333\r\n" in contact.vcard)
+    }
+
+    @Test fun emptyCardIsText() {
+        assertTrue(QrContent.of("BEGIN:VCARD\nVERSION:3.0\nEND:VCARD") is QrContent.Text)
+    }
+}
