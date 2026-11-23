@@ -10,7 +10,6 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.awaitHorizontalTouchSlopOrCancellation
-import androidx.compose.foundation.gestures.horizontalDrag
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
@@ -44,6 +43,8 @@ import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.layout.boundsInRoot
@@ -68,6 +69,9 @@ private const val SNAP = 0.06
 
 /** 1×–2× on the ruler, in dp; the whole 1×–5× of the reference phone then fits its width. */
 private const val OCTAVE_DP = 120f
+
+/** A hold this long on the stops opens the ruler. */
+private const val HOLD_MS = 250L
 
 /** The ruler folds back into the stops this long after the last touch. */
 private const val COLLAPSE_MS = 2_000L
@@ -129,23 +133,42 @@ fun ZoomRow(
                     awaitEachGesture {
                         val down = awaitFirstDown(requireUnconsumed = false)
                         if (!currentOpen && !groupBounds.contains(down.position)) return@awaitEachGesture
-                        val drag = awaitHorizontalTouchSlopOrCancellation(down.id) { change, _ -> change.consume() } ?: return@awaitEachGesture
+                        // A short hold opens the ruler under the still finger (owner, 23 Nov 2026: starting with a drag one way to move the other was awkward);
+                        // a drag past the slop opens it too. A tap stays the stop's own.
+                        var slop: PointerInputChange? = null
+                        val decided = withTimeoutOrNull(HOLD_MS) {
+                            slop = awaitHorizontalTouchSlopOrCancellation(down.id) { change, _ -> change.consume() }
+                            true
+                        }
+                        val held = decided == null && currentEvent.changes.any { it.id == down.id && it.pressed }
+                        if (!held && slop == null) return@awaitEachGesture
+                        if (held) haptics.lock()
                         onRulerOpen(true)
                         dragging = true
                         var position = ruler.position(currentZoom.coerceAtLeast(start))
                         var shown = currentZoom
-                        horizontalDrag(drag.id) { change ->
-                            lastTouch = System.currentTimeMillis()
-                            // The scale moves under the finger: a drag to the left brings larger values to the needle
-                            position = (position - with(density) { change.positionChange().x.toDp().value }).coerceIn(ruler.position(start), ruler.position(end))
-                            val raw = ruler.value(position)
-                            val stop = group.firstOrNull { abs(it.ratio - raw) <= SNAP }
-                            val next = stop?.ratio ?: raw
-                            if (stop != null && abs(shown - stop.ratio) > 1e-6) haptics.detent()
-                            else if (stop == null && floor(next) != floor(shown) && next >= 1) haptics.step()
-                            if (next >= end && shown < end) haptics.end()
-                            shown = next
-                            onZoom(next)
+                        // Read before the stops do (the initial pass), so letting go after a hold doesn't also tap the stop under the finger
+                        while (true) {
+                            val event = awaitPointerEvent(PointerEventPass.Initial)
+                            val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                            if (!change.pressed) {
+                                change.consume()
+                                break
+                            }
+                            val dx = change.positionChange().x
+                            if (dx != 0f) {
+                                lastTouch = System.currentTimeMillis()
+                                // The scale moves under the finger: a drag to the left brings larger values to the needle
+                                position = (position - with(density) { dx.toDp().value }).coerceIn(ruler.position(start), ruler.position(end))
+                                val raw = ruler.value(position)
+                                val stop = group.firstOrNull { abs(it.ratio - raw) <= SNAP }
+                                val next = stop?.ratio ?: raw
+                                if (stop != null && abs(shown - stop.ratio) > 1e-6) haptics.detent()
+                                else if (stop == null && floor(next) != floor(shown) && next >= 1) haptics.step()
+                                if (next >= end && shown < end) haptics.end()
+                                shown = next
+                                onZoom(next)
+                            }
                             change.consume()
                         }
                         dragging = false
