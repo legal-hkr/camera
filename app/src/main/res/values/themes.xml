@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Window theme only; the UI is themed in Compose (ui/theme). -->
-    <style name="Theme.Camera" parent="@android:style/Theme.DeviceDefault.DayNight">
+    <!-- Window theme only; the UI is themed in Compose (ui/theme). Dark always, as the app (no light window flashing before the first frame). -->
+    <style name="Theme.Camera" parent="@android:style/Theme.DeviceDefault">
         <item name="android:windowActionBar">false</item>
         <item name="android:windowNoTitle">true</item>
     </style>
