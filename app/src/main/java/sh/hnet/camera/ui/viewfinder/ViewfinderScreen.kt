@@ -18,6 +18,7 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.LocalActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.annotation.DrawableRes
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.snap
@@ -59,6 +60,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.LoadingIndicator
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialShapes
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
@@ -95,6 +97,7 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
@@ -126,6 +129,7 @@ import kotlin.math.abs
 import kotlin.math.roundToInt
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import sh.hnet.camera.MotionPhoto
 import sh.hnet.camera.R
 import sh.hnet.camera.camera.CameraStatus
 import sh.hnet.camera.camera.Flash
@@ -450,6 +454,11 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, onOpenSettings: () -> Uni
                             onDisabled = { explain(hdrFps) },
                         ) { viewModel.toggleHdr() }
                     }
+                    if (!video) {
+                        MenuButton(listOf(MotionPhoto.entries.map { m -> MenuChoice(stringResource(motionName(m)), m == settings.motionPhoto) { viewModel.setMotionPhoto(m) } })) { open ->
+                            TopButton(motionIcon(settings.motionPhoto), stringResource(R.string.tooltip_motion_photo), stringResource(motionState(settings.motionPhoto)), filled = settings.motionPhoto != MotionPhoto.AUTO, turn = turn, onClick = open)
+                        }
+                    }
                     if (video) {
                         val uhdAvailable = SessionLadder.UHD in camera.video
                         val rates = videoRates(camera.fixedFps)
@@ -476,7 +485,16 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, onOpenSettings: () -> Uni
         // The recording's time, centred under the cutout
         // In line with the top row, in its free middle
         if (recording != null) RecordingTime(recording, Modifier.align(Alignment.TopCenter).padding(top = status + 10.dp))
-        // Indicators at the picture's top-start: no sound in Video
+        // Indicators at the picture's top-start: a motion photo's video still recording (SPEC §7.6)
+        if (ui.motionWaiting > 0) {
+            IndicatorChip(
+                R.drawable.ic_motion_photos_on,
+                stringResource(R.string.label_motion),
+                Modifier.align(Alignment.TopStart).padding(start = 12.dp, top = status + maxOf(52.dp, pictureTop) + 8.dp),
+                solid = true,
+            ) {}
+        }
+        // No sound in Video
         val noSound = ui.mode == Mode.VIDEO && problem == null && (!micGranted || recording?.silenced == true)
         if (noSound) {
             IndicatorChip(
@@ -632,6 +650,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, onOpenSettings: () -> Uni
                     fps = settings.videoFps,
                     torch = ui.torch,
                     ultraHdrAvailable = camera.jpegR.isNotEmpty(),
+                    motionPhoto = settings.motionPhoto,
                     ultraHdr = settings.ultraHdr,
                     location = settings.location,
                 ),
@@ -652,6 +671,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, onOpenSettings: () -> Uni
                         }
                     },
                     onUltraHdr = { viewModel.toggleHdr() },
+                    onMotionPhoto = { viewModel.setMotionPhoto(it) },
                     onLocation = {
                         if (!ui.settings.location && !viewModel.location.allowed()) quickSettings = false
                         toggleLocation()
@@ -904,18 +924,19 @@ private fun duration(seconds: Long): String {
 
 /** An indicator chip (SPEC §4.4): 28 dp of finder glass with an icon and a short label; a tap explains it. */
 @Composable
-private fun IndicatorChip(icon: Int, label: String, modifier: Modifier, onClick: () -> Unit) {
+private fun IndicatorChip(icon: Int, label: String, modifier: Modifier, solid: Boolean = false, onClick: () -> Unit) {
+    val colors = MaterialTheme.colorScheme
     Box(
         modifier
             .height(28.dp)
-            .controlSurface(CircleShape, controlColor())
+            .controlSurface(CircleShape, if (solid) colors.secondaryContainer else controlColor())
             .clickable(role = Role.Button, onClick = onClick),
         contentAlignment = Alignment.Center,
     ) {
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(horizontal = 10.dp)) {
-            Icon(painterResource(icon), contentDescription = null, modifier = Modifier.size(16.dp))
+            Icon(painterResource(icon), contentDescription = null, tint = if (solid) colors.onSecondaryContainer else LocalContentColor.current, modifier = Modifier.size(16.dp))
             Spacer(Modifier.width(4.dp))
-            Text(label, style = MaterialTheme.typography.labelMedium)
+            Text(label, style = MaterialTheme.typography.labelMedium, color = if (solid) colors.onSecondaryContainer else Color.Unspecified)
         }
     }
 }
@@ -942,6 +963,25 @@ private fun topRowTop(status: Dp, start: Dp, end: Dp): Dp {
 
 /** The frame rates the camera holds for video, of 24, 30 and 60 (30 always: the ladder falls back to it). */
 fun videoRates(fixed: Set<Int>): List<Int> = listOf(24, 30, 60).filter { it == 30 || it in fixed }
+
+@DrawableRes
+fun motionIcon(mode: MotionPhoto) = when (mode) {
+    MotionPhoto.OFF -> R.drawable.ic_motion_photos_off
+    MotionPhoto.AUTO -> R.drawable.ic_motion_photos_auto
+    MotionPhoto.ON -> R.drawable.ic_motion_photos_on
+}
+
+fun motionName(mode: MotionPhoto) = when (mode) {
+    MotionPhoto.OFF -> R.string.menu_motion_off
+    MotionPhoto.AUTO -> R.string.menu_motion_auto
+    MotionPhoto.ON -> R.string.menu_motion_on
+}
+
+fun motionState(mode: MotionPhoto) = when (mode) {
+    MotionPhoto.OFF -> R.string.desc_state_motion_off
+    MotionPhoto.AUTO -> R.string.desc_state_motion_auto
+    MotionPhoto.ON -> R.string.desc_state_motion_on
+}
 
 fun flashState(flash: Flash) = when (flash) {
     Flash.OFF -> R.string.desc_state_flash_off

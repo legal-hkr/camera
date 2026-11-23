@@ -63,6 +63,7 @@ import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.unit.dp
 import kotlin.math.roundToInt
 import sh.hnet.camera.Grid
+import sh.hnet.camera.MotionPhoto
 import sh.hnet.camera.R
 import sh.hnet.camera.camera.Flash
 import sh.hnet.camera.capabilities.model.Aspect
@@ -285,6 +286,7 @@ class PanelState(
     val fps: Int,
     val torch: Boolean,
     val ultraHdrAvailable: Boolean,
+    val motionPhoto: MotionPhoto,
     val ultraHdr: Boolean,
     val location: Boolean,
 )
@@ -301,6 +303,7 @@ class PanelActions(
     val onFps: (Int) -> Unit,
     val onTorch: () -> Unit,
     val onUltraHdr: () -> Unit,
+    val onMotionPhoto: (MotionPhoto) -> Unit,
     val onLocation: () -> Unit,
     val onSettings: () -> Unit,
 )
@@ -322,6 +325,11 @@ fun QuickSettings(state: PanelState, actions: PanelActions) {
             }
             if (!state.video) {
                 if (state.ultraHdrAvailable) row { PanelSwitchRow(it, stringResource(R.string.label_panel_ultra_hdr), state.ultraHdr) { actions.onUltraHdr() } }
+                row { shapes ->
+                    PanelRow(shapes, stringResource(R.string.label_panel_motion_photo)) {
+                        Toggles(MotionPhoto.entries, state.motionPhoto, { stringResource(motionName(it)) }, actions.onMotionPhoto) { Icon(painterResource(motionIcon(it)), contentDescription = null, modifier = Modifier.size(20.dp)) }
+                    }
+                }
                 row { shapes ->
                     PanelRow(shapes, stringResource(R.string.label_panel_aspect_ratio)) {
                         Toggles(Aspect.entries.toList(), state.aspect, { aspectText(it) }, actions.onAspect) { Text(aspectText(it), maxLines = 1) }

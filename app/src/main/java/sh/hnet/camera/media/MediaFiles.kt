@@ -22,6 +22,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
+import sh.hnet.camera.camera.MotionClip
 import sh.hnet.camera.camera.VideoTarget
 import sh.hnet.camera.capabilities.model.PixelSize
 
@@ -57,10 +58,8 @@ class MediaFiles(private val context: Context) {
         }
         val uri = runCatching { resolver.insert(MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), values) }.getOrNull() ?: return@withContext null
         try {
-            if (crop == null) {
-                resolver.openOutputStream(uri)!!.use { it.write(bytes) }
-            } else {
-                resolver.openOutputStream(uri)!!.use { it.write(StillCrop.crop(bytes, crop)) }
+            resolver.openOutputStream(uri)!!.use { it.write(if (crop == null) bytes else StillCrop.crop(bytes, crop)) }
+            if (crop != null) {
                 // The photo is kept even if its EXIF can't be carried over
                 runCatching { resolver.openFileDescriptor(uri, "rw")!!.use { StillCrop.copyExif(bytes, it, crop) } }.onFailure { Log.w(TAG, "EXIF not copied: ${it.javaClass.simpleName}") }
             }
@@ -75,6 +74,18 @@ class MediaFiles(private val context: Context) {
     }
 
     /** The place found shortly after a photo without one (SPEC §7.8). */
+    /**
+     * A saved photo made a motion photo (LOGIKA §3.3): its video appended and named in its XMP, the file rewritten whole. A photo that can't take it stays as it
+     * was.
+     */
+    suspend fun addMotion(uri: Uri, clip: MotionClip) = withContext(Dispatchers.IO) {
+        runCatching {
+            val photo = resolver.openInputStream(uri)!!.use { it.readBytes() }
+            val whole = MotionPhotoWriter.write(photo, clip.bytes, clip.presentationUs) ?: return@runCatching
+            resolver.openOutputStream(uri, "wt")!!.use { it.write(whole) }
+        }.onFailure { Log.w(TAG, "Motion video not added: ${it.javaClass.simpleName}") }
+    }
+
     suspend fun addLocation(uri: Uri, location: Location) = withContext(Dispatchers.IO) {
         runCatching { resolver.openFileDescriptor(uri, "rw")?.use { StillCrop.addLocation(it, location) } }.onFailure { Log.w(TAG, "Place not added: ${it.javaClass.simpleName}") }
     }

@@ -133,4 +133,14 @@
     <string name="button_add_contact">Add to contacts</string>
     <string name="msg_no_contacts_app">No app to save contacts.</string>
     <string name="label_macro">Macro</string>
+    <!-- Stage 1c-2b: motion photos -->
+    <string name="tooltip_motion_photo">Motion photo</string>
+    <string name="desc_state_motion_off">Motion photo – off</string>
+    <string name="desc_state_motion_auto">Motion photo – auto</string>
+    <string name="desc_state_motion_on">Motion photo – on</string>
+    <string name="menu_motion_off">Off</string>
+    <string name="menu_motion_auto">Auto</string>
+    <string name="menu_motion_on">On</string>
+    <string name="label_panel_motion_photo">Motion photo</string>
+    <string name="label_motion">Motion</string>
 </resources>

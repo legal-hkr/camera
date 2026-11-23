@@ -55,6 +55,7 @@ class FrameAnalyzer(private val previewRatio: () -> Double) {
     private var generation = 0
 
     fun analyze(frame: AnalysisFrame) {
+        measureMovement(frame)
         val now = SystemClock.uptimeMillis()
         if (qrEnabled && !decoding && now - lastQr >= QR_EVERY_MS) {
             lastQr = now
@@ -129,6 +130,59 @@ class FrameAnalyzer(private val previewRatio: () -> Double) {
         _qr.value = QrFound(content, corners)
     }
 
+    // Movement in the scene for the automatic motion photo: the luma averaged over a coarse grid, compared with the grid of about a third of a second earlier;
+    // the change common to the whole picture (exposure steps, flicker) is taken out, and it counts as movement when enough cells changed on their own
+    private val grids = ArrayDeque<Pair<Long, IntArray>>()
+    private val movement = ArrayDeque<Pair<Long, Boolean>>()
+    private val movementLock = Any()
+
+    private fun measureMovement(frame: AnalysisFrame) {
+        val image = frame.image
+        val time = image.timestamp
+        val plane = image.planes[0]
+        val buffer = plane.buffer
+        val high = if (frame.tenBit) 1 else 0
+        val cellW = image.width / GRID_W
+        val cellH = image.height / GRID_H
+        val stepX = maxOf(1, cellW / CELL_SAMPLES)
+        val stepY = maxOf(1, cellH / CELL_SAMPLES)
+        val now = IntArray(GRID_W * GRID_H)
+        for (gy in 0 until GRID_H) for (gx in 0 until GRID_W) {
+            var sum = 0
+            var count = 0
+            var y = gy * cellH + stepY / 2
+            while (y < (gy + 1) * cellH) {
+                var x = gx * cellW + stepX / 2
+                while (x < (gx + 1) * cellW) {
+                    sum += buffer.get(y * plane.rowStride + x * plane.pixelStride + high).toInt() and 0xFF
+                    count++
+                    x += stepX
+                }
+                y += stepY
+            }
+            now[gy * GRID_W + gx] = if (count > 0) sum / count else 0
+        }
+        // A gap in the frames (a new session, another camera) starts the comparison over
+        val last = grids.lastOrNull()?.first
+        if (last != null && (time < last || time - last > GAP_NS)) grids.clear()
+        val before = grids.lastOrNull { it.first <= time - COMPARE_NS }?.second
+        grids.addLast(time to now)
+        while (grids.size > 1 && grids[1].first <= time - COMPARE_NS) grids.removeFirst()
+        if (before == null) return
+        val diffs = IntArray(now.size) { now[it] - before[it] }
+        val common = diffs.sorted()[diffs.size / 2]
+        val changed = diffs.count { abs(it - common) > CELL_CHANGE }
+        synchronized(movementLock) {
+            movement.addLast(time to (changed >= MIN_CHANGED_CELLS))
+            while (movement.size > 1 && movement.first().first < time - MOVEMENT_KEEP_NS) movement.removeFirst()
+        }
+    }
+
+    /** Whether something moved in the scene between two of the sensor's times (the automatic motion photo keeps its video then). */
+    fun moved(fromNs: Long, toNs: Long): Boolean = synchronized(movementLock) {
+        movement.any { (time, moving) -> moving && time in fromNs..toNs }
+    }
+
     /** A point of the (landscape, 4:3) analysis frame on the upright preview: into the part the preview shows, then turned as the camera shows it. */
     private fun toView(x: Double, y: Double, sensorOrientation: Int, front: Boolean, frameRatio: Double): Point {
         val ratio = previewRatio()
@@ -148,5 +202,15 @@ class FrameAnalyzer(private val previewRatio: () -> Double) {
         private const val MARKS_KEEP_MS = 300L
         /** Corners that moved less than this share of the picture aren't published again. */
         private const val STEADY = 0.02
+        private const val GRID_W = 16
+        private const val GRID_H = 12
+        /** Samples per cell along each side, averaged (the sensor's noise cancels out). */
+        private const val CELL_SAMPLES = 8
+        private const val COMPARE_NS = 330_000_000L
+        private const val GAP_NS = 500_000_000L
+        private const val MOVEMENT_KEEP_NS = 6_000_000_000L
+        /** A cell's own change of its mean luma (0–255) that counts, and how many cells (of 192) must change: about a fiftieth of the picture. */
+        private const val CELL_CHANGE = 12
+        private const val MIN_CHANGED_CELLS = 4
     }
 }

@@ -72,7 +72,7 @@ import sh.hnet.camera.capabilities.model.VideoChoice
 enum class Mode { PHOTO, VIDEO }
 
 /** What the viewfinder wants: which camera, in which mode and aspect ratio. */
-data class CameraRequest(val camera: CameraSpec, val mode: Mode, val aspect: Aspect, val video: VideoChoice = VideoChoice(), val ultraHdr: Boolean = true) {
+data class CameraRequest(val camera: CameraSpec, val mode: Mode, val aspect: Aspect, val video: VideoChoice = VideoChoice(), val ultraHdr: Boolean = true, val motion: Boolean = false, val motionFirst: Boolean = false) {
     /** The aspect the preview and the session use: video is always 16:9. */
     val pictureAspect: Aspect get() = if (mode == Mode.VIDEO) Aspect.SIXTEEN_NINE else aspect
 }
@@ -105,8 +105,10 @@ data class EngineState(
     val recording: Recording? = null,
     /** The camera switched to the ultrawide by itself at 1× or more, for a close subject (SPEC §3.3: shown, it does it on its own). */
     val macro: Boolean = false,
-    /** The session has the analysis stream: QR codes and the finder glass's picture come only then. */
+    /** The session has the analysis stream: QR codes come only then. */
     val analysis: Boolean = false,
+    /** The session keeps the motion photo's last seconds. */
+    val motion: Boolean = false,
     /** A recording is being finished and saved: the shutter waits for it. */
     val finishing: Boolean = false,
     /** A frame of the current session has been shown (the viewfinder's crossfade ends then). */
@@ -134,7 +136,16 @@ data class Controls(
 )
 
 /** A still as it came from the camera, with the crop the app still has to make for its aspect ratio. */
-class CapturedPhoto(val bytes: ByteArray, val format: StillFormat, val crop: PixelSize?, val takenAt: Long)
+class CapturedPhoto(
+    val bytes: ByteArray,
+    val format: StillFormat,
+    val crop: PixelSize?,
+    val takenAt: Long,
+    val sensorTimeNs: Long,
+    /** The motion photo's stream of the session the photo was taken in, and the photo's orientation: its clip belongs to it, whatever happens after. */
+    internal val motionSource: MotionBuffer?,
+    val orientation: Int,
+)
 
 /**
  * The app's camera (LOGIKA §1, §2): one device and one session at a time on a thread of its own. The viewfinder says what it wants (camera, mode, aspect, preview
@@ -182,6 +193,7 @@ class CameraEngine(context: Context) {
     /** Written on the camera thread, read on the analysis thread: frames of a session that is going aren't handed on. */
     @Volatile
     private var analyzing: AnalysisOutput? = null
+    private var motion: MotionBuffer? = null
     private var silenceWatch: Job? = null
     /** A recording being finished: a new one, or closing the session, waits for it. */
     private var stopping: Deferred<Boolean>? = null
@@ -363,11 +375,15 @@ class CameraEngine(context: Context) {
         val video = request.mode == Mode.VIDEO
         val builder = device.createCaptureRequest(if (video) CameraDevice.TEMPLATE_VIDEO_SNAPSHOT else CameraDevice.TEMPLATE_STILL_CAPTURE)
         builder.addTarget(output.reader.surface)
+        // The motion photo's video keeps its frame at the shot where one request may hold both (SDR; HLG streams can't go with the still's)
+        if (_state.value.range == PictureRange.SDR) motion?.let { builder.addTarget(it.surface) }
         applyControls(builder, request)
         // Set either way: the still template may turn the buffer on by itself, and a flash photo must not come from it
         if (request.camera.zsl) builder.set(CaptureRequest.CONTROL_ENABLE_ZSL, !video && !metered)
         location?.let { builder.set(CaptureRequest.JPEG_GPS_LOCATION, it) }
-        builder.set(CaptureRequest.JPEG_ORIENTATION, Orientation.jpeg(request.camera.sensorOrientation, deviceRotation, request.camera.front))
+        val orientation = Orientation.jpeg(request.camera.sensorOrientation, deviceRotation, request.camera.front)
+        builder.set(CaptureRequest.JPEG_ORIENTATION, orientation)
+        val motionSource = motion
         builder.set(CaptureRequest.JPEG_QUALITY, JPEG_QUALITY)
         output.drain()
         val takenAt = System.currentTimeMillis()
@@ -400,7 +416,7 @@ class CameraEngine(context: Context) {
             found
         } ?: return null
         val bytes = image.use { it.compressedBytes() }
-        return CapturedPhoto(bytes, output.format, output.plan.crop, takenAt)
+        return CapturedPhoto(bytes, output.format, output.plan.crop, takenAt, if (startedAt != 0L) startedAt else image.timestamp, motionSource, orientation)
     }
 
     private suspend fun reconcile(want: Desired) {
@@ -528,12 +544,12 @@ class CameraEngine(context: Context) {
     }
 
     /** One rung of a ladder: the range, the still stream (none in a video session without photos) and the video stream (Video mode). */
-    private data class Rung(val range: PictureRange, val still: StillFormat?, val video: VideoFormat?, val analysis: Boolean = false)
+    private data class Rung(val range: PictureRange, val still: StillFormat?, val video: VideoFormat?, val analysis: Boolean = false, val motion: Boolean = false)
 
     private fun rungs(request: CameraRequest): List<Rung> {
         val spec = request.camera
         return when (request.mode) {
-            Mode.PHOTO -> SessionLadder.photo(spec.hlg, spec.jpegR.isNotEmpty(), wantMotion = false, wantAnalysis = true, wantUltraHdr = request.ultraHdr).map { Rung(it.range, it.still, null, it.analysis) }
+            Mode.PHOTO -> SessionLadder.photo(spec.hlg, spec.jpegR.isNotEmpty(), wantMotion = request.motion, wantAnalysis = true, wantUltraHdr = request.ultraHdr, motionFirst = request.motionFirst).map { Rung(it.range, it.still, null, it.analysis, it.motion) }
             Mode.VIDEO -> {
                 val hevc = Encoders.hevc()
                 SessionLadder.video(request.video, spec.hlg, spec.jpegR.isNotEmpty(), spec.video, spec.fixedFps, Encoders.limits(hevc))
@@ -570,10 +586,12 @@ class CameraEngine(context: Context) {
             var output: StillOutput? = null
             var video: VideoRecorder? = null
             var analysis: AnalysisOutput? = null
+            var motion: MotionBuffer? = null
             val made = try {
                 output = stillPlan?.let { StillOutput(it, rung.still, format) }
                 video = rung.video?.let { VideoRecorder(it, audio, scope) }
                 analysis = analysisSize?.let { AnalysisOutput(it, rung.range == PictureRange.HLG, spec) }
+                motion = if (rung.motion) MotionBuffer(previewSize, rung.range == PictureRange.HLG, appContext.cacheDir) else null
                 val profile = if (rung.range == PictureRange.HLG) DynamicRangeProfiles.HLG10 else DynamicRangeProfiles.STANDARD
                 val outputs = listOfNotNull(
                     OutputConfiguration(surface).apply { dynamicRangeProfile = profile },
@@ -582,11 +600,14 @@ class CameraEngine(context: Context) {
                     output?.let { OutputConfiguration(it.reader.surface) },
                     // The analysis frames share the preview's range (one request may not mix them): P010 next to HLG, YUV next to SDR
                     analysis?.let { OutputConfiguration(it.reader.surface).apply { dynamicRangeProfile = profile } },
+                    // The motion photo's frames in the sensor's clock, as the photo's own timestamp
+                    motion?.let { OutputConfiguration(it.surface).apply { dynamicRangeProfile = profile; timestampBase = OutputConfiguration.TIMESTAMP_BASE_SENSOR } },
                 )
                 val closeOutputs: () -> Unit = {
                     output?.close()
                     video?.release()
                     analysis?.close()
+                    motion?.release()
                 }
                 configure(device, sessionParameters(device.createCaptureRequest(template(request)), request, rung.video), outputs, closeOutputs)
             } catch (e: Exception) {
@@ -598,6 +619,7 @@ class CameraEngine(context: Context) {
                 output?.close()
                 video?.release()
                 analysis?.close()
+                motion?.release()
                 continue
             }
             // The world may have moved while the session was being made: the device lost, another request or surface wanted
@@ -609,9 +631,10 @@ class CameraEngine(context: Context) {
             still = output
             recorder = video
             analyzing = analysis
+            this.motion = motion
             previewSurface = surface
             controls = controls.copy(zoom = controls.zoom.coerceIn(spec.zoom.min, spec.zoom.max))
-            _state.update { EngineState(CameraStatus.Ready, request, rung.range, rung.video, frameShown = false, analysis = analysis != null) }
+            _state.update { EngineState(CameraStatus.Ready, request, rung.range, rung.video, frameShown = false, analysis = analysis != null, motion = motion != null) }
             repeat()
             return true
         }
@@ -643,7 +666,8 @@ class CameraEngine(context: Context) {
             val tenBit = rung.range == PictureRange.HLG
             OutputConfiguration(if (tenBit) ImageFormat.YCBCR_P010 else ImageFormat.YUV_420_888, Size(size.width, size.height)).apply { dynamicRangeProfile = profile }
         } else null
-        val outputs = listOfNotNull(preview, video, still?.let { OutputConfiguration(format, Size(it.capture.width, it.capture.height)) }, analysis)
+        val motion = if (rung.motion) OutputConfiguration(ImageFormat.PRIVATE, Size(previewSize.width, previewSize.height), HardwareBuffer.USAGE_VIDEO_ENCODE).apply { dynamicRangeProfile = profile; timestampBase = OutputConfiguration.TIMESTAMP_BASE_SENSOR } else null
+        val outputs = listOfNotNull(preview, video, still?.let { OutputConfiguration(format, Size(it.capture.width, it.capture.height)) }, analysis, motion)
         val config = SessionConfiguration(SessionConfiguration.SESSION_REGULAR, outputs)
         config.setSessionParameters(sessionParameters(setup.createCaptureRequest(template(request)), request, rung.video))
         setup.isSessionConfigurationSupported(config)
@@ -712,6 +736,9 @@ class CameraEngine(context: Context) {
         repeat()
     }
 
+    /** The motion photo's clip around a photo (its sensor time); null without a motion stream or when nothing usable came. */
+    suspend fun motionClip(photo: CapturedPhoto): MotionClip? = photo.motionSource?.clip(photo.sensorTimeNs / 1000, photo.orientation)
+
     /** Ends the recording and saves it, in the engine's own scope (a screen going away doesn't cut it short); true when a video was saved. */
     suspend fun stopRecording(): Boolean = scope.async { finishRecording() }.await()
 
@@ -756,8 +783,9 @@ class CameraEngine(context: Context) {
     private fun addRecordingTarget(builder: CaptureRequest.Builder) {
         val recording = _state.value.recording
         if (recording != null && recording.pausedAt == null) recorder?.let { builder.addTarget(it.surface) }
-        // The analysis frames go with every preview frame (the analyzer takes what it can keep up with)
+        // The analysis frames go with every preview frame (the analyzer takes what it can keep up with), the motion photo's too
         analyzing?.let { builder.addTarget(it.reader.surface) }
+        motion?.let { builder.addTarget(it.surface) }
     }
 
     /** The analysis stream's size: the smallest 4:3 at least 640 wide (QR codes need the detail), in 10 bits next to an HLG preview. */
@@ -935,12 +963,15 @@ class CameraEngine(context: Context) {
         lockJob?.cancel()
         // The prepared encoder goes at once (the next session's may need the hardware); the surface goes when the session has closed
         recorder?.retire()
+        // The motion photo's encoder too (the next session's may need the hardware at once)
+        motion?.release()
         runCatching { session?.close() }
         session = null
         sessionKey = null
         still = null
         recorder = null
         analyzing = null
+        motion = null
         previewSurface = null
     }
 

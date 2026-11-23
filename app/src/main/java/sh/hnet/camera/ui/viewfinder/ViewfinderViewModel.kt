@@ -30,6 +30,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 import sh.hnet.camera.CameraApplication
 import sh.hnet.camera.CameraSettings
 import sh.hnet.camera.Grid
+import sh.hnet.camera.MotionPhoto
 import sh.hnet.camera.VolumeKeys
 import sh.hnet.camera.camera.CameraRequest
 import sh.hnet.camera.camera.EngineState
@@ -69,6 +70,8 @@ data class ViewfinderUi(
     val countdown: Int? = null,
     /** The front camera's screen flash is lit. */
     val screenFlash: Boolean = false,
+    /** Shots whose motion photo video is still being recorded (the 1.5 s after each): the "Motion" indicator. */
+    val motionWaiting: Int = 0,
     /** How the phone is held (0, 90, 180, 270): the controls turn the other way. */
     val rotation: Int = 0,
     val settings: CameraSettings = CameraSettings(),
@@ -172,7 +175,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     fun request(): CameraRequest? {
         val ui = _ui.value
         val settings = ui.settings
-        return camera?.let { CameraRequest(it, ui.mode, settings.aspect, VideoChoice(settings.videoUhd, settings.videoFps, settings.hdrVideo), settings.ultraHdr) }
+        return camera?.let { CameraRequest(it, ui.mode, settings.aspect, VideoChoice(settings.videoUhd, settings.videoFps, settings.hdrVideo), settings.ultraHdr, motion = ui.mode == Mode.PHOTO && settings.motionPhoto != MotionPhoto.OFF, motionFirst = settings.motionPhoto == MotionPhoto.ON) }
     }
 
     fun previewSize(): PixelSize? = request()?.let { engine.previewSize(it) }
@@ -326,6 +329,8 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
 
     fun setLocation(on: Boolean) = viewModelScope.launch { preferences.setLocation(on) }
 
+    fun setMotionPhoto(mode: MotionPhoto) = viewModelScope.launch { preferences.setMotionPhoto(mode) }
+
     /** The video shutter: starts a recording into a new pending file, or ends the one running (saved either way as far as it got). */
     fun record() {
         // In the app's scope: a screen going away right after must not cut a start or a stop in half
@@ -391,7 +396,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
             timerJob = null
             _ui.update { it.copy(countdown = null) }
             engine.setTorch(_ui.value.torch)
-            if (_ui.value.mode == Mode.VIDEO) record() else shoot()
+            if (_ui.value.mode == Mode.VIDEO) record() else shoot(timed = true)
         }
     }
 
@@ -413,7 +418,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     private fun placeNow() = if (_ui.value.settings.location) location.current() else null
 
     /** Takes a photo and saves it in the app's scope, so leaving the viewfinder right after doesn't lose it. Shots queue up; the shutter never waits. */
-    fun shoot() {
+    fun shoot(timed: Boolean = false) {
         val ui = _ui.value
         val front = camera?.front == true
         val screenFlash = front && ui.mode == Mode.PHOTO && (ui.flash == Flash.ON || (ui.flash == Flash.AUTO && engineState.value.dark))
@@ -435,8 +440,30 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
                     if (screenFlash) _ui.update { it.copy(screenFlash = false) }
                 } ?: return@withLock
                 val wantPlace = ui.settings.location && place == null
+                // A motion photo (LOGIKA §3.3) where the stream runs, not after the timer (its LED blinks in the video) nor with a flash (one lit frame); automatic
+                // only where the analysis can tell whether something moved
+                val flashFired = screenFlash || (camera?.flash == true && !ui.torch && (ui.flash == Flash.ON || (ui.flash == Flash.AUTO && engineState.value.flashNeeded)))
+                val motionMode = ui.settings.motionPhoto
+                val state = engineState.value
+                val wantMotion = !timed && !flashFired && state.motion && (motionMode == MotionPhoto.ON || (motionMode == MotionPhoto.AUTO && state.analysis))
+                if (wantMotion) _ui.update { it.copy(motionWaiting = it.motionWaiting + 1) }
                 application.appScope.launch {
-                    val uri = media.savePhoto(photo.bytes, photo.takenAt, photo.crop) ?: return@launch
+                    // The photo is saved at once; its video is added when the 1.5 s after it are there
+                    var waiting = wantMotion
+                    val uri = try {
+                        val saved = media.savePhoto(photo.bytes, photo.takenAt, photo.crop)
+                        if (wantMotion) {
+                            val clip = engine.motionClip(photo)
+                            _ui.update { it.copy(motionWaiting = it.motionWaiting - 1) }
+                            waiting = false
+                            // Automatic: the video stays only when something moved around the shot
+                            val keep = clip?.takeIf { motionMode == MotionPhoto.ON || analyzer.moved(photo.sensorTimeNs - MOTION_AROUND_NS, photo.sensorTimeNs + MOTION_AROUND_NS) }
+                            if (saved != null && keep != null) media.addMotion(saved, keep)
+                        }
+                        saved
+                    } finally {
+                        if (waiting) _ui.update { it.copy(motionWaiting = it.motionWaiting - 1) }
+                    } ?: return@launch
                     // A fix that comes within a few seconds still goes into the photo
                     if (wantPlace) withTimeoutOrNull(LATE_PLACE_MS) { location.fix.first { it != null && location.current() != null } }?.let { media.addLocation(uri, it) }
                 }
@@ -517,5 +544,6 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         const val LATE_PLACE_MS = 5_000L
         const val KEY_ZOOM_STEP = 1.1
         const val REFRESH_SETTLE_MS = 300L
+        const val MOTION_AROUND_NS = 1_500_000_000L
     }
 }

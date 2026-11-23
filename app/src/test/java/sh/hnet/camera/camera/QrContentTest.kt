@@ -65,6 +65,14 @@ class QrContactTest {
         assertTrue("TEL:+48111222333\r\n" in contact.vcard)
     }
 
+    @Test fun escapesAndUnencodedLetters() {
+        // An escaped ";" stays in its field; a letter left unencoded in a quoted-printable value stays itself; a soft break before a line starting with a space
+        val card = "BEGIN:VCARD\nVERSION:2.1\nORG:Kowalski\\; Nowak;Dział\nFN;CHARSET=UTF-8;ENCODING=QUOTED-PRINTABLE:Łukasz =C5=BBak=\n Junior\nEND:VCARD"
+        val contact = QrContent.of(card) as QrContent.Contact
+        assertEquals("Kowalski; Nowak, Dział", contact.organization)
+        assertEquals("Łukasz Żak Junior", contact.name)
+    }
+
     @Test fun emptyCardIsText() {
         assertTrue(QrContent.of("BEGIN:VCARD\nVERSION:3.0\nEND:VCARD") is QrContent.Text)
     }

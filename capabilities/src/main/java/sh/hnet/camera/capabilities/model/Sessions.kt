@@ -26,14 +26,23 @@ object SessionLadder {
      * The photo sessions to try, best first; the first one the camera confirms is used. Analysis goes first (the finder glass falls back to plain translucency,
      * QR codes stop), then the HDR preview, then Ultra HDR. [wantMotion] and [wantAnalysis] leave out what the current settings don't need at all.
      */
-    fun photo(hlg: Boolean, jpegR: Boolean, wantMotion: Boolean, wantAnalysis: Boolean, wantUltraHdr: Boolean = true): List<PhotoSession> = buildList {
+    fun photo(hlg: Boolean, jpegR: Boolean, wantMotion: Boolean, wantAnalysis: Boolean, wantUltraHdr: Boolean = true, motionFirst: Boolean = false): List<PhotoSession> = buildList {
         val ranges = if (hlg) listOf(PictureRange.HLG, PictureRange.SDR) else listOf(PictureRange.SDR)
         val stills = if (jpegR && wantUltraHdr) listOf(StillFormat.JPEG_R, StillFormat.JPEG) else listOf(StillFormat.JPEG)
         for (still in stills) for (range in ranges) {
             if (wantAnalysis) add(PhotoSession(range, still, wantMotion, analysis = true))
-            add(PhotoSession(range, still, wantMotion, analysis = false))
-            // Motion photos go last before the next range: a photo without its short video beats no HDR at all
-            if (wantMotion) add(PhotoSession(range, still, motion = false, analysis = false))
+            // Without room for both: the motion photo's stream when it is always wanted, else the analysis (QR codes, and the automatic motion photo can't decide without it)
+            val motionOnly = PhotoSession(range, still, wantMotion, analysis = false)
+            val analysisOnly = PhotoSession(range, still, motion = false, analysis = wantAnalysis)
+            if (motionFirst) {
+                add(motionOnly)
+                add(analysisOnly)
+            } else {
+                add(analysisOnly)
+                add(motionOnly)
+            }
+            // Then neither, before the next range: a photo without its short video beats no HDR at all
+            add(PhotoSession(range, still, motion = false, analysis = false))
         }
     }.distinct()
 

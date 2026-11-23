@@ -132,4 +132,14 @@
     <string name="button_add_contact">Dodaj do kontaktów</string>
     <string name="msg_no_contacts_app">Brak aplikacji do zapisania kontaktu.</string>
     <string name="label_macro">Makro</string>
+    <!-- Stage 1c-2b: motion photos -->
+    <string name="tooltip_motion_photo">Zdjęcie ruchome</string>
+    <string name="desc_state_motion_off">Zdjęcie ruchome – wyłączone</string>
+    <string name="desc_state_motion_auto">Zdjęcie ruchome – automatycznie</string>
+    <string name="desc_state_motion_on">Zdjęcie ruchome – włączone</string>
+    <string name="menu_motion_off">Wyłączone</string>
+    <string name="menu_motion_auto">Automatycznie</string>
+    <string name="menu_motion_on">Włączone</string>
+    <string name="label_panel_motion_photo">Zdjęcie ruchome</string>
+    <string name="label_motion">Ruch</string>
 </resources>

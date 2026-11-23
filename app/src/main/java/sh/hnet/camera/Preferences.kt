@@ -17,6 +17,9 @@ enum class Grid { OFF, THIRDS, QUARTERS }
 
 enum class VolumeKeys { SHUTTER, ZOOM, VOLUME }
 
+/** Motion photos (SPEC §7.6): off, kept only when something moved, or always. */
+enum class MotionPhoto { OFF, AUTO, ON }
+
 /** The values remembered between starts (SPEC §17.5); one value each, whether changed in the viewfinder or in Settings. */
 data class CameraSettings(
     val aspect: Aspect = Aspect.FOUR_THREE,
@@ -34,6 +37,7 @@ data class CameraSettings(
     val volumeKeys: VolumeKeys = VolumeKeys.SHUTTER,
     /** QR codes recognized in Photo mode (Settings › Photos). */
     val qrCodes: Boolean = true,
+    val motionPhoto: MotionPhoto = MotionPhoto.AUTO,
 )
 
 /** Choices the user made in the UI that outlive the process (app-private, not backed up by the system). */
@@ -52,6 +56,7 @@ class Preferences(private val context: Context) {
         timerFlash = this[TIMER_FLASH] ?: false,
         volumeKeys = this[VOLUME_KEYS]?.let { name -> VolumeKeys.entries.firstOrNull { it.name == name } } ?: VolumeKeys.SHUTTER,
         qrCodes = this[QR_CODES] ?: true,
+        motionPhoto = this[MOTION_PHOTO]?.let { name -> MotionPhoto.entries.firstOrNull { it.name == name } } ?: MotionPhoto.AUTO,
     )
 
     suspend fun setAspect(value: Aspect) = context.settings.edit { it[ASPECT] = value.name }
@@ -65,6 +70,7 @@ class Preferences(private val context: Context) {
     suspend fun setTimerFlash(value: Boolean) = context.settings.edit { it[TIMER_FLASH] = value }
     suspend fun setVolumeKeys(value: VolumeKeys) = context.settings.edit { it[VOLUME_KEYS] = value.name }
     suspend fun setQrCodes(value: Boolean) = context.settings.edit { it[QR_CODES] = value }
+    suspend fun setMotionPhoto(value: MotionPhoto) = context.settings.edit { it[MOTION_PHOTO] = value.name }
 
     /** Restore defaults (Settings › Reset): every setting of this store back to its default. */
     suspend fun restoreDefaults() = context.settings.edit { it.clear() }
@@ -81,5 +87,6 @@ class Preferences(private val context: Context) {
         val TIMER_FLASH = booleanPreferencesKey("timer_flash")
         val VOLUME_KEYS = stringPreferencesKey("volume_keys")
         val QR_CODES = booleanPreferencesKey("qr_codes")
+        val MOTION_PHOTO = stringPreferencesKey("motion_photo")
     }
 }

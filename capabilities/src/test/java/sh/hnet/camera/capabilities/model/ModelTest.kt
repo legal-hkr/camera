@@ -109,10 +109,13 @@ class SessionLadderTest {
     @Test fun bestFirstThenAnalysisThenHdrPreviewThenUltraHdr() {
         val ladder = SessionLadder.photo(hlg = true, jpegR = true, wantMotion = true, wantAnalysis = true)
         assertEquals(PhotoSession(PictureRange.HLG, StillFormat.JPEG_R, motion = true, analysis = true), ladder.first())
-        assertEquals(PhotoSession(PictureRange.HLG, StillFormat.JPEG_R, motion = true, analysis = false), ladder[1])
-        assertEquals(PhotoSession(PictureRange.HLG, StillFormat.JPEG_R, motion = false, analysis = false), ladder[2])
-        assertEquals(PictureRange.SDR, ladder[3].range)
-        assertEquals(StillFormat.JPEG_R, ladder[3].still)
+        // Automatic motion photos: the analysis before the motion stream when both don't fit
+        assertEquals(PhotoSession(PictureRange.HLG, StillFormat.JPEG_R, motion = false, analysis = true), ladder[1])
+        assertEquals(PhotoSession(PictureRange.HLG, StillFormat.JPEG_R, motion = true, analysis = false), ladder[2])
+        assertEquals(PhotoSession(PictureRange.HLG, StillFormat.JPEG_R, motion = false, analysis = false), ladder[3])
+        assertEquals(PictureRange.SDR, ladder[4].range)
+        assertEquals(StillFormat.JPEG_R, ladder[4].still)
+        assertEquals(PhotoSession(PictureRange.HLG, StillFormat.JPEG_R, motion = true, analysis = false), SessionLadder.photo(hlg = true, jpegR = true, wantMotion = true, wantAnalysis = true, motionFirst = true)[1])
         assertEquals(StillFormat.JPEG, ladder.last().still)
         assertEquals(ladder.size, ladder.distinct().size)
     }

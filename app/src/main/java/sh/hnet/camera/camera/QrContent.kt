@@ -66,8 +66,9 @@ sealed interface QrContent {
             val lines = mutableListOf<String>()
             for (line in text.replace("\r\n", "\n").split('\n')) {
                 // A line starting with a space or a tab continues the one before (folding); quoted-printable continues with a soft break "="
-                if ((line.startsWith(" ") || line.startsWith("\t")) && lines.isNotEmpty()) lines[lines.lastIndex] += line.substring(1)
-                else if (lines.isNotEmpty() && lines.last().endsWith("=") && lines.last().contains("QUOTED-PRINTABLE", ignoreCase = true)) lines[lines.lastIndex] = lines.last().dropLast(1) + line
+                // The soft break first: its next line may start with a space that belongs to the value
+                if (lines.isNotEmpty() && lines.last().endsWith("=") && lines.last().contains("QUOTED-PRINTABLE", ignoreCase = true)) lines[lines.lastIndex] = lines.last().dropLast(1) + line
+                else if ((line.startsWith(" ") || line.startsWith("\t")) && lines.isNotEmpty()) lines[lines.lastIndex] += line.substring(1)
                 else lines += line
             }
             var formatted: String? = null
@@ -89,13 +90,13 @@ sealed interface QrContent {
                 if (params.any { "QUOTED-PRINTABLE" in it }) value = quotedPrintable(value, params.firstOrNull { it.startsWith("CHARSET=") }?.substringAfter('='))
                 when (name) {
                     "FN" -> formatted = unescape(value).trim().ifEmpty { null }
-                    "N" -> structured = value.split(';').map { unescape(it).trim() }.let { parts -> listOfNotNull(parts.getOrNull(3), parts.getOrNull(1), parts.getOrNull(2), parts.getOrNull(0), parts.getOrNull(4)).filter { it.isNotEmpty() }.joinToString(" ").ifEmpty { null } }
-                    "ORG" -> organization = value.split(';').map { unescape(it).trim() }.filter { it.isNotEmpty() }.joinToString(", ").ifEmpty { null }
+                    "N" -> structured = fields(value).map { unescape(it).trim() }.let { parts -> listOfNotNull(parts.getOrNull(3), parts.getOrNull(1), parts.getOrNull(2), parts.getOrNull(0), parts.getOrNull(4)).filter { it.isNotEmpty() }.joinToString(" ").ifEmpty { null } }
+                    "ORG" -> organization = fields(value).map { unescape(it).trim() }.filter { it.isNotEmpty() }.joinToString(", ").ifEmpty { null }
                     "TITLE" -> title = unescape(value).trim().ifEmpty { null }
                     "TEL" -> unescape(value).removePrefix("tel:").trim().takeIf { it.isNotEmpty() }?.let { phones += it }
                     "EMAIL" -> unescape(value).trim().takeIf { it.isNotEmpty() }?.let { emails += it }
                     "URL" -> unescape(value).trim().takeIf { it.isNotEmpty() }?.let { urls += it }
-                    "ADR" -> if (address == null) address = value.split(';').map { unescape(it).trim() }.filter { it.isNotEmpty() }.joinToString(", ").ifEmpty { null }
+                    "ADR" -> if (address == null) address = fields(value).map { unescape(it).trim() }.filter { it.isNotEmpty() }.joinToString(", ").ifEmpty { null }
                 }
             }
             val name = formatted ?: structured
@@ -155,6 +156,30 @@ sealed interface QrContent {
             return Contact(text, card, name, organization, null, phones, emails, urls, address)
         }
 
+        /** A structured value's fields: split at the `;` that aren't escaped (`\;` stays in its field, unescaped later). */
+        private fun fields(value: String): List<String> {
+            val parts = mutableListOf<String>()
+            val part = StringBuilder()
+            var i = 0
+            while (i < value.length) {
+                val c = value[i]
+                when {
+                    c == '\\' && i + 1 < value.length -> {
+                        part.append(c).append(value[i + 1])
+                        i++
+                    }
+                    c == ';' -> {
+                        parts += part.toString()
+                        part.clear()
+                    }
+                    else -> part.append(c)
+                }
+                i++
+            }
+            parts += part.toString()
+            return parts
+        }
+
         /** vCard text escapes: `\n`, `\,`, `\;`, `\\`. */
         private fun unescape(value: String): String {
             val out = StringBuilder()
@@ -175,6 +200,7 @@ sealed interface QrContent {
 
         /** Quoted-printable (vCard 2.1): `=XX` bytes in the declared charset, UTF-8 when none is given. */
         private fun quotedPrintable(value: String, charset: String?): String {
+            val cs = charset?.let { runCatching { charset(it) }.getOrNull() } ?: Charsets.UTF_8
             val bytes = ByteArrayOutputStream()
             var i = 0
             while (i < value.length) {
@@ -187,10 +213,10 @@ sealed interface QrContent {
                         continue
                     }
                 }
-                bytes.write(c.code and 0xFF)
+                // A character left unencoded stays itself, in the declared charset
+                if (c.code < 0x80) bytes.write(c.code) else bytes.write(c.toString().toByteArray(cs))
                 i++
             }
-            val cs = charset?.let { runCatching { charset(it) }.getOrNull() } ?: Charsets.UTF_8
             return String(bytes.toByteArray(), cs)
         }
 

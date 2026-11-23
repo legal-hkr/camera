@@ -223,7 +223,10 @@ private fun copy(context: Context, text: String, sensitive: Boolean) {
 /** The card as a vCard file in the app's cache, offered to other apps through the file provider. */
 private fun contactFile(context: Context, contact: QrContent.Contact): Uri? = runCatching {
     val dir = File(context.cacheDir, "share").apply { mkdirs() }
-    val file = File(dir, "contact.vcf")
+    // A file per card, so an app that reads it later doesn't get the next scanned one; the old ones go after an hour
+    val now = System.currentTimeMillis()
+    dir.listFiles { f -> f.name.endsWith(".vcf") && now - f.lastModified() > SHARE_KEEP_MS }?.forEach { it.delete() }
+    val file = File(dir, "contact-${Integer.toHexString(contact.vcard.hashCode())}.vcf")
     file.writeText(contact.vcard)
     FileProvider.getUriForFile(context, "${context.packageName}.files", file)
 }.getOrNull()
@@ -265,3 +268,5 @@ private fun share(context: Context, file: Uri) {
 private fun share(context: Context, text: String) {
     context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text), null))
 }
+
+private const val SHARE_KEEP_MS = 3_600_000L
