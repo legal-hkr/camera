@@ -4,9 +4,13 @@ import android.content.ContentResolver
 import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
+import android.database.ContentObserver
 import android.graphics.Bitmap
+import android.location.Location
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.MediaStore
 import android.util.Log
 import android.util.Size
@@ -19,6 +23,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
 import sh.hnet.camera.camera.VideoTarget
+import sh.hnet.camera.capabilities.model.PixelSize
 
 /** File names of the camera's shots: the local time to the millisecond, as bursts and quick shots fall in the same second. */
 object FileNames {
@@ -41,8 +46,8 @@ class MediaFiles(private val context: Context) {
     private val _last = MutableStateFlow<LastShot?>(null)
     val last: StateFlow<LastShot?> = _last.asStateFlow()
 
-    /** Writes a finished JPEG (Ultra HDR or plain) and publishes it; null when the storage refused it. */
-    suspend fun savePhoto(bytes: ByteArray, takenAt: Long): Uri? = withContext(Dispatchers.IO) {
+    /** Writes a finished JPEG (Ultra HDR or plain), cut to [crop] first when the camera had no size of the shot's aspect, and publishes it; null when the storage refused it. */
+    suspend fun savePhoto(bytes: ByteArray, takenAt: Long, crop: PixelSize? = null): Uri? = withContext(Dispatchers.IO) {
         val values = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, FileNames.photo(takenAt))
             put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
@@ -52,7 +57,13 @@ class MediaFiles(private val context: Context) {
         }
         val uri = runCatching { resolver.insert(MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), values) }.getOrNull() ?: return@withContext null
         try {
-            resolver.openOutputStream(uri)!!.use { it.write(bytes) }
+            if (crop == null) {
+                resolver.openOutputStream(uri)!!.use { it.write(bytes) }
+            } else {
+                resolver.openOutputStream(uri)!!.use { it.write(StillCrop.crop(bytes, crop)) }
+                // The photo is kept even if its EXIF can't be carried over
+                runCatching { resolver.openFileDescriptor(uri, "rw")!!.use { StillCrop.copyExif(bytes, it, crop) } }.onFailure { Log.w(TAG, "EXIF not copied: ${it.javaClass.simpleName}") }
+            }
             resolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
             show(uri, "image/jpeg")
             uri
@@ -61,6 +72,11 @@ class MediaFiles(private val context: Context) {
             runCatching { resolver.delete(uri, null, null) }
             null
         }
+    }
+
+    /** The place found shortly after a photo without one (SPEC §7.8). */
+    suspend fun addLocation(uri: Uri, location: Location) = withContext(Dispatchers.IO) {
+        runCatching { resolver.openFileDescriptor(uri, "rw")?.use { StillCrop.addLocation(it, location) } }.onFailure { Log.w(TAG, "Place not added: ${it.javaClass.simpleName}") }
     }
 
     /** A new video in `DCIM/Camera`, pending until the recording ends; null when the storage refused it. */
@@ -104,7 +120,14 @@ class MediaFiles(private val context: Context) {
      */
     suspend fun refreshLast() = withContext(Dispatchers.IO) {
         latest?.let { (uri, mime) ->
-            val exists = runCatching { resolver.query(uri, arrayOf(MediaStore.MediaColumns._ID), null, null)?.use { it.count > 0 } }.getOrNull() == true
+            // Asked through the collection, whose default leaves out what is in the trash or pending (a gallery's delete is usually a move to the trash)
+            val collection = if (mime.startsWith("video/")) MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL) else MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
+            val args = Bundle().apply {
+                putString(ContentResolver.QUERY_ARG_SQL_SELECTION, "${MediaStore.MediaColumns._ID} = ?")
+                putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS, arrayOf(ContentUris.parseId(uri).toString()))
+                putInt(MediaStore.QUERY_ARG_MATCH_TRASHED, MediaStore.MATCH_EXCLUDE)
+            }
+            val exists = runCatching { resolver.query(collection, arrayOf(MediaStore.MediaColumns._ID), args, null)?.use { it.count > 0 } }.getOrNull() == true
             if (exists) {
                 if (_last.value?.uri != uri || _last.value?.thumbnail == null) show(uri, mime)
                 return@withContext
@@ -136,6 +159,15 @@ class MediaFiles(private val context: Context) {
         if (_last.value?.uri == uri && _last.value?.thumbnail != null) return@withContext
         val thumbnail = runCatching { resolver.loadThumbnail(uri, Size(THUMBNAIL_PX, THUMBNAIL_PX), null) }.getOrNull()
         _last.value = LastShot(uri, mime, thumbnail)
+    }
+
+    /** Calls [onChange] (a moment after the last of a burst of changes) when anything in the media storage changes: a gallery deleting the last shot, say. */
+    fun watch(onChange: () -> Unit): () -> Unit {
+        val observer = object : ContentObserver(Handler(Looper.getMainLooper())) {
+            override fun onChange(selfChange: Boolean) = onChange()
+        }
+        resolver.registerContentObserver(MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL), true, observer)
+        return { resolver.unregisterContentObserver(observer) }
     }
 
     /** Own entries left pending by a process that died while writing (older than an hour) are removed when the app starts. */

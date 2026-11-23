@@ -38,6 +38,9 @@ data class CameraSpec(
     val aeRegions: Int,
     val faceDetection: Boolean,
     val flash: Boolean,
+    /** The flash's strength levels (Android 15+; 1 when it can't be set). */
+    val flashLevels: Int,
+    val flashDefaultLevel: Int,
     /** The camera can take a still from its own buffer of recent frames (`CONTROL_ENABLE_ZSL`). */
     val zsl: Boolean,
     /** Sessions can be checked before they are configured (`CameraDeviceSetup`, Android 15+). */
@@ -91,6 +94,8 @@ object CameraCatalog {
             aeRegions = chars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0,
             faceDetection = chars.get(CameraCharacteristics.STATISTICS_INFO_AVAILABLE_FACE_DETECT_MODES)?.contains(CameraMetadata.STATISTICS_FACE_DETECT_MODE_SIMPLE) == true,
             flash = chars.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true,
+            flashLevels = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) chars.get(CameraCharacteristics.FLASH_SINGLE_STRENGTH_MAX_LEVEL) ?: 1 else 1,
+            flashDefaultLevel = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) chars.get(CameraCharacteristics.FLASH_SINGLE_STRENGTH_DEFAULT_LEVEL) ?: 1 else 1,
             zsl = CaptureRequest.CONTROL_ENABLE_ZSL in requestKeys,
             sessionQueries = Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM && manager.isCameraDeviceSetupSupported(id),
             video = map.getOutputSizes(MediaRecorder::class.java)?.map { PixelSize(it.width, it.height) }.orEmpty(),

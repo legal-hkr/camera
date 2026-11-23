@@ -40,6 +40,7 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
@@ -87,6 +88,8 @@ fun ZoomRow(
     modifier: Modifier = Modifier,
     /** Hidden while recording (SPEC §4.6). */
     showQuickSettings: Boolean = true,
+    /** The numbers and the button turn with the phone (SPEC §18). */
+    turn: Float = 0f,
 ) {
     val haptics = rememberHaptics()
     val numbers = rememberNumbers()
@@ -159,7 +162,7 @@ fun ZoomRow(
                         scale.ultrawide?.let { wide ->
                             val selected = zoom < start - 1e-6
                             val label = if (selected) stringResource(R.string.value_zoom, numbers.zoom(wide.ratio)) else numbers.zoom(wide.ratio)
-                            ZoomPill(label, selected, stringResource(R.string.tooltip_ultrawide), Modifier.height(44.dp).defaultMinSize(minWidth = 44.dp).finderGlass(CircleShape, glassColor())) {
+                            ZoomPill(label, selected, stringResource(R.string.tooltip_ultrawide), Modifier.height(44.dp).defaultMinSize(minWidth = 44.dp).finderGlass(CircleShape, glassColor()), turn) {
                                 haptics.detent()
                                 onZoom(wide.ratio)
                             }
@@ -181,7 +184,7 @@ fun ZoomRow(
                                 // The stop the value is on, or the nearest one below it, shows the value
                                 val current = zoom >= stop.ratio - 1e-6 && zoom < next - 1e-6
                                 val label = if (current) stringResource(R.string.value_zoom, numbers.zoom(zoom)) else numbers.zoom(stop.ratio)
-                                ZoomPill(label, current, label, Modifier.height(36.dp).defaultMinSize(minWidth = 36.dp)) {
+                                ZoomPill(label, current, label, Modifier.height(36.dp).defaultMinSize(minWidth = 36.dp), turn) {
                                     haptics.detent()
                                     onZoom(stop.ratio)
                                 }
@@ -197,14 +200,14 @@ fun ZoomRow(
             exit = fadeOut(MaterialTheme.motionScheme.fastEffectsSpec()),
             modifier = Modifier.align(Alignment.CenterEnd).padding(end = 8.dp),
         ) {
-            GlassIconButton(R.drawable.ic_tune, stringResource(R.string.tooltip_quick_settings), selected = quickSettingsOpen, size = 44, iconSize = 22, onClick = onQuickSettings)
+            GlassIconButton(R.drawable.ic_tune, stringResource(R.string.tooltip_quick_settings), selected = quickSettingsOpen, size = 44, iconSize = 22, turn = turn, onClick = onQuickSettings)
         }
     }
 }
 
 /** A stop of the zoom: the selected one in `primaryContainer` with "×", the others the bare number. */
 @Composable
-private fun ZoomPill(label: String, selected: Boolean, description: String, modifier: Modifier, onClick: () -> Unit) {
+private fun ZoomPill(label: String, selected: Boolean, description: String, modifier: Modifier, turn: Float, onClick: () -> Unit) {
     val colors = MaterialTheme.colorScheme
     Box(
         contentAlignment = Alignment.Center,
@@ -218,6 +221,7 @@ private fun ZoomPill(label: String, selected: Boolean, description: String, modi
             label,
             style = if (selected) MaterialTheme.typography.labelLarge else MaterialTheme.typography.labelMedium,
             color = if (selected) colors.onPrimaryContainer else colors.onSurface,
+            modifier = Modifier.rotate(turn),
         )
     }
 }
@@ -246,7 +250,7 @@ private fun zoomTicks(scale: ZoomScale?, numbers: Numbers): List<Tick> {
 
 /** A round icon button of finder glass (the quick-settings button), `secondaryContainer` while what it opens is open; long press shows its name. */
 @Composable
-fun GlassIconButton(icon: Int, label: String, selected: Boolean, size: Int, iconSize: Int, onClick: () -> Unit) {
+fun GlassIconButton(icon: Int, label: String, selected: Boolean, size: Int, iconSize: Int, turn: Float = 0f, onClick: () -> Unit) {
     val colors = MaterialTheme.colorScheme
     TooltipBox(
         positionProvider = TooltipDefaults.rememberTooltipPositionProvider(TooltipAnchorPosition.Above),
@@ -261,7 +265,7 @@ fun GlassIconButton(icon: Int, label: String, selected: Boolean, size: Int, icon
                 .clickable(role = Role.Button, onClick = onClick)
                 .semantics { contentDescription = label },
         ) {
-            Icon(painterResource(icon), contentDescription = null, tint = if (selected) colors.onSecondaryContainer else colors.onSurface, modifier = Modifier.width(iconSize.dp).height(iconSize.dp))
+            Icon(painterResource(icon), contentDescription = null, tint = if (selected) colors.onSecondaryContainer else colors.onSurface, modifier = Modifier.width(iconSize.dp).height(iconSize.dp).rotate(turn))
         }
     }
 }

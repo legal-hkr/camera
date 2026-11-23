@@ -19,6 +19,7 @@ import android.hardware.camera2.params.DynamicRangeProfiles
 import android.hardware.camera2.params.MeteringRectangle
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
+import android.location.Location
 import android.media.AudioManager
 import android.media.Image
 import android.media.ImageReader
@@ -71,7 +72,7 @@ import sh.hnet.camera.capabilities.model.VideoChoice
 enum class Mode { PHOTO, VIDEO }
 
 /** What the viewfinder wants: which camera, in which mode and aspect ratio. */
-data class CameraRequest(val camera: CameraSpec, val mode: Mode, val aspect: Aspect, val video: VideoChoice = VideoChoice()) {
+data class CameraRequest(val camera: CameraSpec, val mode: Mode, val aspect: Aspect, val video: VideoChoice = VideoChoice(), val ultraHdr: Boolean = true) {
     /** The aspect the preview and the session use: video is always 16:9. */
     val pictureAspect: Aspect get() = if (mode == Mode.VIDEO) Aspect.SIXTEEN_NINE else aspect
 }
@@ -107,11 +108,26 @@ data class EngineState(
     /** A frame of the current session has been shown (the viewfinder's crossfade ends then). */
     val frameShown: Boolean = false,
     val focusing: Boolean = false,
+    /** The scene is dark (high sensitivity or a long exposure): the front camera's automatic screen flash fires. */
+    val dark: Boolean = false,
+    /** The flash is needed: the exposure says so, or the scene is dark (automatic flash: it will fire with the next photo). */
+    val flashNeeded: Boolean = false,
     val face: FaceMark? = null,
 )
 
-/** What the repeating request carries besides the template: zoom, exposure, the tapped point, the AE/AF lock. */
-data class Controls(val zoom: Double = 1.0, val exposure: Int = 0, val focus: Point? = null, val locked: Boolean = false, val torch: Boolean = false)
+enum class Flash { OFF, AUTO, ON }
+
+/** What the repeating request carries besides the template: zoom, exposure, the tapped point, the AE/AF lock, the flash, the torch (flashlight, timer's LED). */
+data class Controls(
+    val zoom: Double = 1.0,
+    val exposure: Int = 0,
+    val focus: Point? = null,
+    val locked: Boolean = false,
+    val torch: Boolean = false,
+    val flash: Flash = Flash.OFF,
+    /** The flash's strength level, null for the camera's default. */
+    val flashLevel: Int? = null,
+)
 
 /** A still as it came from the camera, with the crop the app still has to make for its aspect ratio. */
 class CapturedPhoto(val bytes: ByteArray, val format: StillFormat, val crop: PixelSize?, val takenAt: Long)
@@ -170,6 +186,11 @@ class CameraEngine(context: Context) {
     private var capture: CompletableDeferred<Unit>? = null
     /** The exposure has settled on the last frame (converged, or decided it needs the flash). */
     private val aeSettled = MutableStateFlow(false)
+    /** The exposure's state on the last frame. */
+    private val aeState = MutableStateFlow<Int?>(null)
+    /** The pre-capture metering began after the last trigger. */
+    @Volatile
+    private var precaptureSeen = false
     private var shownFace: FaceMark? = null
 
     /** How the phone is held (0, 90, 180, 270): faces stand that way, which tells the face mark its long side. */
@@ -255,6 +276,12 @@ class CameraEngine(context: Context) {
         repeat()
     }
 
+    /** The photo flash (the front camera's screen flash is the viewfinder's; the camera only meters for it). */
+    fun setFlash(flash: Flash, level: Int?) = scope.launch {
+        controls = controls.copy(flash = flash, flashLevel = level)
+        repeat()
+    }
+
     fun setExposure(steps: Int) = scope.launch {
         controls = controls.copy(exposure = steps)
         repeat()
@@ -266,7 +293,8 @@ class CameraEngine(context: Context) {
         controls = controls.copy(focus = point, locked = false)
         aeSettled.value = false
         repeat()
-        trigger(CameraMetadata.CONTROL_AF_TRIGGER_START, precapture = lock)
+        // The lock meters with plain auto-exposure: no pre-flash for a lock
+        trigger(CameraMetadata.CONTROL_AF_TRIGGER_START, precapture = lock, flashMetering = false)
         if (!lock) return@launch
         lockJob = scope.launch {
             // A few frames for the new region to count, then until the exposure settles (at most a moment)
@@ -283,16 +311,16 @@ class CameraEngine(context: Context) {
     fun resetFocus(exposure: Int? = null) = scope.launch {
         lockJob?.cancel()
         controls = controls.copy(focus = null, locked = false, exposure = exposure ?: controls.exposure)
-        trigger(CameraMetadata.CONTROL_AF_TRIGGER_CANCEL, precapture = false)
+        trigger(CameraMetadata.CONTROL_AF_TRIGGER_CANCEL, precapture = false, flashMetering = false)
         repeat()
     }
 
     /** Takes a still; [onShutter] runs on the camera thread when the exposure starts (the blink, the sound). Null when there is no session or the camera didn't deliver. */
-    suspend fun takePhoto(deviceRotation: Int, onShutter: () -> Unit): CapturedPhoto? = withContext(dispatcher) {
+    suspend fun takePhoto(deviceRotation: Int, location: Location?, precapture: Boolean, onShutter: () -> Unit): CapturedPhoto? = withContext(dispatcher) {
         val done = CompletableDeferred<Unit>()
         capture = done
         try {
-            shoot(deviceRotation, onShutter)
+            shoot(deviceRotation, location, precapture, onShutter)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -304,16 +332,34 @@ class CameraEngine(context: Context) {
         }
     }
 
-    private suspend fun shoot(deviceRotation: Int, onShutter: () -> Unit): CapturedPhoto? {
+    /**
+     * [precapture]: meter first (the flash's pre-flash, or the front camera's screen lit as its flash) and take the photo once the exposure has settled; the
+     * camera's own buffer of frames (ZSL) can't be used then.
+     */
+    private suspend fun shoot(deviceRotation: Int, location: Location?, precapture: Boolean, onShutter: () -> Unit): CapturedPhoto? {
         val session = session ?: return null
         val output = still ?: return null
         val request = desired.value.request ?: return null
         val device = device ?: return null
+        // The flash meters first: always when on, when auto only if the exposure says the flash is needed (daylight shots stay quick, from the buffer)
+        val flashShot = request.mode == Mode.PHOTO && request.camera.flash && !controls.torch && (controls.flash == Flash.ON || (controls.flash == Flash.AUTO && _state.value.flashNeeded))
+        val metered = precapture || flashShot
+        // A locked exposure stays as it is: metering again would wait in vain
+        if (metered && !controls.locked) {
+            precaptureSeen = false
+            trigger(CameraMetadata.CONTROL_AF_TRIGGER_IDLE, precapture = true, flashMetering = true)
+            withTimeoutOrNull(PRECAPTURE_MAX_MS) {
+                // Into the pre-capture metering (seen by the results, which may pass it between two looks), then out of it
+                while (!(precaptureSeen && aeState.value != CameraMetadata.CONTROL_AE_STATE_PRECAPTURE)) delay(PRECAPTURE_POLL_MS)
+            }
+        }
         val video = request.mode == Mode.VIDEO
         val builder = device.createCaptureRequest(if (video) CameraDevice.TEMPLATE_VIDEO_SNAPSHOT else CameraDevice.TEMPLATE_STILL_CAPTURE)
         builder.addTarget(output.reader.surface)
         applyControls(builder, request)
-        if (request.camera.zsl && !video) builder.set(CaptureRequest.CONTROL_ENABLE_ZSL, true)
+        // Set either way: the still template may turn the buffer on by itself, and a flash photo must not come from it
+        if (request.camera.zsl) builder.set(CaptureRequest.CONTROL_ENABLE_ZSL, !video && !metered)
+        location?.let { builder.set(CaptureRequest.JPEG_GPS_LOCATION, it) }
         builder.set(CaptureRequest.JPEG_ORIENTATION, Orientation.jpeg(request.camera.sensorOrientation, deviceRotation, request.camera.front))
         builder.set(CaptureRequest.JPEG_QUALITY, JPEG_QUALITY)
         output.drain()
@@ -480,7 +526,7 @@ class CameraEngine(context: Context) {
     private fun rungs(request: CameraRequest): List<Rung> {
         val spec = request.camera
         return when (request.mode) {
-            Mode.PHOTO -> SessionLadder.photo(spec.hlg, spec.jpegR.isNotEmpty(), wantMotion = false, wantAnalysis = false).map { Rung(it.range, it.still, null) }
+            Mode.PHOTO -> SessionLadder.photo(spec.hlg, spec.jpegR.isNotEmpty(), wantMotion = false, wantAnalysis = false, wantUltraHdr = request.ultraHdr).map { Rung(it.range, it.still, null) }
             Mode.VIDEO -> {
                 val hevc = Encoders.hevc()
                 SessionLadder.video(request.video, spec.hlg, spec.jpegR.isNotEmpty(), spec.video, spec.fixedFps, Encoders.limits(hevc))
@@ -693,7 +739,8 @@ class CameraEngine(context: Context) {
     }
 
     /** A one-off request with an AF trigger (and the exposure's precapture metering for a lock), on top of the repeating one. */
-    private fun trigger(af: Int, precapture: Boolean) {
+    /** [flashMetering]: the pre-capture meters with the flash's exposure mode (a flash shot), else with plain auto-exposure (a lock). */
+    private fun trigger(af: Int, precapture: Boolean, flashMetering: Boolean) {
         val session = session ?: return
         val device = device ?: return
         val surface = previewSurface ?: return
@@ -704,6 +751,7 @@ class CameraEngine(context: Context) {
             builder.addTarget(surface)
             addRecordingTarget(builder)
             applyControls(builder, request)
+            if (!flashMetering) builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
             if (request.camera.autofocus) builder.set(CaptureRequest.CONTROL_AF_TRIGGER, af)
             if (precapture) builder.set(CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER, CameraMetadata.CONTROL_AE_PRECAPTURE_TRIGGER_START)
             session.capture(builder.build(), null, handler)
@@ -724,7 +772,23 @@ class CameraEngine(context: Context) {
             if (video.fps in spec.fixedFps) builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(video.fps, video.fps))
             if (spec.videoStabilization) builder.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON)
         }
-        if (request.mode == Mode.VIDEO && spec.flash) builder.set(CaptureRequest.FLASH_MODE, if (controls.torch) CameraMetadata.FLASH_MODE_TORCH else CameraMetadata.FLASH_MODE_OFF)
+        if (spec.flash) {
+            // The torch (flashlight, the timer's LED) needs plain auto-exposure; the photo flash is the exposure's mode
+            val photoFlash = request.mode == Mode.PHOTO && !controls.torch
+            builder.set(
+                CaptureRequest.CONTROL_AE_MODE,
+                when {
+                    photoFlash && controls.flash == Flash.AUTO -> CameraMetadata.CONTROL_AE_MODE_ON_AUTO_FLASH
+                    photoFlash && controls.flash == Flash.ON -> CameraMetadata.CONTROL_AE_MODE_ON_ALWAYS_FLASH
+                    else -> CameraMetadata.CONTROL_AE_MODE_ON
+                },
+            )
+            builder.set(CaptureRequest.FLASH_MODE, if (controls.torch) CameraMetadata.FLASH_MODE_TORCH else CameraMetadata.FLASH_MODE_OFF)
+            // The strength is the photo flash's (the torch has its own range)
+            if (photoFlash && Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM && spec.flashLevels > 1) {
+                controls.flashLevel?.let { builder.set(CaptureRequest.FLASH_STRENGTH_LEVEL, it.coerceIn(1, spec.flashLevels)) }
+            }
+        }
         val point = controls.focus
         if (spec.autofocus) {
             val continuous = if (request.mode == Mode.VIDEO) CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO else CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE
@@ -750,10 +814,20 @@ class CameraEngine(context: Context) {
             val request = desired.value.request ?: return
             val afState = result.get(CaptureResult.CONTROL_AF_STATE)
             val aeState = result.get(CaptureResult.CONTROL_AE_STATE)
+            this@CameraEngine.aeState.value = aeState
+            if (aeState == CameraMetadata.CONTROL_AE_STATE_PRECAPTURE) precaptureSeen = true
             aeSettled.value = aeState == null || aeState == CameraMetadata.CONTROL_AE_STATE_CONVERGED || aeState == CameraMetadata.CONTROL_AE_STATE_FLASH_REQUIRED || aeState == CameraMetadata.CONTROL_AE_STATE_LOCKED
             val focusing = afState == CameraMetadata.CONTROL_AF_STATE_ACTIVE_SCAN || afState == CameraMetadata.CONTROL_AF_STATE_PASSIVE_SCAN
             val face = steadyFace(focusedFace(result, request))
-            _state.update { if (it.frameShown && it.focusing == focusing && it.face == face) it else it.copy(frameShown = true, focusing = focusing, face = face) }
+            val iso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0
+            val exposure = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L
+            val dark = iso >= DARK_ISO || exposure >= DARK_EXPOSURE_NS
+            // The exposure's own word where the camera gives it; the Pixel doesn't in the preview, so a dark scene counts too (as for the front camera's screen flash)
+            val flashNeeded = aeState == CameraMetadata.CONTROL_AE_STATE_FLASH_REQUIRED || dark
+            _state.update {
+                if (it.frameShown && it.focusing == focusing && it.face == face && it.dark == dark && it.flashNeeded == flashNeeded) it
+                else it.copy(frameShown = true, focusing = focusing, face = face, dark = dark, flashNeeded = flashNeeded)
+            }
         }
     }
 
@@ -851,6 +925,10 @@ class CameraEngine(context: Context) {
         const val LOCK_MIN_WAIT_MS = 150L
         const val LOCK_MAX_WAIT_MS = 800L
         const val SILENCE_CHECK_MS = 500L
+        const val PRECAPTURE_MAX_MS = 1_500L
+        const val PRECAPTURE_POLL_MS = 16L
+        const val DARK_ISO = 1600
+        const val DARK_EXPOSURE_NS = 50_000_000L
         /** The reported inner face grown to the whole face: across it (cheek to cheek) and along it (forehead to chin). */
         const val FACE_ACROSS = 1.6
         const val FACE_ALONG = 2.2

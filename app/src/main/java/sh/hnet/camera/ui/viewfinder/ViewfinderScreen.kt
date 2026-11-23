@@ -13,6 +13,7 @@ import android.os.SystemClock
 import android.provider.MediaStore
 import android.provider.Settings
 import android.view.OrientationEventListener
+import android.view.WindowManager
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.LocalActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -43,21 +44,22 @@ import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.requiredSize
+import androidx.compose.foundation.layout.statusBarsIgnoringVisibility
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
-import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilledTonalIconButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.LoadingIndicator
+import androidx.compose.material3.MaterialShapes
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.PlainTooltip
@@ -71,7 +73,9 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TooltipAnchorPosition
 import androidx.compose.material3.TooltipBox
 import androidx.compose.material3.TooltipDefaults
+import androidx.compose.material3.lightColorScheme
 import androidx.compose.material3.rememberTooltipState
+import androidx.compose.material3.toShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -89,6 +93,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
@@ -105,6 +110,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
@@ -122,11 +128,13 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import sh.hnet.camera.R
 import sh.hnet.camera.camera.CameraStatus
+import sh.hnet.camera.camera.Flash
 import sh.hnet.camera.camera.Mode
 import sh.hnet.camera.camera.Recording
 import sh.hnet.camera.capabilities.model.Aspect
 import sh.hnet.camera.capabilities.model.Orientation
 import sh.hnet.camera.capabilities.model.Point
+import sh.hnet.camera.capabilities.model.SessionLadder
 import sh.hnet.camera.media.LastShot
 import sh.hnet.camera.ui.components.EmptyState
 
@@ -209,7 +217,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, onOpenSettings: () -> Uni
         viewModel.start()
         onStopOrDispose { viewModel.stop() }
     }
-    // How the phone is held, for the photo's orientation (the controls turn with it in stage 1c)
+    // How the phone is held: the photo's orientation, and the controls turn with it
     DisposableEffect(Unit) {
         val listener = object : OrientationEventListener(context) {
             override fun onOrientationChanged(orientation: Int) {
@@ -242,8 +250,17 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, onOpenSettings: () -> Uni
     val cover by animateFloatAsState(if (engine.frameShown) 0f else 1f, if (engine.frameShown) tween(300) else snap(), label = "cover")
 
     val recording = engine.recording
-    // Back while recording ends it and saves; a second Back leaves (SPEC §3)
-    BackHandler(enabled = recording != null) { viewModel.record() }
+    // Back while recording ends it and saves, during a countdown cancels it; a second Back leaves (SPEC §3)
+    BackHandler(enabled = recording != null || ui.countdown != null) { if (!viewModel.cancelTimer()) viewModel.record() }
+    // The volume keys go to the viewfinder while it is shown (SPEC §7.9)
+    DisposableEffect(viewModel) {
+        HardwareKeys.handler = { viewModel.onVolumeKey(it) }
+        onDispose { HardwareKeys.handler = null }
+    }
+    LaunchedEffect(Unit) { viewModel.countdownTick.collect { haptics.mode() } }
+    val turn = controlTurn(ui.rotation)
+    val fix by viewModel.location.fix.collectAsStateWithLifecycle()
+    val tilt by viewModel.tilt.collectAsStateWithLifecycle()
 
     // The microphone is asked for on the first entry into Video (SPEC §16); without it videos have no sound
     val activity = LocalActivity.current
@@ -262,6 +279,20 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, onOpenSettings: () -> Uni
     val snackbars = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
     val micBusy = stringResource(R.string.msg_mic_busy)
+    val hdrFps = stringResource(R.string.msg_hdr_fps)
+    val locationDenied = stringResource(R.string.msg_location_denied)
+    fun explain(message: String) = scope.launch { snackbars.showSnackbar(message, duration = SnackbarDuration.Short) }
+    // Location is asked for when it is first turned on (SPEC §16); refused, it stays off and a snackbar says why
+    val locationLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
+        if (result.values.any { it }) viewModel.setLocation(true) else explain(locationDenied)
+    }
+    fun toggleLocation() {
+        when {
+            ui.settings.location -> viewModel.setLocation(false)
+            viewModel.location.allowed() -> viewModel.setLocation(true)
+            else -> locationLauncher.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION))
+        }
+    }
 
     val colors = MaterialTheme.colorScheme
     val problem = engine.status.takeIf { it is CameraStatus.Busy || it is CameraStatus.Blocked || it is CameraStatus.Error }
@@ -274,20 +305,31 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, onOpenSettings: () -> Uni
         val modeBottom = nav + 2.dp
         val shutterBottom = modeBottom + 36.dp + 14.dp
         val zoomBottom = shutterBottom + 80.dp + 12.dp
-        val canvas = maxHeight - shutterBottom - 80.dp - 4.dp
+        // The status bar's band stays free, hidden or not: icons there sat under the screen's rounded corners and the pulled-down bar (owner, 23 Nov 2026)
+        val status = WindowInsets.statusBarsIgnoringVisibility.asPaddingValues().calculateTopPadding()
+        val canvas = maxHeight - status - shutterBottom - 80.dp - 4.dp
         val aspect = request?.pictureAspect ?: Aspect.FOUR_THREE
         val portrait = aspect.width.toFloat() / aspect.height
         var pictureWidth = maxWidth
         var pictureHeight: Dp = maxWidth * portrait
+        // 16:9 fills the canvas's width, a few pixels cut off its ends in the preview only (owner, 23 Nov 2026); the other ratios fit inside the canvas
+        val fill = aspect == Aspect.SIXTEEN_NINE
         if (pictureHeight > canvas) {
             pictureHeight = canvas
-            pictureWidth = canvas / portrait
+            if (!fill) pictureWidth = canvas / portrait
         }
         val pictureTop = (canvas - pictureHeight) / 2
         val pictureLeft = (maxWidth - pictureWidth) / 2
 
-        // The picture: the preview's surface, the cover while a session starts, the blink of a shot, the marks and the gestures
-        Box(Modifier.offset(pictureLeft, pictureTop).size(pictureWidth, pictureHeight)) {
+        // The picture: the preview's surface, the cover while a session starts, the blink of a shot, the marks and the gestures. A square shot is previewed
+        // in 4:3 with the picture's box cutting it; the surface's box is the one that taps and marks refer to.
+        val surfaceHeight = when {
+            aspect == Aspect.SQUARE -> pictureWidth * 4f / 3f
+            fill -> pictureWidth * portrait
+            else -> pictureHeight
+        }
+        Box(Modifier.offset(pictureLeft, status + pictureTop).size(pictureWidth, pictureHeight).clipToBounds(), contentAlignment = Alignment.Center) {
+          Box(Modifier.requiredSize(pictureWidth, surfaceHeight)) {
             if (previewSize != null && problem == null) {
                 key(previewSize) {
                     AndroidExternalSurface(Modifier.fillMaxSize(), surfaceSize = IntSize(previewSize.width, previewSize.height)) {
@@ -343,33 +385,96 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, onOpenSettings: () -> Uni
                             }
                         },
                 )
-            } else {
-                CameraProblem(problem, onRetry = { viewModel.retry() }, modifier = Modifier.align(Alignment.Center).padding(16.dp))
             }
+          }
+          if (problem == null) {
+              GridAndLevel(ui.settings.grid, if (ui.settings.level) tilt else null, ui.rotation, Modifier.fillMaxSize())
+              ui.countdown?.let { Countdown(it, turn, Modifier.align(Alignment.Center)) }
+          } else {
+              CameraProblem(problem, onRetry = { viewModel.retry() }, modifier = Modifier.align(Alignment.Center).padding(16.dp))
+          }
         }
 
-        // The top row: the flashlight in Video (the other state icons come with stage 1c), level with the camera's cutout, beside it
-        if (ui.mode == Mode.VIDEO && camera?.flash == true && problem == null) {
-            Box(Modifier.align(Alignment.TopStart).padding(start = 12.dp, top = topRowTop(start = 12.dp, end = 52.dp))) {
-                GlassIconButton(
-                    if (ui.torch) R.drawable.ic_flashlight_on else R.drawable.ic_flashlight_off,
-                    stringResource(R.string.tooltip_flashlight),
-                    selected = ui.torch,
-                    size = 40,
-                    iconSize = 20,
-                    onClick = { viewModel.toggleTorch() },
-                )
+        // The top row (SPEC §4.3, §6.3): state icons in two groups beside the camera's cutout; while recording only the flashlight
+        if (problem == null && camera != null) {
+            val video = ui.mode == Mode.VIDEO
+            val settings = ui.settings
+            Row(Modifier.align(Alignment.TopStart).padding(start = 12.dp, top = topRowTop(status, start = 12.dp, end = 140.dp)), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                if (video && camera.flash) {
+                    TopButton(if (ui.torch) R.drawable.ic_flashlight_on else R.drawable.ic_flashlight_off, stringResource(R.string.tooltip_flashlight), null, filled = ui.torch, turn = turn) { viewModel.toggleTorch() }
+                }
+                if (!video && (camera.flash || camera.front)) {
+                    MenuButton(listOf(Flash.entries.map { f -> MenuChoice(stringResource(flashName(f)), f == ui.flash) { viewModel.setFlash(f) } })) { open ->
+                        // Automatic: the button's background shows when the flash will fire (the exposure asks for it, or the scene is dark)
+                        val willFire = ui.flash == Flash.AUTO && if (camera.front) engine.dark else engine.flashNeeded
+                        TopButton(flashIcon(ui.flash), stringResource(R.string.tooltip_flash), stringResource(flashState(ui.flash)), filled = ui.flash != Flash.OFF, turn = turn, accent = willFire, onClick = open)
+                    }
+                }
+                if (recording == null && ui.countdown == null) {
+                    MenuButton(listOf(listOf(0, 3, 10).map { t -> MenuChoice(if (t == 0) stringResource(R.string.menu_timer_off) else stringResource(R.string.value_seconds, t), t == ui.timer) { viewModel.setTimer(t) } })) { open ->
+                        TopButton(timerIcon(ui.timer), stringResource(R.string.tooltip_timer), null, filled = ui.timer != 0, turn = turn, onClick = open)
+                    }
+                    val searching = settings.location && (fix == null || viewModel.location.current() == null)
+                    TopButton(
+                        if (!settings.location) R.drawable.ic_location_off else if (searching) R.drawable.ic_location_searching else R.drawable.ic_location_on,
+                        stringResource(R.string.tooltip_location),
+                        stringResource(if (!settings.location) R.string.desc_state_location_off else if (searching) R.string.desc_state_location_searching else R.string.desc_state_location_on),
+                        filled = settings.location,
+                        turn = turn,
+                    ) { toggleLocation() }
+                }
+            }
+            // Nothing that rebuilds the session while a countdown runs or a recording goes on
+            if (recording == null && ui.countdown == null) {
+                Row(Modifier.align(Alignment.TopEnd).padding(end = 12.dp, top = topRowTop(status, start = maxWidth - 148.dp, end = maxWidth - 12.dp)), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    val hdrAvailable = if (video) camera.hlg else camera.jpegR.isNotEmpty()
+                    if (hdrAvailable) {
+                        val possible = !video || viewModel.videoHdrPossible
+                        val on = (if (video) settings.hdrVideo else settings.ultraHdr) && possible
+                        TopButton(
+                            if (on) R.drawable.ic_hdr_on else R.drawable.ic_hdr_off,
+                            stringResource(R.string.tooltip_hdr),
+                            stringResource(if (on) R.string.desc_state_hdr_on else R.string.desc_state_hdr_off),
+                            // HDR on is the default; off is the value that stands out
+                            filled = !on,
+                            turn = turn,
+                            enabled = possible,
+                            onDisabled = { explain(hdrFps) },
+                        ) { viewModel.toggleHdr() }
+                    }
+                    if (video) {
+                        val uhdAvailable = SessionLadder.UHD in camera.video
+                        val rates = videoRates(camera.fixedFps)
+                        val groups = buildList {
+                            if (uhdAvailable) add(listOf(MenuChoice(stringResource(R.string.menu_resolution_4k), settings.videoUhd) { viewModel.setVideoSize(true) }, MenuChoice(stringResource(R.string.menu_resolution_1080p), !settings.videoUhd) { viewModel.setVideoSize(false) }))
+                            add(rates.map { fps -> MenuChoice(stringResource(R.string.value_fps, fps), fps == settings.videoFps, if (fps > SessionLadder.HLG_MAX_FPS && camera.hlg) stringResource(R.string.desc_fps_no_hdr) else null) { viewModel.setVideoFps(fps) } })
+                        }
+                        // What the session records, once it runs (the ladder may have fallen back from the choice)
+                        val recorded = engine.video
+                        val uhd = recorded?.let { it.size.width >= SessionLadder.UHD.width } ?: (settings.videoUhd && uhdAvailable)
+                        val label = stringResource(R.string.value_video_quality, stringResource(if (uhd) R.string.menu_resolution_4k else R.string.menu_resolution_1080p), recorded?.fps ?: settings.videoFps)
+                        // Held sideways the pill is too narrow for "4K 30" turned: "4K" over "30"
+                        val sideways = ui.rotation == 90 || ui.rotation == 270
+                        val stacked = if (sideways) listOf(stringResource(if (uhd) R.string.menu_resolution_4k else R.string.menu_resolution_1080p), "${recorded?.fps ?: settings.videoFps}") else null
+                        MenuButton(groups) { open -> TopTextButton(label, stringResource(R.string.tooltip_video_quality), filled = false, turn = turn, stacked = stacked, onClick = open) }
+                    } else {
+                        MenuButton(listOf(Aspect.entries.map { a -> MenuChoice(aspectText(a), a == settings.aspect) { viewModel.setAspect(a) } })) { open ->
+                            TopTextButton(aspectText(settings.aspect), stringResource(R.string.tooltip_aspect_ratio), filled = settings.aspect != Aspect.FOUR_THREE, turn = turn, onClick = open)
+                        }
+                    }
+                }
             }
         }
         // The recording's time, centred under the cutout
-        if (recording != null) RecordingTime(recording, Modifier.align(Alignment.TopCenter).padding(top = 56.dp))
+        // In line with the top row, in its free middle
+        if (recording != null) RecordingTime(recording, Modifier.align(Alignment.TopCenter).padding(top = status + 10.dp))
         // Indicators at the picture's top-start: no sound in Video
         val noSound = ui.mode == Mode.VIDEO && problem == null && (!micGranted || recording?.silenced == true)
         if (noSound) {
             IndicatorChip(
                 R.drawable.ic_mic_off,
                 stringResource(R.string.label_no_sound),
-                Modifier.align(Alignment.TopStart).padding(start = 12.dp, top = maxOf(52.dp, pictureTop) + 8.dp),
+                Modifier.align(Alignment.TopStart).padding(start = 12.dp, top = status + maxOf(52.dp, pictureTop) + 8.dp),
             ) {
                 if (!micGranted) micLauncher.launch(Manifest.permission.RECORD_AUDIO)
                 else scope.launch { snackbars.showSnackbar(micBusy, duration = SnackbarDuration.Short) }
@@ -411,6 +516,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, onOpenSettings: () -> Uni
             onQuickSettings = { quickSettings = true },
             quickSettingsOpen = quickSettings,
             showQuickSettings = recording == null,
+            turn = turn,
             modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = zoomBottom - 4.dp),
         )
 
@@ -419,34 +525,47 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, onOpenSettings: () -> Uni
             if (recording != null) {
                 // While recording: pause or resume in the thumbnail's place, a photo in the camera switch's
                 val paused = recording.pausedAt != null
-                RowButton(if (paused) R.drawable.ic_play_arrow else R.drawable.ic_pause, stringResource(if (paused) R.string.tooltip_resume else R.string.tooltip_pause), Modifier.align(Alignment.CenterStart).padding(start = 34.dp)) {
+                RowButton(if (paused) R.drawable.ic_play_arrow else R.drawable.ic_pause, stringResource(if (paused) R.string.tooltip_resume else R.string.tooltip_pause), turn, Modifier.align(Alignment.CenterStart).padding(start = 34.dp)) {
                     if (paused) viewModel.resumeRecording() else viewModel.pauseRecording()
                 }
                 if (engine.video != null && engine.range != null) {
-                    RowButton(R.drawable.ic_photo_camera, stringResource(R.string.tooltip_photo_while_recording), Modifier.align(Alignment.CenterEnd).padding(end = 34.dp)) { viewModel.shoot() }
+                    RowButton(R.drawable.ic_photo_camera, stringResource(R.string.tooltip_photo_while_recording), turn, Modifier.align(Alignment.CenterEnd).padding(end = 34.dp)) { viewModel.shoot() }
                 }
             } else {
-                Thumbnail(last, Modifier.align(Alignment.CenterStart).padding(start = 34.dp))
-                if (viewModel.cameras.size > 1) SwitchCameraButton(onClick = { viewModel.switchCamera() }, modifier = Modifier.align(Alignment.CenterEnd).padding(end = 34.dp))
+                Thumbnail(last, turn, Modifier.align(Alignment.CenterStart).padding(start = 34.dp))
+                if (viewModel.cameras.size > 1) SwitchCameraButton(turn, onClick = { viewModel.switchCamera() }, modifier = Modifier.align(Alignment.CenterEnd).padding(end = 34.dp))
             }
             val video = ui.mode == Mode.VIDEO
+            val counting = ui.countdown != null
             ShutterButton(
-                look = if (recording != null) ShutterLook.RECORDING else if (video) ShutterLook.VIDEO else ShutterLook.PHOTO,
-                label = stringResource(if (recording != null) R.string.content_description_shutter_stop else if (video) R.string.content_description_shutter_record else R.string.content_description_shutter_photo),
+                look = when {
+                    counting -> ShutterLook.TIMER
+                    recording != null -> ShutterLook.RECORDING
+                    video -> ShutterLook.VIDEO
+                    else -> ShutterLook.PHOTO
+                },
+                label = stringResource(
+                    when {
+                        counting -> R.string.content_description_shutter_cancel_timer
+                        recording != null -> R.string.content_description_shutter_stop
+                        video -> R.string.content_description_shutter_record
+                        else -> R.string.content_description_shutter_photo
+                    },
+                ),
                 enabled = engine.status == CameraStatus.Ready && (!video || (engine.video != null && !engine.finishing)),
+                progress = ui.countdown?.let { 1f - it.toFloat() / ui.timer.coerceAtLeast(1) },
+                turn = turn,
                 onClick = {
-                    if (video) {
+                    if (video && !counting && ui.timer == 0) {
                         if (recording != null) haptics.photo() else haptics.lock()
-                        viewModel.record()
-                    } else {
-                        viewModel.shoot()
                     }
+                    viewModel.shutterPressed()
                 },
                 modifier = Modifier.align(Alignment.Center),
             )
         }
 
-        if (recording == null) ModeRow(
+        if (recording == null && ui.countdown == null) ModeRow(
             modes = modes,
             selected = ui.mode,
             label = { stringResource(if (it == Mode.VIDEO) R.string.label_mode_video else R.string.label_mode_photo) },
@@ -458,22 +577,66 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, onOpenSettings: () -> Uni
         )
     }
 
-    if (quickSettings) {
+    if (ui.screenFlash) ScreenFlash(viewModel::onScreenLit)
+
+    if (quickSettings && camera != null) {
+        val settings = ui.settings
         ModalBottomSheet(onDismissRequest = { quickSettings = false }, containerColor = colors.surfaceContainerLow) {
-            // Stage 1a: only the way to Settings; the quick settings themselves come with stage 1c
-            FilledTonalButton(
-                onClick = {
-                    quickSettings = false
-                    onOpenSettings()
-                },
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp).padding(bottom = 16.dp).height(48.dp),
-            ) {
-                Icon(painterResource(R.drawable.ic_settings), contentDescription = null, modifier = Modifier.size(ButtonDefaults.IconSize))
-                Spacer(Modifier.width(ButtonDefaults.IconSpacing))
-                Text(stringResource(R.string.button_panel_settings))
-            }
+            QuickSettings(
+                PanelState(
+                    video = ui.mode == Mode.VIDEO,
+                    flashAvailable = camera.flash || camera.front,
+                    flash = ui.flash,
+                    flashLevels = if (camera.front) 1 else camera.flashLevels,
+                    flashLevel = ui.flashLevel ?: camera.flashDefaultLevel,
+                    timer = ui.timer,
+                    aspect = settings.aspect,
+                    grid = settings.grid,
+                    level = settings.level,
+                    hdr = settings.hdrVideo,
+                    hdrPossible = viewModel.videoHdrPossible && camera.hlg,
+                    uhdAvailable = SessionLadder.UHD in camera.video,
+                    uhd = settings.videoUhd,
+                    fpsChoices = videoRates(camera.fixedFps),
+                    fps = settings.videoFps,
+                    torch = ui.torch,
+                    ultraHdrAvailable = camera.jpegR.isNotEmpty(),
+                    ultraHdr = settings.ultraHdr,
+                    location = settings.location,
+                ),
+                PanelActions(
+                    onFlash = viewModel::setFlash,
+                    onFlashLevel = viewModel::setFlashLevel,
+                    onTimer = viewModel::setTimer,
+                    onAspect = { viewModel.setAspect(it) },
+                    onGrid = { viewModel.setGrid(it) },
+                    onLevel = { viewModel.setLevel(it) },
+                    onHdr = {
+                        if (viewModel.videoHdrPossible) {
+                            viewModel.toggleHdr()
+                        } else {
+                            // The snackbar would stand behind the sheet
+                            quickSettings = false
+                            explain(hdrFps)
+                        }
+                    },
+                    onUltraHdr = { viewModel.toggleHdr() },
+                    onLocation = {
+                        if (!ui.settings.location && !viewModel.location.allowed()) quickSettings = false
+                        toggleLocation()
+                    },
+                    onUhd = { viewModel.setVideoSize(it) },
+                    onFps = { viewModel.setVideoFps(it) },
+                    onTorch = viewModel::toggleTorch,
+                    onSettings = {
+                        quickSettings = false
+                        onOpenSettings()
+                    },
+                ),
+            )
         }
     }
+
 }
 
 /** The exposure ruler: ±2 EV in thirds, a detent at zero; dragged directly. */
@@ -513,7 +676,7 @@ private fun ExposureRuler(steps: Int, stepEv: Double, stepsPerThird: Int, limits
 
 /** The thumbnail of the newest own shot (SPEC §8.1); a tap hands it to the gallery with the rest to swipe through. */
 @Composable
-private fun Thumbnail(last: LastShot?, modifier: Modifier) {
+private fun Thumbnail(last: LastShot?, turn: Float, modifier: Modifier) {
     val context = LocalContext.current
     val colors = MaterialTheme.colorScheme
     val label = stringResource(R.string.tooltip_last_shot)
@@ -534,8 +697,8 @@ private fun Thumbnail(last: LastShot?, modifier: Modifier) {
                     .semantics { contentDescription = label },
             ) {
                 val bitmap = last?.thumbnail
-                if (bitmap != null) Image(bitmap.asImageBitmap(), contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
-                else Icon(painterResource(R.drawable.ic_photo_library), contentDescription = null, tint = IconButtonDefaults.iconButtonColors().disabledContentColor)
+                if (bitmap != null) Image(bitmap.asImageBitmap(), contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize().rotate(turn))
+                else Icon(painterResource(R.drawable.ic_photo_library), contentDescription = null, tint = IconButtonDefaults.iconButtonColors().disabledContentColor, modifier = Modifier.rotate(turn))
             }
         }
     }
@@ -554,7 +717,7 @@ private fun openInGallery(context: Context, shot: LastShot) {
 
 /** The other camera: a 52 dp tonal circle whose icon turns half a turn on each tap. */
 @Composable
-private fun SwitchCameraButton(onClick: () -> Unit, modifier: Modifier) {
+private fun SwitchCameraButton(turn: Float, onClick: () -> Unit, modifier: Modifier) {
     var turns by remember { mutableIntStateOf(0) }
     val angle by animateFloatAsState(turns * 180f, MaterialTheme.motionScheme.defaultSpatialSpec(), label = "switch")
     val label = stringResource(R.string.tooltip_switch_camera)
@@ -573,7 +736,7 @@ private fun SwitchCameraButton(onClick: () -> Unit, modifier: Modifier) {
                 colors = IconButtonDefaults.filledTonalIconButtonColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
                 modifier = Modifier.size(52.dp),
             ) {
-                Icon(painterResource(R.drawable.ic_cameraswitch), contentDescription = label, modifier = Modifier.size(24.dp).rotate(angle))
+                Icon(painterResource(R.drawable.ic_cameraswitch), contentDescription = label, modifier = Modifier.size(24.dp).rotate(angle + turn))
             }
         }
     }
@@ -654,7 +817,7 @@ private fun NoCameraAccess(permanentlyDenied: Boolean, onAllow: () -> Unit, onOp
 
 /** A 52 dp tonal circle of the shutter row (pause, resume, photo while recording). */
 @Composable
-private fun RowButton(icon: Int, label: String, modifier: Modifier, onClick: () -> Unit) {
+private fun RowButton(icon: Int, label: String, turn: Float, modifier: Modifier, onClick: () -> Unit) {
     Box(modifier) {
         TooltipBox(
             positionProvider = TooltipDefaults.rememberTooltipPositionProvider(TooltipAnchorPosition.Above),
@@ -666,7 +829,7 @@ private fun RowButton(icon: Int, label: String, modifier: Modifier, onClick: () 
                 colors = IconButtonDefaults.filledTonalIconButtonColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
                 modifier = Modifier.size(52.dp),
             ) {
-                Icon(painterResource(icon), contentDescription = label, modifier = Modifier.size(24.dp))
+                Icon(painterResource(icon), contentDescription = label, modifier = Modifier.size(24.dp).rotate(turn))
             }
         }
     }
@@ -729,18 +892,65 @@ private fun IndicatorChip(icon: Int, label: String, modifier: Modifier, onClick:
 private const val TIME_TICK_MS = 250L
 
 /**
- * Where a group of the top row sits (SPEC §4.3): 6 dp from the top edge, level with the camera's cutout, as long as it keeps 16 dp from the cutout's bounds; a
- * group that would collide moves below the cutout instead.
+ * Where a group of the top row sits (SPEC §4.3): 6 dp under the status bar's band, as long as it keeps 16 dp from the camera cutout's bounds; a group that would
+ * collide with a cutout reaching lower moves below it.
  */
 @Composable
-private fun topRowTop(start: Dp, end: Dp): Dp {
+private fun topRowTop(status: Dp, start: Dp, end: Dp): Dp {
     val view = LocalView.current
     val density = LocalDensity.current
     val cutouts = view.rootWindowInsets?.displayCutout?.boundingRects.orEmpty()
     return with(density) {
         val left = (start - 16.dp).toPx()
         val right = (end + 16.dp).toPx()
-        val below = cutouts.filter { it.top < 52.dp.toPx() && it.right > left && it.left < right }.maxOfOrNull { it.bottom }
-        if (below == null) 6.dp else below.toDp() + 6.dp
+        val top = status.toPx()
+        val below = cutouts.filter { it.bottom > top && it.top < top + 52.dp.toPx() && it.right > left && it.left < right }.maxOfOrNull { it.bottom }
+        if (below == null) status + 6.dp else below.toDp() + 6.dp
+    }
+}
+
+/** The frame rates the camera holds for video, of 24, 30 and 60 (30 always: the ladder falls back to it). */
+fun videoRates(fixed: Set<Int>): List<Int> = listOf(24, 30, 60).filter { it == 30 || it in fixed }
+
+fun flashState(flash: Flash) = when (flash) {
+    Flash.OFF -> R.string.desc_state_flash_off
+    Flash.AUTO -> R.string.desc_state_flash_auto
+    Flash.ON -> R.string.desc_state_flash_on
+}
+
+/**
+ * The timer's countdown (SPEC §7.3): the digit in the middle of the picture on a 9-sided cookie, 128 sp (owner, 23 Nov 2026: readable from a step away), turned
+ * with the phone.
+ */
+@Composable
+private fun Countdown(seconds: Int, turn: Float, modifier: Modifier) {
+    val colors = MaterialTheme.colorScheme
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = modifier.size(216.dp).rotate(turn).clip(MaterialShapes.Cookie9Sided.toShape()).background(colors.surfaceContainerHigh),
+    ) {
+        Text(seconds.toString(), fontSize = 128.sp, lineHeight = 128.sp, color = colors.onSurface, style = MaterialTheme.typography.displayLarge.copy(fontFeatureSettings = "tnum"))
+    }
+}
+
+/**
+ * The front camera's flash (SPEC §7.2): the whole window in the light scheme's brightest surface (white in the dark theme too) at full brightness while the
+ * photo is taken.
+ */
+@Composable
+private fun ScreenFlash(onLit: (Boolean) -> Unit) {
+    val activity = LocalActivity.current
+    DisposableEffect(activity) {
+        val window = activity?.window
+        val before = window?.attributes?.screenBrightness
+        window?.attributes = window.attributes.apply { screenBrightness = 1f }
+        onLit(true)
+        onDispose {
+            onLit(false)
+            window?.attributes = window.attributes.apply { screenBrightness = before ?: WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE }
+        }
+    }
+    MaterialTheme(colorScheme = lightColorScheme()) {
+        Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surfaceContainerLowest))
     }
 }

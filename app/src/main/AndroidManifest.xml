@@ -6,6 +6,9 @@
     <uses-permission android:name="android.permission.CAMERA" />
     <!-- Stage 1b: sound in videos (asked on the first entry into Video) -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Stage 1c: the place in photos and videos, asked for when turned on; the coarse one is declared next to the fine one (Android 12+), the user may allow only it -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
 
     <uses-feature android:name="android.hardware.camera.any" android:required="true" />
 

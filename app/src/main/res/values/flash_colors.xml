@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The automatic flash that will fire: Calendar's amber (owner's exception to the theme colours, 23 Nov 2026), its light variant; values-night has the dark one -->
+<resources>
+    <color name="flash_ready_fill">#DAA93D</color>
+    <color name="flash_ready_on">#412D00</color>
+</resources>
