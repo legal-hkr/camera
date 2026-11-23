@@ -36,5 +36,29 @@
         <item quantity="other">Wersja %1$s, %2$d zmiany</item>
     </plurals>
     <string name="whats_new_updated_snackbar">Zaktualizowano do wersji %1$s</string>
-    <string name="msg_in_development">W budowie.</string>
+    <!-- Stage 1a: viewfinder -->
+    <string name="label_mode_photo">Zdjęcie</string>
+    <string name="label_mode_video">Wideo</string>
+    <string name="tooltip_quick_settings">Szybkie ustawienia</string>
+    <string name="tooltip_switch_camera">Przełącz kamerę</string>
+    <string name="tooltip_last_shot">Otwórz w galerii</string>
+    <string name="content_description_shutter_photo">Zrób zdjęcie</string>
+    <string name="content_description_shutter_record">Rozpocznij nagrywanie</string>
+    <string name="tooltip_ultrawide">Obiektyw ultraszerokokątny</string>
+    <string name="value_zoom">%1$s×</string>
+    <string name="label_ae_af_locked">AE/AF – zablokowane</string>
+    <string name="content_description_dismiss">Zamknij</string>
+    <string name="button_panel_settings">Ustawienia</string>
+    <string name="desc_no_camera_access">Bez dostępu do aparatu aplikacja nie może robić zdjęć ani nagrywać filmów.</string>
+    <string name="button_allow_access">Zezwól na dostęp</string>
+    <string name="button_open_app_settings">Otwórz ustawienia aplikacji</string>
+    <string name="button_settings">Ustawienia</string>
+    <string name="title_camera_busy">Aparat jest zajęty</string>
+    <string name="desc_camera_busy">Korzysta z niego inna aplikacja albo trwa rozmowa. Obraz pojawi się automatycznie, gdy aparat będzie wolny.</string>
+    <string name="desc_camera_blocked_admin">Aparat jest zablokowany przez administratora telefonu.</string>
+    <string name="title_camera_restarting">Ponowne uruchamianie aparatu…</string>
+    <string name="desc_camera_restarting">Aparat przestał działać. To potrwa chwilę.</string>
+    <string name="title_camera_failed">Aparat nie działa</string>
+    <string name="desc_camera_failed">Uruchom ponownie aparat albo telefon.</string>
+    <string name="button_restart_camera">Uruchom ponownie</string>
 </resources>

@@ -42,6 +42,7 @@ import sh.hnet.camera.ui.settings.LicensesScreen
 import sh.hnet.camera.ui.settings.ResetScreen
 import sh.hnet.camera.ui.settings.SettingsRootScreen
 import sh.hnet.camera.ui.settings.WhatsNewScreen
+import sh.hnet.camera.ui.viewfinder.ViewfinderScreen
 
 /** The app's shell: one back stack with the camera at its root (a camera has no navigation bar), Settings opened over it, snackbars. */
 @Composable
@@ -98,7 +99,7 @@ fun CameraApp() {
                     (slideOutHorizontally(spatial) { shift } + fadeOut(fastEffects))
             },
             entryProvider = entryProvider {
-                entry<Screen.Camera> { PlaceholderScreen(stringResource(R.string.app_name), onOpenSettings = { stack.add(Screen.Settings) }) }
+                entry<Screen.Camera> { ViewfinderScreen(onOpenSettings = { stack.add(Screen.Settings) }) }
                 entry<Screen.Settings> {
                     SettingsRootScreen(
                         onBack = back,

@@ -3,7 +3,7 @@ package sh.hnet.camera.ui
 import androidx.navigation3.runtime.NavKey
 import kotlinx.serialization.Serializable
 
-/** One back stack: the camera at its root, Settings and their pages over it. Placeholder set until the handoff settles the camera's own pages. */
+/** One back stack: the viewfinder at its root, Settings and their pages over it (SPEC §3). */
 @Serializable
 sealed interface Screen : NavKey {
     @Serializable data object Camera : Screen

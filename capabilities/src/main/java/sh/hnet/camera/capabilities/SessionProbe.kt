@@ -16,6 +16,7 @@ import android.os.Build
 import android.util.Range
 import android.util.Size
 import androidx.annotation.RequiresApi
+import kotlin.math.abs
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -176,13 +177,15 @@ class SessionProbe(private val manager: CameraManager) {
      */
     private fun photoLadders(map: StreamConfigurationMap, hlg: Boolean, previewUsage: Long, videoUsage: Long, previewUseCase: Long?, videoUseCase: Long?, stillUseCase: Long?): List<Combination> {
         fun sizes(format: Int): List<Size> = runCatching { map.getOutputSizes(format)?.toList() }.getOrNull().orEmpty()
-        fun largestOf(format: Int, width: Int, height: Int) = sizes(format).filter { it.width * height == it.height * width }.maxByOrNull { area(it) }
+        // Cameras' default sizes are near the ratio, not on it (4080×3072, 3440×2448), so within 7 %
+        fun near(size: Size, width: Int, height: Int) = abs(size.width.toDouble() / size.height / (width.toDouble() / height) - 1) < 0.07
+        fun largestOf(format: Int, width: Int, height: Int) = sizes(format).filter { near(it, width, height) }.maxByOrNull { area(it) }
         fun smallestAtLeast(format: Int, width: Int) = sizes(format).filter { it.width >= width && it.width * 3 == it.height * 4 }.minByOrNull { area(it) }
         val fps30 = Range(30, 30)
         val h = DynamicRangeProfiles.HLG10
         return buildList {
             for ((name, w, ht) in listOf(Triple("4:3", 4, 3), Triple("16:9", 16, 9))) {
-                val previewSize = sizes(ImageFormat.PRIVATE).filter { it.width <= 1920 && it.width * ht == it.height * w }.maxByOrNull { area(it) } ?: continue
+                val previewSize = sizes(ImageFormat.PRIVATE).filter { it.width <= 1920 && near(it, w, ht) }.maxByOrNull { area(it) } ?: continue
                 val jpegR = largestOf(ImageFormat.JPEG_R, w, ht)
                 val jpeg = largestOf(ImageFormat.JPEG, w, ht)
                 val yuvSmall = smallestAtLeast(ImageFormat.YUV_420_888, 320)

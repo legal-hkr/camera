@@ -12,6 +12,7 @@ import android.util.Rational
 import android.util.Size
 import android.util.SizeF
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonArrayBuilder
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
@@ -49,7 +50,7 @@ fun jsonOf(value: Any?): JsonElement = when (value) {
     else -> JsonPrimitive(value.toString())
 }
 
-private fun kotlinx.serialization.json.JsonArrayBuilder.add(value: Int) = add(JsonPrimitive(value))
+private fun JsonArrayBuilder.add(value: Int) = add(JsonPrimitive(value))
 
 fun sizeText(size: Size) = "${size.width}x${size.height}"
 

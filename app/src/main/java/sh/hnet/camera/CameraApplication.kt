@@ -3,10 +3,17 @@ package sh.hnet.camera
 import android.app.Application
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
+import sh.hnet.camera.camera.CameraEngine
+import sh.hnet.camera.media.MediaFiles
 
 class CameraApplication : Application() {
     /** Work that outlives a screen; lives as long as the process. */
     val appScope = CoroutineScope(SupervisorJob())
 
     val preferences: Preferences by lazy { Preferences(this) }
+
+    /** The one camera of the process: one device and one session at a time, whichever screen shows the viewfinder. */
+    val camera: CameraEngine by lazy { CameraEngine(this) }
+
+    val media: MediaFiles by lazy { MediaFiles(this) }
 }
