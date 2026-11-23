@@ -220,7 +220,6 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
                 } ?: return@withLock
                 application.appScope.launch {
                     media.savePhoto(photo.bytes, photo.takenAt)
-                    media.refreshLast()
                 }
             }
         }

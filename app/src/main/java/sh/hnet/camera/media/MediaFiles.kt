@@ -54,6 +54,7 @@ class MediaFiles(private val context: Context) {
         try {
             resolver.openOutputStream(uri)!!.use { it.write(bytes) }
             resolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
+            show(uri, "image/jpeg")
             uri
         } catch (e: Exception) {
             Log.w(TAG, "Photo not saved: ${e.javaClass.simpleName}")
@@ -82,17 +83,39 @@ class MediaFiles(private val context: Context) {
                 if (saved) runCatching { resolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null) }
                 else runCatching { resolver.delete(uri, null, null) }
             }
-            refreshLast()
+            if (saved) show(uri, "video/mp4") else refreshLast()
         }
     }
 
-    /** Reads the newest own shot again (after a save, when the viewfinder comes back). */
+    /** The shot this process saved last: the thumbnail shows it as long as it exists (a video's entry is older than a photo taken while it recorded). */
+    @Volatile
+    private var latest: Pair<Uri, String>? = null
+
+    /** Shows a shot just saved in the thumbnail. */
+    private suspend fun show(uri: Uri, mime: String) = withContext(Dispatchers.IO) {
+        latest = uri to mime
+        val thumbnail = runCatching { resolver.loadThumbnail(uri, Size(THUMBNAIL_PX, THUMBNAIL_PX), null) }.getOrNull()
+        _last.value = LastShot(uri, mime, thumbnail)
+    }
+
+    /**
+     * Reads the newest own shot again (when the viewfinder comes back): the one saved last by this process while it still exists (a gallery may have deleted it),
+     * else the newest by the time it was taken.
+     */
     suspend fun refreshLast() = withContext(Dispatchers.IO) {
+        latest?.let { (uri, mime) ->
+            val exists = runCatching { resolver.query(uri, arrayOf(MediaStore.MediaColumns._ID), null, null)?.use { it.count > 0 } }.getOrNull() == true
+            if (exists) {
+                if (_last.value?.uri != uri || _last.value?.thumbnail == null) show(uri, mime)
+                return@withContext
+            }
+            latest = null
+        }
         val args = Bundle().apply {
             putString(ContentResolver.QUERY_ARG_SQL_SELECTION, "${MediaStore.Files.FileColumns.MEDIA_TYPE} IN (?, ?)")
             putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS, arrayOf(MediaStore.Files.FileColumns.MEDIA_TYPE_IMAGE.toString(), MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO.toString()))
-            putStringArray(ContentResolver.QUERY_ARG_SORT_COLUMNS, arrayOf(MediaStore.MediaColumns.DATE_ADDED, MediaStore.MediaColumns._ID))
-            putInt(ContentResolver.QUERY_ARG_SORT_DIRECTION, ContentResolver.QUERY_SORT_DIRECTION_DESCENDING)
+            // The SQL order: MediaStore ignored QUERY_ARG_SORT_DIRECTION and gave the oldest shot
+            putString(ContentResolver.QUERY_ARG_SQL_SORT_ORDER, "${MediaStore.MediaColumns.DATE_TAKEN} DESC, ${MediaStore.MediaColumns._ID} DESC")
             putInt(ContentResolver.QUERY_ARG_LIMIT, 1)
         }
         val projection = arrayOf(MediaStore.MediaColumns._ID, MediaStore.Files.FileColumns.MEDIA_TYPE, MediaStore.MediaColumns.MIME_TYPE)
