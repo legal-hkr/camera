@@ -62,4 +62,13 @@
     <string name="title_camera_failed">The camera isn’t working</string>
     <string name="desc_camera_failed">Restart the camera or the phone.</string>
     <string name="button_restart_camera">Restart</string>
+    <!-- Stage 1b: video -->
+    <string name="tooltip_flashlight">Flashlight</string>
+    <string name="tooltip_pause">Pause</string>
+    <string name="tooltip_resume">Resume</string>
+    <string name="tooltip_photo_while_recording">Take photo</string>
+    <string name="content_description_shutter_stop">Stop</string>
+    <string name="content_description_recording">Recording</string>
+    <string name="label_no_sound">No sound</string>
+    <string name="msg_mic_busy">Another app is using the microphone. The video will be recorded without sound.</string>
 </resources>

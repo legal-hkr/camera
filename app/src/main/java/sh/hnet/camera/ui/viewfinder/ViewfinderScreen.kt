@@ -9,9 +9,11 @@ import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.provider.Settings
 import android.view.OrientationEventListener
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.LocalActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -33,11 +35,13 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.asPaddingValues
+import androidx.compose.foundation.layout.displayCutout
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -57,6 +61,10 @@ import androidx.compose.material3.LoadingIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.PlainTooltip
+import androidx.compose.material3.Snackbar
+import androidx.compose.material3.SnackbarDuration
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -74,16 +82,19 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
@@ -104,12 +115,15 @@ import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.LifecycleStartEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.roundToInt
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import sh.hnet.camera.R
 import sh.hnet.camera.camera.CameraStatus
 import sh.hnet.camera.camera.Mode
+import sh.hnet.camera.camera.Recording
 import sh.hnet.camera.capabilities.model.Aspect
 import sh.hnet.camera.capabilities.model.Orientation
 import sh.hnet.camera.capabilities.model.Point
@@ -227,6 +241,28 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, onOpenSettings: () -> Uni
     }
     val cover by animateFloatAsState(if (engine.frameShown) 0f else 1f, if (engine.frameShown) tween(300) else snap(), label = "cover")
 
+    val recording = engine.recording
+    // Back while recording ends it and saves; a second Back leaves (SPEC §3)
+    BackHandler(enabled = recording != null) { viewModel.record() }
+
+    // The microphone is asked for on the first entry into Video (SPEC §16); without it videos have no sound
+    val activity = LocalActivity.current
+    var micGranted by remember { mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) }
+    var micAsked by rememberSaveable { mutableStateOf(false) }
+    val micLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { micGranted = it }
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
+        micGranted = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+    }
+    LaunchedEffect(ui.mode) {
+        if (ui.mode == Mode.VIDEO && !micGranted && !micAsked) {
+            micAsked = true
+            micLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        }
+    }
+    val snackbars = remember { SnackbarHostState() }
+    val scope = rememberCoroutineScope()
+    val micBusy = stringResource(R.string.msg_mic_busy)
+
     val colors = MaterialTheme.colorScheme
     val problem = engine.status.takeIf { it is CameraStatus.Busy || it is CameraStatus.Blocked || it is CameraStatus.Error }
     val modes = listOf(Mode.PHOTO, Mode.VIDEO)
@@ -312,6 +348,38 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, onOpenSettings: () -> Uni
             }
         }
 
+        // The top row: the flashlight in Video (the other state icons come with stage 1c), level with the camera's cutout, beside it
+        if (ui.mode == Mode.VIDEO && camera?.flash == true && problem == null) {
+            Box(Modifier.align(Alignment.TopStart).padding(start = 12.dp, top = topRowTop(start = 12.dp, end = 52.dp))) {
+                GlassIconButton(
+                    if (ui.torch) R.drawable.ic_flashlight_on else R.drawable.ic_flashlight_off,
+                    stringResource(R.string.tooltip_flashlight),
+                    selected = ui.torch,
+                    size = 40,
+                    iconSize = 20,
+                    onClick = { viewModel.toggleTorch() },
+                )
+            }
+        }
+        // The recording's time, centred under the cutout
+        if (recording != null) RecordingTime(recording, Modifier.align(Alignment.TopCenter).padding(top = 56.dp))
+        // Indicators at the picture's top-start: no sound in Video
+        val noSound = ui.mode == Mode.VIDEO && problem == null && (!micGranted || recording?.silenced == true)
+        if (noSound) {
+            IndicatorChip(
+                R.drawable.ic_mic_off,
+                stringResource(R.string.label_no_sound),
+                Modifier.align(Alignment.TopStart).padding(start = 12.dp, top = maxOf(52.dp, pictureTop) + 8.dp),
+            ) {
+                if (!micGranted) micLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                else scope.launch { snackbars.showSnackbar(micBusy, duration = SnackbarDuration.Short) }
+            }
+        }
+        // Snackbars 8 dp above the suggestion slot (SPEC §14.2)
+        SnackbarHost(snackbars, Modifier.align(Alignment.BottomCenter).padding(bottom = zoomBottom + 44.dp + 36.dp + 32.dp + 8.dp)) { data ->
+            Snackbar(data, shape = MaterialTheme.shapes.extraLarge, modifier = Modifier.padding(horizontal = 12.dp))
+        }
+
         // The suggestion slot: the zoom value over the ruler's needle, the AE/AF lock
         Box(Modifier.align(Alignment.BottomCenter).padding(bottom = zoomBottom + 44.dp + 36.dp).height(32.dp)) {
             when {
@@ -342,24 +410,43 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, onOpenSettings: () -> Uni
             onZoom = { viewModel.zoomTo(it) },
             onQuickSettings = { quickSettings = true },
             quickSettingsOpen = quickSettings,
+            showQuickSettings = recording == null,
             modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = zoomBottom - 4.dp),
         )
 
         // The shutter row: the last shot, the shutter, the other camera
         Box(Modifier.align(Alignment.BottomCenter).padding(bottom = shutterBottom).fillMaxWidth().height(80.dp)) {
-            Thumbnail(last, Modifier.align(Alignment.CenterStart).padding(start = 34.dp))
+            if (recording != null) {
+                // While recording: pause or resume in the thumbnail's place, a photo in the camera switch's
+                val paused = recording.pausedAt != null
+                RowButton(if (paused) R.drawable.ic_play_arrow else R.drawable.ic_pause, stringResource(if (paused) R.string.tooltip_resume else R.string.tooltip_pause), Modifier.align(Alignment.CenterStart).padding(start = 34.dp)) {
+                    if (paused) viewModel.resumeRecording() else viewModel.pauseRecording()
+                }
+                if (engine.video != null && engine.range != null) {
+                    RowButton(R.drawable.ic_photo_camera, stringResource(R.string.tooltip_photo_while_recording), Modifier.align(Alignment.CenterEnd).padding(end = 34.dp)) { viewModel.shoot() }
+                }
+            } else {
+                Thumbnail(last, Modifier.align(Alignment.CenterStart).padding(start = 34.dp))
+                if (viewModel.cameras.size > 1) SwitchCameraButton(onClick = { viewModel.switchCamera() }, modifier = Modifier.align(Alignment.CenterEnd).padding(end = 34.dp))
+            }
+            val video = ui.mode == Mode.VIDEO
             ShutterButton(
-                look = if (ui.mode == Mode.VIDEO) ShutterLook.VIDEO else ShutterLook.PHOTO,
-                label = stringResource(if (ui.mode == Mode.VIDEO) R.string.content_description_shutter_record else R.string.content_description_shutter_photo),
-                // Recording comes with stage 1b
-                enabled = engine.status == CameraStatus.Ready && ui.mode == Mode.PHOTO,
-                onClick = { viewModel.shoot() },
+                look = if (recording != null) ShutterLook.RECORDING else if (video) ShutterLook.VIDEO else ShutterLook.PHOTO,
+                label = stringResource(if (recording != null) R.string.content_description_shutter_stop else if (video) R.string.content_description_shutter_record else R.string.content_description_shutter_photo),
+                enabled = engine.status == CameraStatus.Ready && (!video || (engine.video != null && !engine.finishing)),
+                onClick = {
+                    if (video) {
+                        if (recording != null) haptics.photo() else haptics.lock()
+                        viewModel.record()
+                    } else {
+                        viewModel.shoot()
+                    }
+                },
                 modifier = Modifier.align(Alignment.Center),
             )
-            if (viewModel.cameras.size > 1) SwitchCameraButton(onClick = { viewModel.switchCamera() }, modifier = Modifier.align(Alignment.CenterEnd).padding(end = 34.dp))
         }
 
-        ModeRow(
+        if (recording == null) ModeRow(
             modes = modes,
             selected = ui.mode,
             label = { stringResource(if (it == Mode.VIDEO) R.string.label_mode_video else R.string.label_mode_photo) },
@@ -562,5 +649,98 @@ private fun NoCameraAccess(permanentlyDenied: Boolean, onAllow: () -> Unit, onOp
         TextButton(onClick = onOpenSettings, modifier = Modifier.align(Alignment.CenterHorizontally).padding(bottom = 16.dp)) {
             Text(stringResource(R.string.button_settings))
         }
+    }
+}
+
+/** A 52 dp tonal circle of the shutter row (pause, resume, photo while recording). */
+@Composable
+private fun RowButton(icon: Int, label: String, modifier: Modifier, onClick: () -> Unit) {
+    Box(modifier) {
+        TooltipBox(
+            positionProvider = TooltipDefaults.rememberTooltipPositionProvider(TooltipAnchorPosition.Above),
+            tooltip = { PlainTooltip { Text(label) } },
+            state = rememberTooltipState(),
+        ) {
+            FilledTonalIconButton(
+                onClick = onClick,
+                colors = IconButtonDefaults.filledTonalIconButtonColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
+                modifier = Modifier.size(52.dp),
+            ) {
+                Icon(painterResource(icon), contentDescription = label, modifier = Modifier.size(24.dp))
+            }
+        }
+    }
+}
+
+/** The recording's time (SPEC §4.4): a solid chip with the red dot (owner, 23 Nov 2026) and tabular figures; paused, the time blinks once a second. */
+@Composable
+private fun RecordingTime(recording: Recording, modifier: Modifier) {
+    val colors = MaterialTheme.colorScheme
+    var now by remember { mutableLongStateOf(SystemClock.elapsedRealtime()) }
+    LaunchedEffect(recording) {
+        while (true) {
+            now = SystemClock.elapsedRealtime()
+            delay(TIME_TICK_MS)
+        }
+    }
+    val end = recording.pausedAt ?: now
+    val seconds = ((end - recording.startedAt - recording.pausedMs) / 1000).coerceAtLeast(0)
+    val shown = recording.pausedAt == null || (now / 500) % 2 == 0L
+    val recordingLabel = stringResource(R.string.content_description_recording)
+    Surface(shape = CircleShape, color = colors.surfaceContainerHigh, modifier = modifier.height(32.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(horizontal = 12.dp)) {
+            Box(Modifier.size(10.dp).clip(CircleShape).background(colors.error).semantics { contentDescription = recordingLabel })
+            Spacer(Modifier.width(8.dp))
+            Text(
+                duration(seconds),
+                style = MaterialTheme.typography.labelLarge.copy(fontFeatureSettings = "tnum"),
+                modifier = Modifier.alpha(if (shown) 1f else 0f),
+            )
+        }
+    }
+}
+
+/** A length as "0:42", "12:05" or "1:02:03". */
+private fun duration(seconds: Long): String {
+    val h = seconds / 3600
+    val m = seconds / 60 % 60
+    val s = seconds % 60
+    return if (h > 0) "%d:%02d:%02d".format(Locale.ROOT, h, m, s) else "%d:%02d".format(Locale.ROOT, m, s)
+}
+
+/** An indicator chip (SPEC §4.4): 28 dp of finder glass with an icon and a short label; a tap explains it. */
+@Composable
+private fun IndicatorChip(icon: Int, label: String, modifier: Modifier, onClick: () -> Unit) {
+    Box(
+        modifier
+            .height(28.dp)
+            .finderGlass(CircleShape, glassColor())
+            .clickable(role = Role.Button, onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(horizontal = 10.dp)) {
+            Icon(painterResource(icon), contentDescription = null, modifier = Modifier.size(16.dp))
+            Spacer(Modifier.width(4.dp))
+            Text(label, style = MaterialTheme.typography.labelMedium)
+        }
+    }
+}
+
+private const val TIME_TICK_MS = 250L
+
+/**
+ * Where a group of the top row sits (SPEC §4.3): 6 dp from the top edge, level with the camera's cutout, as long as it keeps 16 dp from the cutout's bounds; a
+ * group that would collide moves below the cutout instead.
+ */
+@Composable
+private fun topRowTop(start: Dp, end: Dp): Dp {
+    val view = LocalView.current
+    val density = LocalDensity.current
+    val cutouts = view.rootWindowInsets?.displayCutout?.boundingRects.orEmpty()
+    return with(density) {
+        val left = (start - 16.dp).toPx()
+        val right = (end + 16.dp).toPx()
+        val below = cutouts.filter { it.top < 52.dp.toPx() && it.right > left && it.left < right }.maxOfOrNull { it.bottom }
+        if (below == null) 6.dp else below.toDp() + 6.dp
     }
 }

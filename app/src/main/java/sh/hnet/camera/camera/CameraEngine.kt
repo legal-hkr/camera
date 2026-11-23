@@ -19,12 +19,15 @@ import android.hardware.camera2.params.DynamicRangeProfiles
 import android.hardware.camera2.params.MeteringRectangle
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
+import android.media.AudioManager
 import android.media.Image
 import android.media.ImageReader
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.SystemClock
 import android.util.Log
+import android.util.Range
 import android.util.Size
 import android.view.Surface
 import androidx.annotation.RequiresApi
@@ -33,9 +36,12 @@ import kotlin.math.abs
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.android.asCoroutineDispatcher
+import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -52,7 +58,6 @@ import sh.hnet.camera.capabilities.CameraCatalog
 import sh.hnet.camera.capabilities.CameraSpec
 import sh.hnet.camera.capabilities.model.Aspect
 import sh.hnet.camera.capabilities.model.Orientation
-import sh.hnet.camera.capabilities.model.PhotoSession
 import sh.hnet.camera.capabilities.model.PictureRange
 import sh.hnet.camera.capabilities.model.PixelRect
 import sh.hnet.camera.capabilities.model.PixelSize
@@ -61,11 +66,12 @@ import sh.hnet.camera.capabilities.model.SessionLadder
 import sh.hnet.camera.capabilities.model.Sizes
 import sh.hnet.camera.capabilities.model.StillFormat
 import sh.hnet.camera.capabilities.model.StillPlan
+import sh.hnet.camera.capabilities.model.VideoChoice
 
 enum class Mode { PHOTO, VIDEO }
 
 /** What the viewfinder wants: which camera, in which mode and aspect ratio. */
-data class CameraRequest(val camera: CameraSpec, val mode: Mode, val aspect: Aspect) {
+data class CameraRequest(val camera: CameraSpec, val mode: Mode, val aspect: Aspect, val video: VideoChoice = VideoChoice()) {
     /** The aspect the preview and the session use: video is always 16:9. */
     val pictureAspect: Aspect get() = if (mode == Mode.VIDEO) Aspect.SIXTEEN_NINE else aspect
 }
@@ -85,11 +91,19 @@ sealed interface CameraStatus {
 /** The focused face's corners as shares of the preview. */
 data class FaceMark(val topLeft: Point, val bottomRight: Point)
 
+/** A recording in progress, timed by the elapsed-time clock (ms): its length is (paused at, or now) − started − paused before. */
+data class Recording(val startedAt: Long, val pausedAt: Long? = null, val pausedMs: Long = 0, val silenced: Boolean = false)
+
 data class EngineState(
     val status: CameraStatus = CameraStatus.Idle,
     val request: CameraRequest? = null,
-    /** The session in use (which rung of the ladder the camera confirmed). */
-    val session: PhotoSession? = null,
+    /** The range of the session in use (which rung of the ladder the camera confirmed). */
+    val range: PictureRange? = null,
+    /** Video mode: what the session records. */
+    val video: VideoFormat? = null,
+    val recording: Recording? = null,
+    /** A recording is being finished and saved: the shutter waits for it. */
+    val finishing: Boolean = false,
     /** A frame of the current session has been shown (the viewfinder's crossfade ends then). */
     val frameShown: Boolean = false,
     val focusing: Boolean = false,
@@ -97,7 +111,7 @@ data class EngineState(
 )
 
 /** What the repeating request carries besides the template: zoom, exposure, the tapped point, the AE/AF lock. */
-data class Controls(val zoom: Double = 1.0, val exposure: Int = 0, val focus: Point? = null, val locked: Boolean = false)
+data class Controls(val zoom: Double = 1.0, val exposure: Int = 0, val focus: Point? = null, val locked: Boolean = false, val torch: Boolean = false)
 
 /** A still as it came from the camera, with the crop the app still has to make for its aspect ratio. */
 class CapturedPhoto(val bytes: ByteArray, val format: StillFormat, val crop: PixelSize?, val takenAt: Long)
@@ -110,6 +124,7 @@ class CameraEngine(context: Context) {
     private val appContext = context.applicationContext
     private val manager = context.getSystemService(CameraManager::class.java)
     private val policy = context.getSystemService(DevicePolicyManager::class.java)
+    private val audio = context.getSystemService(AudioManager::class.java)
     private val thread = HandlerThread("camera").apply { start() }
     private val handler = Handler(thread.looper)
     private val executor = Executor { handler.post(it) }
@@ -143,6 +158,10 @@ class CameraEngine(context: Context) {
     private var session: CameraCaptureSession? = null
     private var sessionKey: Desired? = null
     private var still: StillOutput? = null
+    private var recorder: VideoRecorder? = null
+    private var silenceWatch: Job? = null
+    /** A recording being finished: a new one, or closing the session, waits for it. */
+    private var stopping: Deferred<Boolean>? = null
     private var previewSurface: Surface? = null
     private var attempts = 0
     private var pendingRetry: Job? = null
@@ -176,6 +195,7 @@ class CameraEngine(context: Context) {
                     throw e
                 } catch (e: Exception) {
                     Log.w(TAG, "Camera step failed: ${e.javaClass.simpleName}")
+                    runCatching { finishRecording() }
                     closeDevice()
                     failed(CameraDevice.StateCallback.ERROR_CAMERA_DEVICE)
                 }
@@ -226,6 +246,12 @@ class CameraEngine(context: Context) {
 
     fun setZoom(ratio: Double) = scope.launch {
         controls = controls.copy(zoom = ratio)
+        repeat()
+    }
+
+    /** The flashlight in Video mode. */
+    fun setTorch(on: Boolean) = scope.launch {
+        controls = controls.copy(torch = on)
         repeat()
     }
 
@@ -283,10 +309,11 @@ class CameraEngine(context: Context) {
         val output = still ?: return null
         val request = desired.value.request ?: return null
         val device = device ?: return null
-        val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+        val video = request.mode == Mode.VIDEO
+        val builder = device.createCaptureRequest(if (video) CameraDevice.TEMPLATE_VIDEO_SNAPSHOT else CameraDevice.TEMPLATE_STILL_CAPTURE)
         builder.addTarget(output.reader.surface)
         applyControls(builder, request)
-        if (request.camera.zsl) builder.set(CaptureRequest.CONTROL_ENABLE_ZSL, true)
+        if (request.camera.zsl && !video) builder.set(CaptureRequest.CONTROL_ENABLE_ZSL, true)
         builder.set(CaptureRequest.JPEG_ORIENTATION, Orientation.jpeg(request.camera.sensorOrientation, deviceRotation, request.camera.front))
         builder.set(CaptureRequest.JPEG_QUALITY, JPEG_QUALITY)
         output.drain()
@@ -332,6 +359,7 @@ class CameraEngine(context: Context) {
             return
         }
         if (policy.getCameraDisabled(null)) {
+            awaitCapture()
             closeDevice()
             _state.update { EngineState(CameraStatus.Blocked, request) }
             return
@@ -357,10 +385,10 @@ class CameraEngine(context: Context) {
         }
     }
 
-    /** A still in flight finishes before its session goes (at most the still's timeout). */
+    /** A still in flight finishes before its session goes (at most the still's timeout), and a recording is ended and saved. */
     private suspend fun awaitCapture() {
-        val inFlight = capture ?: return
-        withTimeoutOrNull(STILL_TIMEOUT_MS) { inFlight.await() }
+        capture?.let { inFlight -> withTimeoutOrNull(STILL_TIMEOUT_MS) { inFlight.await() } }
+        finishRecording()
     }
 
     private suspend fun openDevice(request: CameraRequest): Boolean {
@@ -418,6 +446,8 @@ class CameraEngine(context: Context) {
         if (camera != device) return
         deviceLost = true
         scope.launch {
+            // What was recorded up to here is kept
+            finishRecording()
             closeDevice()
             failed(error)
         }
@@ -444,6 +474,23 @@ class CameraEngine(context: Context) {
         }
     }
 
+    /** One rung of a ladder: the range, the still stream (none in a video session without photos) and the video stream (Video mode). */
+    private data class Rung(val range: PictureRange, val still: StillFormat?, val video: VideoFormat?)
+
+    private fun rungs(request: CameraRequest): List<Rung> {
+        val spec = request.camera
+        return when (request.mode) {
+            Mode.PHOTO -> SessionLadder.photo(spec.hlg, spec.jpegR.isNotEmpty(), wantMotion = false, wantAnalysis = false).map { Rung(it.range, it.still, null) }
+            Mode.VIDEO -> {
+                val hevc = Encoders.hevc()
+                SessionLadder.video(request.video, spec.hlg, spec.jpegR.isNotEmpty(), spec.video, spec.fixedFps, Encoders.limits(hevc))
+                    .map { Rung(it.range, it.still, VideoFormat(it.size, it.fps, it.range == PictureRange.HLG, hevc || it.range == PictureRange.HLG)) }
+                    // No encoder takes anything the camera offers: the preview alone, nothing to record
+                    .ifEmpty { listOf(Rung(PictureRange.SDR, null, null)) }
+            }
+        }
+    }
+
     /**
      * Tries the ladder's rungs from the best. Where the camera can answer without being configured (Android 15+) a rung it refuses is skipped – except the last,
      * the plainest, which is always tried rather than leaving the viewfinder without a picture.
@@ -457,31 +504,39 @@ class CameraEngine(context: Context) {
             failed(CameraDevice.StateCallback.ERROR_CAMERA_DEVICE)
             return false
         }
-        val template = if (request.mode == Mode.VIDEO) CameraDevice.TEMPLATE_RECORD else CameraDevice.TEMPLATE_PREVIEW
-        val rungs: List<PhotoSession> = when (request.mode) {
-            Mode.PHOTO -> SessionLadder.photo(spec.hlg, spec.jpegR.isNotEmpty(), wantMotion = false, wantAnalysis = false)
-            // Recording comes with stage 1b; until then the video mode is its preview alone (the still format is unused)
-            Mode.VIDEO -> listOfNotNull(if (spec.hlg) PhotoSession(PictureRange.HLG, StillFormat.JPEG, motion = false, analysis = false) else null, PhotoSession(PictureRange.SDR, StillFormat.JPEG, motion = false, analysis = false))
-        }
+        val rungs = rungs(request)
         for ((index, rung) in rungs.withIndex()) {
             if (!surface.isValid) return false
-            val stillPlan = if (request.mode == Mode.PHOTO) Sizes.still(if (rung.still == StillFormat.JPEG_R) spec.jpegR else spec.jpeg, request.aspect) ?: continue else null
+            val stillPlan = rung.still?.let { Sizes.still(if (it == StillFormat.JPEG_R) spec.jpegR else spec.jpeg, request.pictureAspect) }
+            if (rung.still != null && stillPlan == null) continue
             val format = if (rung.still == StillFormat.JPEG_R) ImageFormat.JPEG_R else ImageFormat.JPEG
             val last = index == rungs.lastIndex
-            if (!last && spec.sessionQueries && Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM && supported(spec.id, template, previewSize, rung, stillPlan, format) == false) continue
+            if (!last && spec.sessionQueries && Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM && supported(spec.id, request, previewSize, rung, stillPlan, format) == false) continue
             var output: StillOutput? = null
+            var video: VideoRecorder? = null
             val made = try {
                 output = stillPlan?.let { StillOutput(it, rung.still, format) }
-                val preview = OutputConfiguration(surface).apply { if (rung.range == PictureRange.HLG) dynamicRangeProfile = DynamicRangeProfiles.HLG10 }
-                val outputs = listOfNotNull(preview, output?.let { OutputConfiguration(it.reader.surface) })
-                configure(device, template, outputs, output)
+                video = rung.video?.let { VideoRecorder(it, audio, scope) }
+                val profile = if (rung.range == PictureRange.HLG) DynamicRangeProfiles.HLG10 else DynamicRangeProfiles.STANDARD
+                val outputs = listOfNotNull(
+                    OutputConfiguration(surface).apply { dynamicRangeProfile = profile },
+                    // Frames for the encoder in the monotonic clock, which the sound follows (the default for an encoder's surface, set so nothing hangs on it)
+                    video?.let { OutputConfiguration(it.surface).apply { dynamicRangeProfile = profile; timestampBase = OutputConfiguration.TIMESTAMP_BASE_MONOTONIC } },
+                    output?.let { OutputConfiguration(it.reader.surface) },
+                )
+                val closeOutputs: () -> Unit = {
+                    output?.close()
+                    video?.release()
+                }
+                configure(device, sessionParameters(device.createCaptureRequest(template(request)), request, rung.video), outputs, closeOutputs)
             } catch (e: Exception) {
-                // An abandoned surface, a size the reader refuses: the next rung, or none
+                // An abandoned surface, a size the reader or the encoder refuses: the next rung, or none
                 Log.w(TAG, "Session rung failed: ${e.javaClass.simpleName}")
                 null
             }
             if (made == null) {
                 output?.close()
+                video?.release()
                 continue
             }
             // The world may have moved while the session was being made: the device lost, another request or surface wanted
@@ -491,9 +546,10 @@ class CameraEngine(context: Context) {
             }
             session = made
             still = output
+            recorder = video
             previewSurface = surface
             controls = controls.copy(zoom = controls.zoom.coerceIn(spec.zoom.min, spec.zoom.max))
-            _state.update { EngineState(CameraStatus.Ready, request, rung, frameShown = false) }
+            _state.update { EngineState(CameraStatus.Ready, request, rung.range, rung.video, frameShown = false) }
             repeat()
             return true
         }
@@ -502,20 +558,33 @@ class CameraEngine(context: Context) {
         return false
     }
 
+    private fun template(request: CameraRequest) = if (request.mode == Mode.VIDEO) CameraDevice.TEMPLATE_RECORD else CameraDevice.TEMPLATE_PREVIEW
+
+    /** The session parameters: a video session's frame rate and stabilization (D6: on, where the camera has it). */
+    private fun sessionParameters(builder: CaptureRequest.Builder, request: CameraRequest, video: VideoFormat?): CaptureRequest {
+        if (video != null) {
+            if (video.fps in request.camera.fixedFps) builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(video.fps, video.fps))
+            if (request.camera.videoStabilization) builder.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON)
+        }
+        return builder.build()
+    }
+
     /** Asks the camera without configuring it; null when it can't say (then the session is tried). */
     @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
-    private fun supported(id: String, template: Int, previewSize: PixelSize, rung: PhotoSession, still: StillPlan?, format: Int): Boolean? = runCatching {
+    private fun supported(id: String, request: CameraRequest, previewSize: PixelSize, rung: Rung, still: StillPlan?, format: Int): Boolean? = runCatching {
         val setup = manager.getCameraDeviceSetup(id)
+        val profile = if (rung.range == PictureRange.HLG) DynamicRangeProfiles.HLG10 else DynamicRangeProfiles.STANDARD
         val preview = OutputConfiguration(ImageFormat.PRIVATE, Size(previewSize.width, previewSize.height), HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE or HardwareBuffer.USAGE_COMPOSER_OVERLAY)
-        if (rung.range == PictureRange.HLG) preview.dynamicRangeProfile = DynamicRangeProfiles.HLG10
-        val outputs = listOfNotNull(preview, still?.let { OutputConfiguration(format, Size(it.capture.width, it.capture.height)) })
+        preview.dynamicRangeProfile = profile
+        val video = rung.video?.let { OutputConfiguration(ImageFormat.PRIVATE, Size(it.size.width, it.size.height), HardwareBuffer.USAGE_VIDEO_ENCODE).apply { dynamicRangeProfile = profile; timestampBase = OutputConfiguration.TIMESTAMP_BASE_MONOTONIC } }
+        val outputs = listOfNotNull(preview, video, still?.let { OutputConfiguration(format, Size(it.capture.width, it.capture.height)) })
         val config = SessionConfiguration(SessionConfiguration.SESSION_REGULAR, outputs)
-        config.setSessionParameters(setup.createCaptureRequest(template).build())
+        config.setSessionParameters(sessionParameters(setup.createCaptureRequest(template(request)), request, rung.video))
         setup.isSessionConfigurationSupported(config)
     }.getOrNull()
 
-    /** Configures a session with the same session parameters the query used; its still reader is closed when the session is (not before). */
-    private suspend fun configure(device: CameraDevice, template: Int, outputs: List<OutputConfiguration>, output: StillOutput?): CameraCaptureSession? = suspendCancellableCoroutine { cont ->
+    /** Configures a session; its still reader and video surface are let go when the session is closed (not before). */
+    private suspend fun configure(device: CameraDevice, parameters: CaptureRequest, outputs: List<OutputConfiguration>, onClosed: () -> Unit): CameraCaptureSession? = suspendCancellableCoroutine { cont ->
         val config = SessionConfiguration(SessionConfiguration.SESSION_REGULAR, outputs, executor, object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(session: CameraCaptureSession) {
                 if (cont.isActive) cont.resumeWith(Result.success(session)) else session.close()
@@ -525,12 +594,79 @@ class CameraEngine(context: Context) {
                 if (cont.isActive) cont.resumeWith(Result.success(null))
             }
 
-            override fun onClosed(session: CameraCaptureSession) {
-                output?.close()
-            }
+            override fun onClosed(session: CameraCaptureSession) = onClosed()
         })
-        config.setSessionParameters(device.createCaptureRequest(template).build())
+        config.setSessionParameters(parameters)
         device.createCaptureSession(config)
+    }
+
+    /** Starts recording into [target] (the sound when the microphone may be used); false when there is no video session or the encoder refused (the target is then removed). */
+    suspend fun startRecording(target: VideoTarget, deviceRotation: Int, location: Pair<Double, Double>?): Boolean = scope.async { start(target, deviceRotation, location) }.await()
+
+    private suspend fun start(target: VideoTarget, deviceRotation: Int, location: Pair<Double, Double>?): Boolean = withContext(NonCancellable) {
+        stopping?.await()
+        val recorder = recorder
+        val request = desired.value.request
+        if (recorder == null || request == null || recorder.recording) {
+            target.close(false)
+            return@withContext false
+        }
+        val spec = request.camera
+        val sound = appContext.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        if (!recorder.start(target, Orientation.jpeg(spec.sensorOrientation, deviceRotation, spec.front), location, sound)) {
+            target.close(false)
+            return@withContext false
+        }
+        _state.update { it.copy(recording = Recording(SystemClock.elapsedRealtime())) }
+        silenceWatch?.cancel()
+        silenceWatch = scope.launch {
+            while (true) {
+                delay(SILENCE_CHECK_MS)
+                val silenced = recorder.silenced
+                _state.update { s -> s.recording?.let { if (it.silenced != silenced) s.copy(recording = it.copy(silenced = silenced)) else s } ?: s }
+            }
+        }
+        repeat()
+        true
+    }
+
+    fun pauseRecording() = scope.launch {
+        val recorder = recorder ?: return@launch
+        if (!recorder.recording || recorder.paused) return@launch
+        recorder.pause()
+        _state.update { s -> s.copy(recording = s.recording?.copy(pausedAt = SystemClock.elapsedRealtime())) }
+        repeat()
+    }
+
+    fun resumeRecording() = scope.launch {
+        val recorder = recorder ?: return@launch
+        if (!recorder.paused) return@launch
+        recorder.resume()
+        _state.update { s -> s.copy(recording = s.recording?.let { r -> r.pausedAt?.let { r.copy(pausedAt = null, pausedMs = r.pausedMs + SystemClock.elapsedRealtime() - it) } ?: r }) }
+        repeat()
+    }
+
+    /** Ends the recording and saves it, in the engine's own scope (a screen going away doesn't cut it short); true when a video was saved. */
+    suspend fun stopRecording(): Boolean = scope.async { finishRecording() }.await()
+
+    /** Finishes the recording, or waits for one being finished. */
+    private suspend fun finishRecording(): Boolean {
+        stopping?.let { return it.await() }
+        val recorder = recorder ?: return false
+        if (!recorder.recording) return false
+        silenceWatch?.cancel()
+        silenceWatch = null
+        _state.update { it.copy(recording = null, finishing = true) }
+        // The encoder's surface leaves the repeating request before the stream ends
+        repeat()
+        val job = scope.async { recorder.stop() }
+        stopping = job
+        return try {
+            job.await()
+        } finally {
+            if (stopping === job) stopping = null
+            _state.update { it.copy(finishing = false) }
+        }
     }
 
     /** Sets the repeating request again with the current controls. */
@@ -540,13 +676,20 @@ class CameraEngine(context: Context) {
         val surface = previewSurface ?: return
         val request = desired.value.request ?: return
         try {
-            val builder = device.createCaptureRequest(if (request.mode == Mode.VIDEO) CameraDevice.TEMPLATE_RECORD else CameraDevice.TEMPLATE_PREVIEW)
+            val builder = device.createCaptureRequest(template(request))
             builder.addTarget(surface)
+            addRecordingTarget(builder)
             applyControls(builder, request)
             session.setRepeatingRequest(builder.build(), results, handler)
         } catch (e: Exception) {
             Log.w(TAG, "Repeating request failed: ${e.javaClass.simpleName}")
         }
+    }
+
+    /** The encoder gets frames only while a recording runs and isn't paused (a trigger's frame too, so focusing doesn't drop one from the video). */
+    private fun addRecordingTarget(builder: CaptureRequest.Builder) {
+        val recording = _state.value.recording
+        if (recording != null && recording.pausedAt == null) recorder?.let { builder.addTarget(it.surface) }
     }
 
     /** A one-off request with an AF trigger (and the exposure's precapture metering for a lock), on top of the repeating one. */
@@ -557,8 +700,9 @@ class CameraEngine(context: Context) {
         val request = desired.value.request ?: return
         if (!request.camera.autofocus && !precapture) return
         try {
-            val builder = device.createCaptureRequest(if (request.mode == Mode.VIDEO) CameraDevice.TEMPLATE_RECORD else CameraDevice.TEMPLATE_PREVIEW)
+            val builder = device.createCaptureRequest(template(request))
             builder.addTarget(surface)
+            addRecordingTarget(builder)
             applyControls(builder, request)
             if (request.camera.autofocus) builder.set(CaptureRequest.CONTROL_AF_TRIGGER, af)
             if (precapture) builder.set(CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER, CameraMetadata.CONTROL_AE_PRECAPTURE_TRIGGER_START)
@@ -576,6 +720,11 @@ class CameraEngine(context: Context) {
         builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, controls.exposure.coerceIn(spec.exposureSteps))
         builder.set(CaptureRequest.CONTROL_AE_LOCK, controls.locked)
         if (spec.faceDetection) builder.set(CaptureRequest.STATISTICS_FACE_DETECT_MODE, CameraMetadata.STATISTICS_FACE_DETECT_MODE_SIMPLE)
+        _state.value.video?.let { video ->
+            if (video.fps in spec.fixedFps) builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(video.fps, video.fps))
+            if (spec.videoStabilization) builder.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON)
+        }
+        if (request.mode == Mode.VIDEO && spec.flash) builder.set(CaptureRequest.FLASH_MODE, if (controls.torch) CameraMetadata.FLASH_MODE_TORCH else CameraMetadata.FLASH_MODE_OFF)
         val point = controls.focus
         if (spec.autofocus) {
             val continuous = if (request.mode == Mode.VIDEO) CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_VIDEO else CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE
@@ -652,10 +801,13 @@ class CameraEngine(context: Context) {
     /** Closes the session; its still reader closes when the camera has really let go of it ([configure]'s `onClosed`). */
     private fun closeSession() {
         lockJob?.cancel()
+        // The prepared encoder goes at once (the next session's may need the hardware); the surface goes when the session has closed
+        recorder?.retire()
         runCatching { session?.close() }
         session = null
         sessionKey = null
         still = null
+        recorder = null
         previewSurface = null
     }
 
@@ -698,6 +850,7 @@ class CameraEngine(context: Context) {
         const val RESTART_DELAY_MS = 1_000L
         const val LOCK_MIN_WAIT_MS = 150L
         const val LOCK_MAX_WAIT_MS = 800L
+        const val SILENCE_CHECK_MS = 500L
         /** The reported inner face grown to the whole face: across it (cheek to cheek) and along it (forehead to chin). */
         const val FACE_ACROSS = 1.6
         const val FACE_ALONG = 2.2

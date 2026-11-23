@@ -85,6 +85,8 @@ fun ZoomRow(
     onQuickSettings: () -> Unit,
     quickSettingsOpen: Boolean,
     modifier: Modifier = Modifier,
+    /** Hidden while recording (SPEC §4.6). */
+    showQuickSettings: Boolean = true,
 ) {
     val haptics = rememberHaptics()
     val numbers = rememberNumbers()
@@ -190,7 +192,7 @@ fun ZoomRow(
             }
         }
         AnimatedVisibility(
-            visible = !rulerOpen,
+            visible = !rulerOpen && showQuickSettings,
             enter = fadeIn(MaterialTheme.motionScheme.fastEffectsSpec()),
             exit = fadeOut(MaterialTheme.motionScheme.fastEffectsSpec()),
             modifier = Modifier.align(Alignment.CenterEnd).padding(end = 8.dp),

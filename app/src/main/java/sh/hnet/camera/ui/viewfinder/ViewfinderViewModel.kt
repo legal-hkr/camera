@@ -41,6 +41,8 @@ data class ViewfinderUi(
     /** The tapped point (a share of the picture), shown as the focus mark. */
     val focus: Point? = null,
     val locked: Boolean = false,
+    /** The flashlight (Video mode). */
+    val torch: Boolean = false,
 )
 
 class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
@@ -96,10 +98,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     init {
         engine.resetControls()
         configure()
-        viewModelScope.launch {
-            media.removeAbandoned()
-            media.refreshLast()
-        }
+        viewModelScope.launch { media.refreshLast() }
     }
 
     val camera: CameraSpec? get() = cameras.getOrNull(_ui.value.cameraIndex)
@@ -129,16 +128,20 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
 
     fun clearPreviewSurface(surface: Surface) = engine.clearPreviewSurface(surface)
 
+    private val recording: Boolean get() = engineState.value.recording != null
+
     fun selectMode(mode: Mode) {
-        if (mode == _ui.value.mode) return
-        _ui.update { it.copy(mode = mode, focus = null, locked = false, exposure = 0) }
+        if (mode == _ui.value.mode || recording) return
+        _ui.update { it.copy(mode = mode, focus = null, locked = false, exposure = 0, torch = false) }
+        engine.setTorch(false)
         engine.resetFocus(exposure = 0)
         configure()
     }
 
     fun switchCamera() {
-        if (cameras.size < 2) return
-        _ui.update { it.copy(cameraIndex = (it.cameraIndex + 1) % cameras.size, zoom = 1.0, focus = null, locked = false, exposure = 0) }
+        if (cameras.size < 2 || recording) return
+        _ui.update { it.copy(cameraIndex = (it.cameraIndex + 1) % cameras.size, zoom = 1.0, focus = null, locked = false, exposure = 0, torch = false) }
+        engine.setTorch(false)
         engine.setZoom(1.0)
         engine.resetFocus(exposure = 0)
         configure()
@@ -177,6 +180,30 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         _ui.update { it.copy(focus = null, locked = false) }
         engine.resetFocus()
     }
+
+    fun toggleTorch() {
+        val on = !_ui.value.torch
+        _ui.update { it.copy(torch = on) }
+        engine.setTorch(on)
+    }
+
+    /** The video shutter: starts a recording into a new pending file, or ends the one running (saved either way as far as it got). */
+    fun record() {
+        // In the app's scope: a screen going away right after must not cut a start or a stop in half
+        if (recording) {
+            application.appScope.launch { engine.stopRecording() }
+            return
+        }
+        if (engineState.value.finishing) return
+        application.appScope.launch {
+            val target = media.newVideo(System.currentTimeMillis()) ?: return@launch
+            engine.startRecording(target, rotation, location = null)
+        }
+    }
+
+    fun pauseRecording() = engine.pauseRecording()
+
+    fun resumeRecording() = engine.resumeRecording()
 
     fun setExposure(steps: Int) {
         _ui.update { it.copy(exposure = steps) }

@@ -18,6 +18,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
+import sh.hnet.camera.camera.VideoTarget
 
 /** File names of the camera's shots: the local time to the millisecond, as bursts and quick shots fall in the same second. */
 object FileNames {
@@ -58,6 +59,30 @@ class MediaFiles(private val context: Context) {
             Log.w(TAG, "Photo not saved: ${e.javaClass.simpleName}")
             runCatching { resolver.delete(uri, null, null) }
             null
+        }
+    }
+
+    /** A new video in `DCIM/Camera`, pending until the recording ends; null when the storage refused it. */
+    suspend fun newVideo(startedAt: Long): VideoTarget? = withContext(Dispatchers.IO) {
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, FileNames.video(startedAt))
+            put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
+            put(MediaStore.MediaColumns.RELATIVE_PATH, CAMERA_DIR)
+            put(MediaStore.MediaColumns.DATE_TAKEN, startedAt)
+            put(MediaStore.MediaColumns.IS_PENDING, 1)
+        }
+        val uri = runCatching { resolver.insert(MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), values) }.getOrNull() ?: return@withContext null
+        val file = runCatching { resolver.openFileDescriptor(uri, "rw") }.getOrNull()
+        if (file == null) {
+            runCatching { resolver.delete(uri, null, null) }
+            return@withContext null
+        }
+        VideoTarget(file) { saved ->
+            withContext(Dispatchers.IO) {
+                if (saved) runCatching { resolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null) }
+                else runCatching { resolver.delete(uri, null, null) }
+            }
+            refreshLast()
         }
     }
 

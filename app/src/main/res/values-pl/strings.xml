@@ -61,4 +61,13 @@
     <string name="title_camera_failed">Aparat nie działa</string>
     <string name="desc_camera_failed">Uruchom ponownie aparat albo telefon.</string>
     <string name="button_restart_camera">Uruchom ponownie</string>
+    <!-- Stage 1b: video -->
+    <string name="tooltip_flashlight">Latarka</string>
+    <string name="tooltip_pause">Wstrzymaj</string>
+    <string name="tooltip_resume">Wznów</string>
+    <string name="tooltip_photo_while_recording">Zrób zdjęcie</string>
+    <string name="content_description_shutter_stop">Zatrzymaj</string>
+    <string name="content_description_recording">Nagrywanie</string>
+    <string name="label_no_sound">Bez dźwięku</string>
+    <string name="msg_mic_busy">Mikrofon jest używany przez inną aplikację. Film zostanie nagrany bez dźwięku.</string>
 </resources>

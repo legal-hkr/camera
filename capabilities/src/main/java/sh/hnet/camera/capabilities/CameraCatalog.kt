@@ -7,6 +7,7 @@ import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.params.DynamicRangeProfiles
 import android.hardware.camera2.params.StreamConfigurationMap
+import android.media.MediaRecorder
 import android.os.Build
 import android.util.Size
 import android.view.SurfaceHolder
@@ -41,6 +42,11 @@ data class CameraSpec(
     val zsl: Boolean,
     /** Sessions can be checked before they are configured (`CameraDeviceSetup`, Android 15+). */
     val sessionQueries: Boolean,
+    /** Sizes a video stream can have (an encoder's input surface). */
+    val video: List<PixelSize>,
+    /** Fixed frame rates the exposure can hold (30, 60…). */
+    val fixedFps: Set<Int>,
+    val videoStabilization: Boolean,
 )
 
 object CameraCatalog {
@@ -87,6 +93,9 @@ object CameraCatalog {
             flash = chars.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true,
             zsl = CaptureRequest.CONTROL_ENABLE_ZSL in requestKeys,
             sessionQueries = Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM && manager.isCameraDeviceSetupSupported(id),
+            video = map.getOutputSizes(MediaRecorder::class.java)?.map { PixelSize(it.width, it.height) }.orEmpty(),
+            fixedFps = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)?.filter { it.lower == it.upper }?.map { it.upper }?.toSet().orEmpty(),
+            videoStabilization = chars.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)?.contains(CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON) == true,
         )
     }
 

@@ -3,6 +3,7 @@ package sh.hnet.camera
 import android.app.Application
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import sh.hnet.camera.camera.CameraEngine
 import sh.hnet.camera.media.MediaFiles
 
@@ -16,4 +17,10 @@ class CameraApplication : Application() {
     val camera: CameraEngine by lazy { CameraEngine(this) }
 
     val media: MediaFiles by lazy { MediaFiles(this) }
+
+    override fun onCreate() {
+        super.onCreate()
+        // Only when the process starts: no recording of this process can be pending then
+        appScope.launch { media.removeAbandoned() }
+    }
 }

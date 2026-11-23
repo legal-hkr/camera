@@ -164,3 +164,29 @@ class OrientationTest {
         assertTrue(corner.left >= 0 && corner.top >= 0 && corner.right <= 4080 && corner.bottom <= 3072)
     }
 }
+
+class VideoLadderTest {
+    private val sizes = listOf(PixelSize(3840, 2160), PixelSize(1920, 1080))
+    private val everything = EncoderLimits { _, _, _ -> true }
+
+    @Test fun hdrBeforeSize() {
+        val ladder = SessionLadder.video(VideoChoice(), hlg = true, jpegR = true, sizes, setOf(30, 60), everything)
+        assertEquals(VideoSession(PictureRange.HLG, SessionLadder.UHD, 30, StillFormat.JPEG_R), ladder.first())
+        val firstSdr = ladder.indexOfFirst { it.range == PictureRange.SDR }
+        val firstFhdHlg = ladder.indexOfFirst { it.range == PictureRange.HLG && it.size == SessionLadder.FHD }
+        assertTrue(firstFhdHlg in 0 until firstSdr)
+    }
+
+    @Test fun sixtyIsSdrThenThirtyWithHdr() {
+        val ladder = SessionLadder.video(VideoChoice(fps = 60), hlg = true, jpegR = false, sizes, setOf(30, 60), everything)
+        assertEquals(VideoSession(PictureRange.SDR, SessionLadder.UHD, 60, StillFormat.JPEG), ladder.first())
+        assertTrue(ladder.none { it.fps == 60 && it.range == PictureRange.HLG })
+        assertTrue(ladder.any { it.fps == 30 && it.range == PictureRange.HLG })
+    }
+
+    @Test fun encoderWithoutHdrOr4k() {
+        val ladder = SessionLadder.video(VideoChoice(), hlg = true, jpegR = true, sizes, setOf(30), EncoderLimits { size, _, hdr -> !hdr && size == SessionLadder.FHD })
+        assertTrue(ladder.all { it.range == PictureRange.SDR && it.size == SessionLadder.FHD })
+        assertFalse(ladder.isEmpty())
+    }
+}

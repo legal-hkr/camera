@@ -24,8 +24,8 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 
-/** The shutter's looks of stage 1a (SPEC §5.1); burst, timer, long shot and recording come with their stages. */
-enum class ShutterLook { PHOTO, VIDEO }
+/** The shutter's looks of stage 1 so far (SPEC §5.1); burst, timer and long shot come with their stages. */
+enum class ShutterLook { PHOTO, VIDEO, RECORDING }
 
 /**
  * ShutterButton (SPEC §5.1): 80 dp in `primary`, its shape carrying the state. Photo: a ring inside a circle, both turning to rounded squares while the finger is
@@ -37,7 +37,7 @@ fun ShutterButton(look: ShutterLook, label: String, onClick: () -> Unit, enabled
     val pressed by interaction.collectIsPressedAsState()
     val spec = MaterialTheme.motionScheme.fastSpatialSpec<Dp>()
     val down = pressed && enabled && look == ShutterLook.PHOTO
-    val corner by animateDpAsState(if (down) 28.dp else 40.dp, spec, label = "shutter")
+    val corner by animateDpAsState(if (down || look == ShutterLook.RECORDING) 28.dp else 40.dp, spec, label = "shutter")
     val ringCorner by animateDpAsState(if (down) 22.dp else 32.dp, spec, label = "ring")
     val colors = ButtonDefaults.buttonColors()
     val container = if (enabled) colors.containerColor else colors.disabledContainerColor
@@ -54,6 +54,7 @@ fun ShutterButton(look: ShutterLook, label: String, onClick: () -> Unit, enabled
         when (look) {
             ShutterLook.PHOTO -> Box(Modifier.size(64.dp).border(3.dp, content, RoundedCornerShape(ringCorner)))
             ShutterLook.VIDEO -> Box(Modifier.size(26.dp).clip(CircleShape).background(content))
+            ShutterLook.RECORDING -> Box(Modifier.size(24.dp).clip(RoundedCornerShape(4.dp)).background(content))
         }
     }
 }

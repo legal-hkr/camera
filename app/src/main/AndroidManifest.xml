@@ -4,6 +4,8 @@
 
     <!-- Privacy: each permission comes with the stage that needs it and is listed in CLAUDE.md. Stage 1a: the camera. -->
     <uses-permission android:name="android.permission.CAMERA" />
+    <!-- Stage 1b: sound in videos (asked on the first entry into Video) -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
     <uses-feature android:name="android.hardware.camera.any" android:required="true" />
 
