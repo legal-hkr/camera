@@ -34,7 +34,9 @@ android {
         compose = true
     }
     androidResources {
-        localeFilters += listOf("en")
+        // The language can be chosen per app in the system's settings, as in the camera app
+        generateLocaleConfig = true
+        localeFilters += listOf("en", "pl")
     }
     dependenciesInfo {
         includeInApk = false

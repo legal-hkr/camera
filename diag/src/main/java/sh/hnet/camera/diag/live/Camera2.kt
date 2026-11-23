@@ -19,6 +19,8 @@ import android.os.HandlerThread
 import android.view.Surface
 import androidx.exifinterface.media.ExifInterface
 import java.util.concurrent.Executor
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeout
@@ -26,8 +28,6 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import sh.hnet.camera.capabilities.Names
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
 
 /** A thread for camera and codec callbacks, so the tests never wait on the main thread. */
 class CameraThread : AutoCloseable {

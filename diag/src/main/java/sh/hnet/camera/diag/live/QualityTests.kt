@@ -47,6 +47,7 @@ import sh.hnet.camera.capabilities.area
 import sh.hnet.camera.capabilities.jsonOf
 import sh.hnet.camera.capabilities.probe
 import sh.hnet.camera.capabilities.sizeText
+import sh.hnet.camera.diag.R
 
 /** A lens behind a logical camera (or the camera itself when it has none) and the logical camera's zoom ratio at which it shows its own field of view. */
 class Lens(val id: String, val physical: Boolean, val zoom: Float, val chars: CameraCharacteristics)
@@ -62,9 +63,9 @@ class QualityTests(context: Context, private val preview: PreviewHost) {
     private val resolver = context.contentResolver
 
     val all = listOf(
-        LiveTest("zoom_sources", "Zoom stops: the lens and sensor mode behind each") { zoomSources(it) },
-        LiveTest("raw_50mp", "50 MP RAW of every lens, sensor layout") { raw50(it) },
-        LiveTest("compare", "Comparison scene: Ultra HDR vs RAW bursts (about 1 GB, one scene per run)", inRunAll = false) { compare(it) },
+        LiveTest("zoom_sources", R.string.title_test_zoom_sources) { zoomSources(it) },
+        LiveTest("raw_50mp", R.string.title_test_raw_50mp) { raw50(it) },
+        LiveTest("compare", R.string.title_test_compare, inRunAll = false) { compare(it) },
     )
 
     private fun chars(id: String) = manager.getCameraCharacteristics(id)

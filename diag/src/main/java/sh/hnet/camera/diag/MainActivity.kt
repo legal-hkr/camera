@@ -13,6 +13,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -42,7 +43,6 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.dynamicDarkColorScheme
 import androidx.compose.material3.dynamicLightColorScheme
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -142,7 +142,7 @@ private fun DiagScreen(model: DiagViewModel = viewModel()) {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         state.cameras.forEach { camera ->
-                            FilterChip(selected = camera.id == state.selected, enabled = state.busy == null, onClick = { model.select(camera.id) }, label = { Text(camera.label) })
+                            FilterChip(selected = camera.id == state.selected, enabled = state.busy == null, onClick = { model.select(camera.id) }, label = { Text(stringResource(R.string.label_camera, camera.id, stringResource(facingLabel(camera.facing)))) })
                         }
                     }
                     Button(enabled = state.busy == null, onClick = { model.runProbes(context.display) }) { Text(stringResource(R.string.button_probes)) }
@@ -161,7 +161,7 @@ private fun DiagScreen(model: DiagViewModel = viewModel()) {
                     Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)) {
                         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(test.title, Modifier.weight(1f), style = MaterialTheme.typography.titleSmall)
+                                Text(stringResource(test.title), Modifier.weight(1f), style = MaterialTheme.typography.titleSmall)
                                 if (state.busy == test.key) LoadingIndicator() else OutlinedButton(enabled = state.busy == null, onClick = { model.runTest(test, preview) }) { Text(stringResource(R.string.button_run)) }
                             }
                             state.results["${test.key}/${state.selected}"]?.let { Text(it, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall) }

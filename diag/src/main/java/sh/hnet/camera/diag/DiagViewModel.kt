@@ -5,6 +5,7 @@ import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.net.Uri
 import android.view.Display
+import androidx.annotation.StringRes
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
@@ -23,13 +24,20 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.put
 import sh.hnet.camera.capabilities.CapabilityReport
-import sh.hnet.camera.capabilities.Names
 import sh.hnet.camera.diag.live.LiveTest
-import sh.hnet.camera.diag.live.LiveTests
 import sh.hnet.camera.diag.live.Media
 import sh.hnet.camera.diag.live.PreviewHost
 
-data class CameraChoice(val id: String, val label: String)
+data class CameraChoice(val id: String, val facing: Int?)
+
+/** The name of a lens facing for the camera chips and the summary. */
+@StringRes
+fun facingLabel(facing: Int?): Int = when (facing) {
+    CameraCharacteristics.LENS_FACING_BACK -> R.string.label_facing_back
+    CameraCharacteristics.LENS_FACING_FRONT -> R.string.label_facing_front
+    CameraCharacteristics.LENS_FACING_EXTERNAL -> R.string.label_facing_external
+    else -> R.string.label_unknown
+}
 
 data class DiagState(
     val cameras: List<CameraChoice> = emptyList(),
@@ -57,8 +65,7 @@ class DiagViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         val cameras = manager.cameraIdList.map { id ->
-            val facing = manager.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING)?.let { Names.facing(it).lowercase() } ?: "?"
-            CameraChoice(id, "$id ($facing)")
+            CameraChoice(id, manager.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING))
         }
         _state.update { it.copy(cameras = cameras, selected = cameras.firstOrNull()?.id) }
     }
@@ -103,6 +110,8 @@ class DiagViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private fun text(@StringRes id: Int, vararg args: Any): String = getApplication<Application>().getString(id, *args)
+
     private fun error(e: Throwable) = buildJsonObject { put("error", "${e.javaClass.simpleName}: ${e.message}") }
 
     /** One line per result: the error or skip reason, else the compact JSON cut short (the file has all of it). */
@@ -121,15 +130,15 @@ class DiagViewModel(application: Application) : AndroidViewModel(application) {
             val outputs = summary?.get("largestOutputs") as? JsonObject
             val combos = (sessions?.get(choice.id) as? JsonObject)?.values?.mapNotNull { (it as? JsonObject)?.get("supported") as? JsonPrimitive }
             val ext = (extensions?.get(choice.id) as? JsonObject)?.get("supported")
-            add("Camera ${choice.label}")
-            add("  JPEG_R: ${outputs?.get("JPEG_R") ?: "no"}")
-            add("  dynamic ranges: ${(summary?.get("dynamicRangeProfiles") as? JsonObject)?.keys ?: "?"}")
-            add("  sessions supported: ${combos?.count { it.content == "true" } ?: "?"} of ${combos?.size ?: "?"}")
-            add("  Camera2 extensions: ${ext?.let { runCatching { it.jsonArray.joinToString { e -> (e as JsonPrimitive).content } }.getOrDefault(it.toString()) } ?: "?"}")
+            add(text(R.string.msg_summary_camera, text(R.string.label_camera, choice.id, text(facingLabel(choice.facing)))))
+            add("  " + text(R.string.msg_summary_jpeg_r, outputs?.get("JPEG_R")?.toString() ?: text(R.string.label_no)))
+            add("  " + text(R.string.msg_summary_dynamic_ranges, (summary?.get("dynamicRangeProfiles") as? JsonObject)?.keys?.toString() ?: "?"))
+            add("  " + text(R.string.msg_summary_sessions, combos?.count { it.content == "true" }?.toString() ?: "?", combos?.size?.toString() ?: "?"))
+            add("  " + text(R.string.msg_summary_camera2_extensions, ext?.let { runCatching { it.jsonArray.joinToString { e -> (e as JsonPrimitive).content } }.getOrDefault(it.toString()) } ?: "?"))
         }
         (sections["cameraX"] as? JsonObject)?.forEach { (id, camera) ->
             val ext = (camera as? JsonObject)?.get("extensions")?.jsonObject?.filterValues { it is JsonObject }?.keys
-            add("CameraX $id extensions: ${ext ?: "?"}")
+            add(text(R.string.msg_summary_camerax_extensions, id, ext?.toString() ?: "?"))
         }
     }
 

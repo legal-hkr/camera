@@ -4,7 +4,6 @@ import android.content.Context
 import android.graphics.ImageDecoder
 import android.graphics.ImageFormat
 import android.graphics.SurfaceTexture
-import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraConstrainedHighSpeedCaptureSession
 import android.hardware.camera2.CameraDevice
@@ -25,6 +24,7 @@ import android.os.SystemClock
 import android.util.Range
 import android.util.Size
 import android.view.Surface
+import androidx.annotation.StringRes
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
 import kotlinx.serialization.json.JsonObject
@@ -36,6 +36,7 @@ import sh.hnet.camera.capabilities.area
 import sh.hnet.camera.capabilities.jsonOf
 import sh.hnet.camera.capabilities.probe
 import sh.hnet.camera.capabilities.sizeText
+import sh.hnet.camera.diag.R
 
 /** Where the tests show what the camera sees; the surface gets the buffer size a test needs (high-speed sessions need the preview at the video size). */
 fun interface PreviewHost {
@@ -43,7 +44,7 @@ fun interface PreviewHost {
 }
 
 /** A test a person runs with the phone pointed at a scene; it returns what really happened, measured, next to what the camera declared. */
-class LiveTest(val key: String, val title: String, val inRunAll: Boolean = true, val run: suspend (cameraId: String) -> JsonObject)
+class LiveTest(val key: String, @StringRes val title: Int, val inRunAll: Boolean = true, val run: suspend (cameraId: String) -> JsonObject)
 
 /**
  * Captures that check the declarations against reality: Ultra HDR and 10-bit stills, burst rates, HLG and high-speed video, still capture during video (motion photo),
@@ -55,16 +56,16 @@ class LiveTests(context: Context, private val preview: PreviewHost) {
     private val resolver = context.contentResolver
 
     val all = listOf(
-        LiveTest("ultra_hdr", "Ultra HDR photo (JPEG_R)") { ultraHdr(it) },
-        LiveTest("p010", "10-bit still (P010, HLG)") { p010(it) },
-        LiveTest("burst", "Burst rate (YUV, JPEG, RAW)") { burst(it) },
-        LiveTest("video_hlg_4k30", "HLG video 4K 30 fps") { video(it, VideoSpec(3840, 2160, 30, true, 50_000_000)) },
-        LiveTest("video_hlg_4k60", "HLG video 4K 60 fps") { video(it, VideoSpec(3840, 2160, 60, true, 80_000_000)) },
-        LiveTest("video_hlg_1080p60", "HLG video 1080p 60 fps") { video(it, VideoSpec(1920, 1080, 60, true, 30_000_000)) },
-        LiveTest("slow_motion", "Slow motion (high speed)") { slowMotion(it) },
-        LiveTest("motion_photo", "Still during video (motion photo)") { motionPhoto(it) },
-        LiveTest("extensions", "Camera2 extensions") { extensions(it) },
-        LiveTest("raw", "RAW (DNG, maximum resolution)") { raw(it) },
+        LiveTest("ultra_hdr", R.string.title_test_ultra_hdr) { ultraHdr(it) },
+        LiveTest("p010", R.string.title_test_p010) { p010(it) },
+        LiveTest("burst", R.string.title_test_burst) { burst(it) },
+        LiveTest("video_hlg_4k30", R.string.title_test_video_hlg_4k30) { video(it, VideoSpec(3840, 2160, 30, true, 50_000_000)) },
+        LiveTest("video_hlg_4k60", R.string.title_test_video_hlg_4k60) { video(it, VideoSpec(3840, 2160, 60, true, 80_000_000)) },
+        LiveTest("video_hlg_1080p60", R.string.title_test_video_hlg_1080p60) { video(it, VideoSpec(1920, 1080, 60, true, 30_000_000)) },
+        LiveTest("slow_motion", R.string.title_test_slow_motion) { slowMotion(it) },
+        LiveTest("motion_photo", R.string.title_test_motion_photo) { motionPhoto(it) },
+        LiveTest("extensions", R.string.title_test_extensions) { extensions(it) },
+        LiveTest("raw", R.string.title_test_raw) { raw(it) },
     )
 
     private fun chars(id: String) = manager.getCameraCharacteristics(id)
