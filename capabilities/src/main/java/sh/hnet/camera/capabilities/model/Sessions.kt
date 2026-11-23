@@ -15,7 +15,7 @@ data class PhotoSession(val range: PictureRange, val still: StillFormat, val mot
 data class VideoSession(val range: PictureRange, val size: PixelSize, val fps: Int, val still: StillFormat?)
 
 /** What the user chose for video (Settings › Video, the top row's "4K 30"): the session falls back from it when the camera or the encoder can't. */
-data class VideoChoice(val uhd: Boolean = true, val fps: Int = 30, val hdr: Boolean = true)
+data class VideoChoice(val uhd: Boolean = true, val fps: Int = 30, val hdr: Boolean = true, val hevc: Boolean = true)
 
 /** The encoder's side: which sizes, rates and HDR it can take (HEVC Main10 for HLG). */
 fun interface EncoderLimits {

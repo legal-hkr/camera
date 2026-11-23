@@ -3,6 +3,7 @@ package sh.hnet.camera.media
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Gainmap
+import android.graphics.Matrix
 import android.location.Location
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -12,29 +13,38 @@ import java.io.ByteArrayOutputStream
 import sh.hnet.camera.capabilities.model.PixelSize
 
 /**
- * Cuts a still to its aspect ratio when the camera has no size of it at full quality (a square on the Pixel 9 Pro, LOGIKA §3): the centered crop of the picture
+ * Edits a still where the camera can't: cuts it to its aspect ratio when the camera has no size of it at full quality (a square on the Pixel 9 Pro, LOGIKA §3): the centered crop of the picture
  * and of its Ultra HDR gain map, encoded again (Android 14's `Bitmap.compress` writes the gain map), the camera's EXIF carried over.
  */
 object StillCrop {
     private const val QUALITY = 95
 
-    fun crop(bytes: ByteArray, size: PixelSize): ByteArray {
-        val source = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return bytes
-        val width = size.width.coerceAtMost(source.width)
-        val height = size.height.coerceAtMost(source.height)
+    /** A photo encoded again, with its size. */
+    class Edited(val bytes: ByteArray, val size: PixelSize)
+
+    /**
+     * The photo cut to [crop] (centered) and mirrored as the front camera's preview shows it ([mirror], Settings › Photos), the gain map with it. The mirror is
+     * left to right as the photo is seen: across the stored rows when the EXIF turns the picture a quarter. The camera's file unchanged when it can't be decoded.
+     */
+    fun edit(bytes: ByteArray, crop: PixelSize?, mirror: Boolean): Edited? {
+        val source = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return null
+        val width = (crop?.width ?: source.width).coerceAtMost(source.width)
+        val height = (crop?.height ?: source.height).coerceAtMost(source.height)
         val x = (source.width - width) / 2
         val y = (source.height - height) / 2
-        val cropped = Bitmap.createBitmap(source, x, y, width, height)
-        source.gainmap?.let { cropped.gainmap = cropGainmap(it, source, x, y, width, height) }
+        val quarter = mirror && runCatching { ExifInterface(ByteArrayInputStream(bytes)).rotationDegrees % 180 != 0 }.getOrDefault(false)
+        val flip = if (mirror) Matrix().apply { if (quarter) setScale(1f, -1f) else setScale(-1f, 1f) } else null
+        val edited = Bitmap.createBitmap(source, x, y, width, height, flip, false)
+        source.gainmap?.let { edited.gainmap = editGainmap(it, source, x, y, width, height, flip) }
         val out = ByteArrayOutputStream()
-        cropped.compress(Bitmap.CompressFormat.JPEG, QUALITY, out)
+        edited.compress(Bitmap.CompressFormat.JPEG, QUALITY, out)
         source.recycle()
-        cropped.recycle()
-        return out.toByteArray()
+        edited.recycle()
+        return Edited(out.toByteArray(), PixelSize(width, height))
     }
 
     /** The gain map is smaller than the picture (a quarter on the Pixel): the same region at its scale, with the map's numbers kept. */
-    private fun cropGainmap(map: Gainmap, source: Bitmap, x: Int, y: Int, width: Int, height: Int): Gainmap {
+    private fun editGainmap(map: Gainmap, source: Bitmap, x: Int, y: Int, width: Int, height: Int, flip: Matrix?): Gainmap {
         val contents = map.gainmapContents
         val sx = contents.width.toDouble() / source.width
         val sy = contents.height.toDouble() / source.height
@@ -42,7 +52,7 @@ object StillCrop {
         val gy = (y * sy).toInt().coerceIn(0, contents.height - 1)
         val gw = (width * sx).toInt().coerceIn(1, contents.width - gx)
         val gh = (height * sy).toInt().coerceIn(1, contents.height - gy)
-        val cut = Bitmap.createBitmap(contents, gx, gy, gw, gh)
+        val cut = Bitmap.createBitmap(contents, gx, gy, gw, gh, flip, false)
         // Android 15+ copies everything the map says (direction, primaries); before, the numbers one by one
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) return Gainmap(map, cut)
         return Gainmap(cut).apply {

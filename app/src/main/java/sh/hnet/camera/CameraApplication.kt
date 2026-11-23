@@ -4,6 +4,7 @@ import android.app.Application
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import sh.hnet.camera.backup.BackupManager
 import sh.hnet.camera.camera.CameraEngine
 import sh.hnet.camera.media.MediaFiles
 
@@ -17,6 +18,8 @@ class CameraApplication : Application() {
     val camera: CameraEngine by lazy { CameraEngine(this) }
 
     val media: MediaFiles by lazy { MediaFiles(this) }
+
+    val backup: BackupManager by lazy { BackupManager(this, getSharedPreferences("stamps", MODE_PRIVATE)) }
 
     override fun onCreate() {
         super.onCreate()

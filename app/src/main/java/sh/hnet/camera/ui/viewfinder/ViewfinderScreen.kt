@@ -8,7 +8,6 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
-import android.net.Uri
 import android.os.SystemClock
 import android.provider.MediaStore
 import android.provider.Settings
@@ -114,7 +113,6 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -129,6 +127,7 @@ import kotlin.math.abs
 import kotlin.math.roundToInt
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import sh.hnet.camera.FirstRun
 import sh.hnet.camera.MotionPhoto
 import sh.hnet.camera.R
 import sh.hnet.camera.camera.CameraStatus
@@ -159,23 +158,28 @@ fun ViewfinderScreen(onOpenSettings: () -> Unit, viewModel: ViewfinderViewModel 
     val context = LocalContext.current
     val activity = LocalActivity.current
     var granted by remember { mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) }
-    var asked by rememberSaveable { mutableStateOf(false) }
+    // Asked by itself only once ever (not again after the wizard: a second refusal would be for good); Allow always asks, and the system's settings take over
+    // only when the system has just refused without its dialog
+    val camera = arrayOf(Manifest.permission.CAMERA)
+    var asked by rememberSaveable { mutableStateOf(FirstRun.requested(context, Manifest.permission.CAMERA)) }
     var permanentlyDenied by rememberSaveable { mutableStateOf(false) }
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
         granted = ok
         asked = true
-        permanentlyDenied = !ok && activity != null && !ActivityCompat.shouldShowRequestPermissionRationale(activity, Manifest.permission.CAMERA)
+        FirstRun.markRequested(context, camera)
+        permanentlyDenied = !ok && FirstRun.refusedForGood(activity, camera)
     }
-    // Access may have been given in the system's settings meanwhile
+    // Access may have been given (or set to ask again) in the system's settings meanwhile
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
         granted = ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+        permanentlyDenied = false
     }
     ViewfinderWindow()
     if (!granted) {
         NoCameraAccess(
             permanentlyDenied = permanentlyDenied,
             onAllow = {
-                if (permanentlyDenied) context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", context.packageName, null)))
+                if (permanentlyDenied) FirstRun.openAppSettings(context)
                 else launcher.launch(Manifest.permission.CAMERA)
             },
             onOpenSettings = onOpenSettings,
@@ -270,10 +274,18 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, onOpenSettings: () -> Uni
     // The microphone is asked for on the first entry into Video (SPEC §16); without it videos have no sound
     val activity = LocalActivity.current
     var micGranted by remember { mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) }
-    var micAsked by rememberSaveable { mutableStateOf(false) }
-    val micLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { micGranted = it }
+    // Asked by itself once ever (the wizard's question counts); the chip asks again, or opens the system's settings when the system just refused for good
+    val mic = arrayOf(Manifest.permission.RECORD_AUDIO)
+    var micAsked by rememberSaveable { mutableStateOf(FirstRun.requested(context, Manifest.permission.RECORD_AUDIO)) }
+    var micRefused by rememberSaveable { mutableStateOf(false) }
+    val micLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
+        micGranted = ok
+        FirstRun.markRequested(context, mic)
+        micRefused = !ok && FirstRun.refusedForGood(activity, mic)
+    }
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
         micGranted = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        micRefused = false
     }
     LaunchedEffect(ui.mode) {
         if (ui.mode == Mode.VIDEO && !micGranted && !micAsked) {
@@ -285,11 +297,18 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, onOpenSettings: () -> Uni
     val scope = rememberCoroutineScope()
     val micBusy = stringResource(R.string.msg_mic_busy)
     val hdrFps = stringResource(R.string.msg_hdr_fps)
+    val hdrCodec = stringResource(R.string.msg_hdr_codec)
     val locationDenied = stringResource(R.string.msg_location_denied)
     fun explain(message: String) = scope.launch { snackbars.showSnackbar(message, duration = SnackbarDuration.Short) }
     // Location is asked for when it is first turned on (SPEC §16); refused, it stays off and a snackbar says why
     val locationLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
-        if (result.values.any { it }) viewModel.setLocation(true) else explain(locationDenied)
+        FirstRun.markRequested(context, result.keys.toTypedArray())
+        when {
+            result.values.any { it } -> viewModel.setLocation(true)
+            // Refused for good: the dialog no longer shows, so the system's settings
+            FirstRun.refusedForGood(activity, result.keys.toTypedArray()) -> FirstRun.openAppSettings(context)
+            else -> explain(locationDenied)
+        }
     }
     fun toggleLocation() {
         when {
@@ -451,7 +470,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, onOpenSettings: () -> Uni
                             filled = !on,
                             turn = turn,
                             enabled = possible,
-                            onDisabled = { explain(hdrFps) },
+                            onDisabled = { explain(if (settings.videoHevc) hdrFps else hdrCodec) },
                         ) { viewModel.toggleHdr() }
                     }
                     if (!video) {
@@ -464,15 +483,15 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, onOpenSettings: () -> Uni
                         val rates = videoRates(camera.fixedFps)
                         val groups = buildList {
                             if (uhdAvailable) add(listOf(MenuChoice(stringResource(R.string.menu_resolution_4k), settings.videoUhd) { viewModel.setVideoSize(true) }, MenuChoice(stringResource(R.string.menu_resolution_1080p), !settings.videoUhd) { viewModel.setVideoSize(false) }))
-                            add(rates.map { fps -> MenuChoice(stringResource(R.string.value_fps, fps), fps == settings.videoFps, if (fps > SessionLadder.HLG_MAX_FPS && camera.hlg) stringResource(R.string.desc_fps_no_hdr) else null) { viewModel.setVideoFps(fps) } })
+                            add(rates.map { fps -> MenuChoice(stringResource(R.string.value_fps, fps), fps == viewModel.videoFps, if (fps > SessionLadder.HLG_MAX_FPS && camera.hlg) stringResource(R.string.desc_fps_no_hdr) else null) { viewModel.setVideoFps(fps) } })
                         }
                         // What the session records, once it runs (the ladder may have fallen back from the choice)
                         val recorded = engine.video
                         val uhd = recorded?.let { it.size.width >= SessionLadder.UHD.width } ?: (settings.videoUhd && uhdAvailable)
-                        val label = stringResource(R.string.value_video_quality, stringResource(if (uhd) R.string.menu_resolution_4k else R.string.menu_resolution_1080p), recorded?.fps ?: settings.videoFps)
+                        val label = stringResource(R.string.value_video_quality, stringResource(if (uhd) R.string.menu_resolution_4k else R.string.menu_resolution_1080p), recorded?.fps ?: viewModel.videoFps)
                         // Held sideways the pill is too narrow for "4K 30" turned: "4K" over "30"
                         val sideways = ui.rotation == 90 || ui.rotation == 270
-                        val stacked = if (sideways) listOf(stringResource(if (uhd) R.string.menu_resolution_4k else R.string.menu_resolution_1080p), "${recorded?.fps ?: settings.videoFps}") else null
+                        val stacked = if (sideways) listOf(stringResource(if (uhd) R.string.menu_resolution_4k else R.string.menu_resolution_1080p), "${recorded?.fps ?: viewModel.videoFps}") else null
                         MenuButton(groups) { open -> TopTextButton(label, stringResource(R.string.tooltip_video_quality), filled = false, turn = turn, stacked = stacked, onClick = open) }
                     } else {
                         MenuButton(listOf(Aspect.entries.map { a -> MenuChoice(aspectText(a), a == settings.aspect) { viewModel.setAspect(a) } })) { open ->
@@ -502,7 +521,9 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, onOpenSettings: () -> Uni
                 stringResource(R.string.label_no_sound),
                 Modifier.align(Alignment.TopStart).padding(start = 12.dp, top = status + maxOf(52.dp, pictureTop) + 8.dp),
             ) {
-                if (!micGranted) micLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                if (!micGranted) {
+                    if (micRefused) FirstRun.openAppSettings(context) else micLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                }
                 else scope.launch { snackbars.showSnackbar(micBusy, duration = SnackbarDuration.Short) }
             }
         }
@@ -647,7 +668,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, onOpenSettings: () -> Uni
                     uhdAvailable = SessionLadder.UHD in camera.video,
                     uhd = settings.videoUhd,
                     fpsChoices = videoRates(camera.fixedFps),
-                    fps = settings.videoFps,
+                    fps = viewModel.videoFps,
                     torch = ui.torch,
                     ultraHdrAvailable = camera.jpegR.isNotEmpty(),
                     motionPhoto = settings.motionPhoto,
@@ -667,7 +688,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, onOpenSettings: () -> Uni
                         } else {
                             // The snackbar would stand behind the sheet
                             quickSettings = false
-                            explain(hdrFps)
+                            explain(if (settings.videoHevc) hdrFps else hdrCodec)
                         }
                     },
                     onUltraHdr = { viewModel.toggleHdr() },

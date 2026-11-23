@@ -8,7 +8,9 @@ import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import sh.hnet.camera.backup.BackupSettings
 import sh.hnet.camera.capabilities.model.Aspect
 
 private val Context.settings by preferencesDataStore("settings")
@@ -38,6 +40,12 @@ data class CameraSettings(
     /** QR codes recognized in Photo mode (Settings › Photos). */
     val qrCodes: Boolean = true,
     val motionPhoto: MotionPhoto = MotionPhoto.AUTO,
+    /** Front camera photos saved as the preview shows them, mirrored (Settings › Photos). */
+    val mirror: Boolean = false,
+    /** The shutter's click (Settings › Photos); played anyway where the law wants it. */
+    val shutterSound: Boolean = true,
+    /** Videos in HEVC, else AVC for older devices (Settings › Video); HLG needs HEVC. */
+    val videoHevc: Boolean = true,
 )
 
 /** Choices the user made in the UI that outlive the process (app-private, not backed up by the system). */
@@ -57,6 +65,9 @@ class Preferences(private val context: Context) {
         volumeKeys = this[VOLUME_KEYS]?.let { name -> VolumeKeys.entries.firstOrNull { it.name == name } } ?: VolumeKeys.SHUTTER,
         qrCodes = this[QR_CODES] ?: true,
         motionPhoto = this[MOTION_PHOTO]?.let { name -> MotionPhoto.entries.firstOrNull { it.name == name } } ?: MotionPhoto.AUTO,
+        mirror = this[MIRROR] ?: false,
+        shutterSound = this[SHUTTER_SOUND] ?: true,
+        videoHevc = this[VIDEO_HEVC] ?: true,
     )
 
     suspend fun setAspect(value: Aspect) = context.settings.edit { it[ASPECT] = value.name }
@@ -71,6 +82,35 @@ class Preferences(private val context: Context) {
     suspend fun setVolumeKeys(value: VolumeKeys) = context.settings.edit { it[VOLUME_KEYS] = value.name }
     suspend fun setQrCodes(value: Boolean) = context.settings.edit { it[QR_CODES] = value }
     suspend fun setMotionPhoto(value: MotionPhoto) = context.settings.edit { it[MOTION_PHOTO] = value.name }
+    suspend fun setMirror(value: Boolean) = context.settings.edit { it[MIRROR] = value }
+    suspend fun setShutterSound(value: Boolean) = context.settings.edit { it[SHUTTER_SOUND] = value }
+    suspend fun setVideoHevc(value: Boolean) = context.settings.edit { it[VIDEO_HEVC] = value }
+
+    /** Every remembered value as the backup holds it (LOGIKA §12). */
+    suspend fun snapshot(): BackupSettings = BackupSettings.of(camera.first())
+
+    /** A backup's settings: each one the file holds replaces the current value; one it lacks stays as it is (family rule). */
+    suspend fun restore(backup: BackupSettings, locationAllowed: Boolean) {
+        val current = camera.first()
+        val restored = backup.applyTo(current, locationAllowed)
+        context.settings.edit { p ->
+            p[ASPECT] = restored.aspect.name
+            p[ULTRA_HDR] = restored.ultraHdr
+            p[HDR_VIDEO] = restored.hdrVideo
+            p[LOCATION] = restored.location
+            p[GRID] = restored.grid.name
+            p[LEVEL] = restored.level
+            p[VIDEO_UHD] = restored.videoUhd
+            p[VIDEO_FPS] = restored.videoFps
+            p[TIMER_FLASH] = restored.timerFlash
+            p[VOLUME_KEYS] = restored.volumeKeys.name
+            p[QR_CODES] = restored.qrCodes
+            p[MOTION_PHOTO] = restored.motionPhoto.name
+            p[MIRROR] = restored.mirror
+            p[SHUTTER_SOUND] = restored.shutterSound
+            p[VIDEO_HEVC] = restored.videoHevc
+        }
+    }
 
     /** Restore defaults (Settings › Reset): every setting of this store back to its default. */
     suspend fun restoreDefaults() = context.settings.edit { it.clear() }
@@ -88,5 +128,8 @@ class Preferences(private val context: Context) {
         val VOLUME_KEYS = stringPreferencesKey("volume_keys")
         val QR_CODES = booleanPreferencesKey("qr_codes")
         val MOTION_PHOTO = stringPreferencesKey("motion_photo")
+        val MIRROR = booleanPreferencesKey("mirror")
+        val SHUTTER_SOUND = booleanPreferencesKey("shutter_sound")
+        val VIDEO_HEVC = booleanPreferencesKey("video_hevc")
     }
 }

@@ -15,6 +15,7 @@ import androidx.lifecycle.viewModelScope
 import kotlin.math.acos
 import kotlin.math.sqrt
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -175,7 +176,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     fun request(): CameraRequest? {
         val ui = _ui.value
         val settings = ui.settings
-        return camera?.let { CameraRequest(it, ui.mode, settings.aspect, VideoChoice(settings.videoUhd, settings.videoFps, settings.hdrVideo), settings.ultraHdr, motion = ui.mode == Mode.PHOTO && settings.motionPhoto != MotionPhoto.OFF, motionFirst = settings.motionPhoto == MotionPhoto.ON) }
+        return camera?.let { CameraRequest(it, ui.mode, settings.aspect, VideoChoice(settings.videoUhd, videoFps, settings.hdrVideo && settings.videoHevc, settings.videoHevc), settings.ultraHdr, motion = ui.mode == Mode.PHOTO && settings.motionPhoto != MotionPhoto.OFF, motionFirst = settings.motionPhoto == MotionPhoto.ON) }
     }
 
     fun previewSize(): PixelSize? = request()?.let { engine.previewSize(it) }
@@ -316,8 +317,11 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         if (_ui.value.mode == Mode.VIDEO) preferences.setHdrVideo(!settings.hdrVideo) else preferences.setUltraHdr(!settings.ultraHdr)
     }
 
-    /** HLG only up to 30 fps: at 60 the HDR button is disabled and says why. */
-    val videoHdrPossible: Boolean get() = _ui.value.settings.videoFps <= SessionLadder.HLG_MAX_FPS
+    /** HLG only up to 30 fps and in HEVC: at 60 or with AVC the HDR button is disabled and says why. */
+    val videoHdrPossible: Boolean get() = videoFps <= SessionLadder.HLG_MAX_FPS && _ui.value.settings.videoHevc
+
+    /** The frame rate the current camera records: the remembered one where it has it (a backup or the other camera may have set 60), else 30. */
+    val videoFps: Int get() = _ui.value.settings.videoFps.takeIf { fps -> camera?.let { fps in videoRates(it.fixedFps) } ?: true } ?: 30
 
     fun setVideoSize(uhd: Boolean) = viewModelScope.launch { preferences.setVideoUhd(uhd) }
 
@@ -433,7 +437,8 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 val photo = try {
                     engine.takePhoto(rotation, place, precapture = screenFlash) {
-                        if (!cleared) sound.play(MediaActionSound.SHUTTER_CLICK)
+                        // The click where the setting wants it or the law does
+                        if (!cleared && (ui.settings.shutterSound || MediaActionSound.mustPlayShutterSound())) sound.play(MediaActionSound.SHUTTER_CLICK)
                         _shutter.tryEmit(Unit)
                     }
                 } finally {
@@ -445,15 +450,18 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
                 val flashFired = screenFlash || (camera?.flash == true && !ui.torch && (ui.flash == Flash.ON || (ui.flash == Flash.AUTO && engineState.value.flashNeeded)))
                 val motionMode = ui.settings.motionPhoto
                 val state = engineState.value
-                val wantMotion = !timed && !flashFired && state.motion && (motionMode == MotionPhoto.ON || (motionMode == MotionPhoto.AUTO && state.analysis))
+                // Nor a mirrored selfie: the video can't be mirrored with it, and the picture would jump to the other side when it plays
+                val mirror = front && ui.settings.mirror
+                val wantMotion = !timed && !flashFired && !mirror && state.motion && (motionMode == MotionPhoto.ON || (motionMode == MotionPhoto.AUTO && state.analysis))
                 if (wantMotion) _ui.update { it.copy(motionWaiting = it.motionWaiting + 1) }
                 application.appScope.launch {
-                    // The photo is saved at once; its video is added when the 1.5 s after it are there
+                    // The photo is saved at once; its video is added when the 1.5 s after it are there, gathered meanwhile (the ring keeps only a few seconds)
                     var waiting = wantMotion
+                    val clipping = if (wantMotion) async { engine.motionClip(photo) } else null
                     val uri = try {
-                        val saved = media.savePhoto(photo.bytes, photo.takenAt, photo.crop)
-                        if (wantMotion) {
-                            val clip = engine.motionClip(photo)
+                        val saved = media.savePhoto(photo.bytes, photo.takenAt, photo.crop, mirror)
+                        if (clipping != null) {
+                            val clip = clipping.await()
                             _ui.update { it.copy(motionWaiting = it.motionWaiting - 1) }
                             waiting = false
                             // Automatic: the video stays only when something moved around the shot

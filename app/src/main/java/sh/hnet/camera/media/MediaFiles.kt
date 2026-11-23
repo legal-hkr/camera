@@ -48,7 +48,7 @@ class MediaFiles(private val context: Context) {
     val last: StateFlow<LastShot?> = _last.asStateFlow()
 
     /** Writes a finished JPEG (Ultra HDR or plain), cut to [crop] first when the camera had no size of the shot's aspect, and publishes it; null when the storage refused it. */
-    suspend fun savePhoto(bytes: ByteArray, takenAt: Long, crop: PixelSize? = null): Uri? = withContext(Dispatchers.IO) {
+    suspend fun savePhoto(bytes: ByteArray, takenAt: Long, crop: PixelSize? = null, mirror: Boolean = false): Uri? = withContext(Dispatchers.IO) {
         val values = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, FileNames.photo(takenAt))
             put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
@@ -58,10 +58,12 @@ class MediaFiles(private val context: Context) {
         }
         val uri = runCatching { resolver.insert(MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), values) }.getOrNull() ?: return@withContext null
         try {
-            resolver.openOutputStream(uri)!!.use { it.write(if (crop == null) bytes else StillCrop.crop(bytes, crop)) }
-            if (crop != null) {
+            // Cut to its aspect and mirrored where asked, encoded again; else the camera's own file
+            val edited = if (crop != null || mirror) StillCrop.edit(bytes, crop, mirror) else null
+            resolver.openOutputStream(uri)!!.use { it.write(edited?.bytes ?: bytes) }
+            if (edited != null) {
                 // The photo is kept even if its EXIF can't be carried over
-                runCatching { resolver.openFileDescriptor(uri, "rw")!!.use { StillCrop.copyExif(bytes, it, crop) } }.onFailure { Log.w(TAG, "EXIF not copied: ${it.javaClass.simpleName}") }
+                runCatching { resolver.openFileDescriptor(uri, "rw")!!.use { StillCrop.copyExif(bytes, it, edited.size) } }.onFailure { Log.w(TAG, "EXIF not copied: ${it.javaClass.simpleName}") }
             }
             resolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
             show(uri, "image/jpeg")

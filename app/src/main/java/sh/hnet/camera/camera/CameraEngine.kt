@@ -551,7 +551,8 @@ class CameraEngine(context: Context) {
         return when (request.mode) {
             Mode.PHOTO -> SessionLadder.photo(spec.hlg, spec.jpegR.isNotEmpty(), wantMotion = request.motion, wantAnalysis = true, wantUltraHdr = request.ultraHdr, motionFirst = request.motionFirst).map { Rung(it.range, it.still, null, it.analysis, it.motion) }
             Mode.VIDEO -> {
-                val hevc = Encoders.hevc()
+                // AVC only where chosen (Settings › Video) or HEVC is missing; HLG is always HEVC
+                val hevc = request.video.hevc && Encoders.hevc()
                 SessionLadder.video(request.video, spec.hlg, spec.jpegR.isNotEmpty(), spec.video, spec.fixedFps, Encoders.limits(hevc))
                     .map { Rung(it.range, it.still, VideoFormat(it.size, it.fps, it.range == PictureRange.HLG, hevc || it.range == PictureRange.HLG)) }
                     // No encoder takes anything the camera offers: the preview alone, nothing to record
