@@ -38,17 +38,15 @@ fun rememberHaptics(): Haptics {
 }
 
 /**
- * The finder glass of SPEC §4.8 for controls lying over the live picture: the owner's exception to the family's colour rule (23 Nov 2026). This is its approved
- * fallback, plain 60 % `surfaceContainerHigh`; the blurred copy of the picture underneath comes with the analysis stream (stage 1c).
+ * The surface of controls lying over the live picture (SPEC §4.8): solid `surfaceContainerHigh`, always readable. The handoff's translucent "finder glass" over a
+ * blurred copy of the picture was built and dropped by the owner (23 Nov 2026): its picture changed in visible steps while the phone moved.
  */
-fun Modifier.finderGlass(shape: Shape, color: Color): Modifier = clip(shape).background(color, shape)
+fun Modifier.controlSurface(shape: Shape, color: Color): Modifier = clip(shape).background(color, shape)
 
-/** The glass' colour from the theme. */
+/** The controls' colour over the picture. */
 @Composable
 @ReadOnlyComposable
-fun glassColor(): Color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = GLASS_ALPHA)
-
-private const val GLASS_ALPHA = 0.6f
+fun controlColor(): Color = MaterialTheme.colorScheme.surfaceContainerHigh
 
 /** Numbers in the viewfinder follow the language's decimal separator ("0,5" in Polish, "0.5" in English): one decimal at most, none when whole. */
 @Composable

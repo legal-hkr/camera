@@ -34,6 +34,7 @@ import sh.hnet.camera.VolumeKeys
 import sh.hnet.camera.camera.CameraRequest
 import sh.hnet.camera.camera.EngineState
 import sh.hnet.camera.camera.Flash
+import sh.hnet.camera.camera.FrameAnalyzer
 import sh.hnet.camera.camera.Mode
 import sh.hnet.camera.capabilities.CameraSpec
 import sh.hnet.camera.capabilities.model.Aspect
@@ -84,6 +85,9 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     private val media = application.media
     private val preferences = application.preferences
     val location = LocationTracker(app)
+
+    /** QR codes and the finder glass from the analysis stream, read against the preview's shape. */
+    val analyzer = FrameAnalyzer { previewSize()?.ratio ?: (4.0 / 3) }
 
     /** Read again until the camera permission is there (some characteristics need it). */
     val cameras: List<CameraSpec> get() = engine.cameras
@@ -177,6 +181,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun configure() {
         request()?.let { engine.configure(it) }
+        analyzer.qrEnabled = _ui.value.mode == Mode.PHOTO && _ui.value.settings.qrCodes
     }
 
     private var started = false
@@ -196,6 +201,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         }
         // Also after the camera permission was just given (the cameras couldn't be read before)
         configure()
+        engine.analyzer = analyzer::analyze
         engine.start()
         sensors.getDefaultSensor(Sensor.TYPE_GRAVITY)?.let { sensors.registerListener(gravityListener, it, SensorManager.SENSOR_DELAY_UI) }
         updateLocation()
@@ -204,6 +210,8 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
 
     fun stop() {
         started = false
+        engine.analyzer = null
+        analyzer.reset()
         unwatch?.invoke()
         unwatch = null
         cancelTimer()
@@ -227,6 +235,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         if (mode == _ui.value.mode || recording) return
         cancelTimer()
         _ui.update { it.copy(mode = mode, focus = null, locked = false, exposure = 0, torch = false) }
+        analyzer.reset()
         engine.setTorch(false)
         engine.resetFocus(exposure = 0)
         configure()
@@ -240,6 +249,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         engine.setZoom(1.0)
         engine.resetFocus(exposure = 0)
         engine.setFlash(_ui.value.flash, null)
+        analyzer.reset()
         configure()
     }
 
@@ -483,6 +493,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         sensors.unregisterListener(gravityListener)
         location.close()
         unwatch?.invoke()
+        analyzer.close()
         sound.release()
         beep?.release()
     }

@@ -114,4 +114,19 @@
     <string name="content_description_shutter_cancel_timer">Anuluj samowyzwalacz</string>
     <string name="label_panel_location">Lokalizacja</string>
     <string name="label_panel_ultra_hdr">Ultra HDR</string>
+    <!-- Stage 1c-2: QR codes -->
+    <string name="label_qr_wifi">Wi-Fi: %1$s</string>
+    <string name="title_qr_code">Kod QR</string>
+    <string name="title_qr_wifi">Sieć Wi-Fi</string>
+    <string name="label_qr_link">Link</string>
+    <string name="label_qr_text">Tekst</string>
+    <string name="label_qr_wifi_name">Nazwa: %1$s</string>
+    <string name="label_qr_wifi_security">Zabezpieczenia: %1$s</string>
+    <string name="button_copy">Kopiuj</string>
+    <string name="button_share">Udostępnij</string>
+    <string name="button_open">Otwórz</string>
+    <string name="button_copy_password">Kopiuj hasło</string>
+    <string name="button_connect">Połącz</string>
+    <string name="msg_wifi_refused">Nie można dodać tej sieci automatycznie. System nie obsługuje haseł krótszych niż 8 znaków ani ze znakami spoza ASCII, a także sieci WEP i sieci z logowaniem firmowym. Skopiuj hasło i połącz się w ustawieniach Wi-Fi.</string>
+    <string name="label_macro">Makro</string>
 </resources>

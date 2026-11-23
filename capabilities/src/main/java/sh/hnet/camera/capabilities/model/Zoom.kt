@@ -56,6 +56,17 @@ object ZoomStops {
         return ZoomScale(distinct, min = distinct.minOf { it.ratio }, max = range.endInclusive, end = end)
     }
 
+    /**
+     * The physical lenses that are the ultrawide (and its other modes, sharing its focal length): the camera switching to one of them at 1× or more is macro
+     * (Pixel 9 Pro switches to physical 3 by itself close up, diag 23 Nov 2026).
+     */
+    fun ultrawideIds(logical: LensOptics, physical: List<LensOptics>): Set<String> {
+        if (physical.isEmpty()) return emptySet()
+        val main = physical.minBy { abs(it.view / logical.view - 1) }
+        val wide = physical.filter { main.view / it.view < ULTRAWIDE_BELOW }
+        return physical.filter { lens -> wide.any { abs(it.focalLength / lens.focalLength - 1) < 0.01 } }.map { it.id }.toSet()
+    }
+
     /** Where a tele's stop sits: the whole number nearest its ratio (Pixel 9 Pro: 4.5 by the optics, 5× as the camera labels and switches it), unless that falls short of the lens, then the ratio itself to a tenth, rounded up. */
     fun teleStop(ratio: Double): Double {
         val whole = ratio.roundToInt().toDouble()

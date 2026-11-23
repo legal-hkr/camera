@@ -8,6 +8,9 @@
     public static ** valueOf(java.lang.String);
 }
 
+# zxing-cpp's wrapper names CameraX's ImageProxy in a method the app never calls (CameraX is left out)
+-dontwarn androidx.camera.core.**
+
 # Stack traces in error details stay readable enough to report
 -keepattributes SourceFile,LineNumberTable
 -renamesourcefileattribute SourceFile

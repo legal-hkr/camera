@@ -32,6 +32,8 @@ data class CameraSettings(
     /** The back flash's LED counts the timer down (owner, 23 Nov 2026). */
     val timerFlash: Boolean = false,
     val volumeKeys: VolumeKeys = VolumeKeys.SHUTTER,
+    /** QR codes recognized in Photo mode (Settings › Photos). */
+    val qrCodes: Boolean = true,
 )
 
 /** Choices the user made in the UI that outlive the process (app-private, not backed up by the system). */
@@ -49,6 +51,7 @@ class Preferences(private val context: Context) {
         videoFps = this[VIDEO_FPS] ?: 30,
         timerFlash = this[TIMER_FLASH] ?: false,
         volumeKeys = this[VOLUME_KEYS]?.let { name -> VolumeKeys.entries.firstOrNull { it.name == name } } ?: VolumeKeys.SHUTTER,
+        qrCodes = this[QR_CODES] ?: true,
     )
 
     suspend fun setAspect(value: Aspect) = context.settings.edit { it[ASPECT] = value.name }
@@ -61,6 +64,7 @@ class Preferences(private val context: Context) {
     suspend fun setVideoFps(value: Int) = context.settings.edit { it[VIDEO_FPS] = value }
     suspend fun setTimerFlash(value: Boolean) = context.settings.edit { it[TIMER_FLASH] = value }
     suspend fun setVolumeKeys(value: VolumeKeys) = context.settings.edit { it[VOLUME_KEYS] = value.name }
+    suspend fun setQrCodes(value: Boolean) = context.settings.edit { it[QR_CODES] = value }
 
     /** Restore defaults (Settings › Reset): every setting of this store back to its default. */
     suspend fun restoreDefaults() = context.settings.edit { it.clear() }
@@ -76,5 +80,6 @@ class Preferences(private val context: Context) {
         val VIDEO_FPS = intPreferencesKey("video_fps")
         val TIMER_FLASH = booleanPreferencesKey("timer_flash")
         val VOLUME_KEYS = stringPreferencesKey("volume_keys")
+        val QR_CODES = booleanPreferencesKey("qr_codes")
     }
 }

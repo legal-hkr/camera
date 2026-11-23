@@ -114,7 +114,7 @@ fun TopButton(
                     when {
                         accent && enabled -> Modifier.background(colorResource(R.color.flash_ready_fill), CircleShape)
                         filled && enabled -> Modifier.background(colors.secondaryContainer, CircleShape)
-                        else -> Modifier.finderGlass(CircleShape, glassColor())
+                        else -> Modifier.controlSurface(CircleShape, controlColor())
                     },
                 )
                 .clickable(role = Role.Button) { if (enabled) onClick() else onDisabled() }
@@ -147,7 +147,7 @@ fun TopTextButton(text: String, label: String, filled: Boolean, turn: Float, sta
             modifier = Modifier
                 .height(40.dp)
                 .defaultMinSize(minWidth = 48.dp)
-                .then(if (filled) Modifier.background(colors.secondaryContainer, CircleShape) else Modifier.finderGlass(CircleShape, glassColor()))
+                .then(if (filled) Modifier.background(colors.secondaryContainer, CircleShape) else Modifier.controlSurface(CircleShape, controlColor()))
                 .clickable(role = Role.Button, onClick = onClick)
                 .semantics { contentDescription = label }
                 .padding(horizontal = 11.dp),

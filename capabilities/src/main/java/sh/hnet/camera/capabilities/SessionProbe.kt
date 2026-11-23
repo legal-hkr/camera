@@ -188,8 +188,9 @@ class SessionProbe(private val manager: CameraManager) {
                 val previewSize = sizes(ImageFormat.PRIVATE).filter { it.width <= 1920 && near(it, w, ht) }.maxByOrNull { area(it) } ?: continue
                 val jpegR = largestOf(ImageFormat.JPEG_R, w, ht)
                 val jpeg = largestOf(ImageFormat.JPEG, w, ht)
-                val yuvSmall = smallestAtLeast(ImageFormat.YUV_420_888, 320)
-                val p010Small = smallestAtLeast(ImageFormat.YCBCR_P010, 320)
+                // The app's analysis stream: 4:3, at least 640 wide (QR codes)
+                val yuvSmall = smallestAtLeast(ImageFormat.YUV_420_888, 640)
+                val p010Small = smallestAtLeast(ImageFormat.YCBCR_P010, 640)
                 fun preview(profile: Long) = Output("preview", ImageFormat.PRIVATE, previewSize, previewUsage, profile, previewUseCase ?: 0)
                 fun motion(profile: Long) = Output("motion", ImageFormat.PRIVATE, previewSize, videoUsage, profile, videoUseCase ?: 0)
                 fun still(format: Int, size: Size) = Output("still", format, size, useCase = stillUseCase ?: 0)

@@ -79,6 +79,10 @@ dependencies {
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.datastore.preferences)
     implementation(libs.exifinterface)
+    // QR codes (actively developed, Apache 2.0). Its wrapper also reads CameraX frames; the app reads bitmaps and has no CameraX, so that dependency stays out
+    implementation(libs.zxing.cpp) {
+        exclude(group = "androidx.camera")
+    }
 
     implementation(project(":capabilities"))
 

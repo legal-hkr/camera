@@ -115,4 +115,19 @@
     <string name="content_description_shutter_cancel_timer">Cancel timer</string>
     <string name="label_panel_location">Location in photos</string>
     <string name="label_panel_ultra_hdr">Ultra HDR</string>
+    <!-- Stage 1c-2: QR codes -->
+    <string name="label_qr_wifi">Wi-Fi: %1$s</string>
+    <string name="title_qr_code">QR code</string>
+    <string name="title_qr_wifi">Wi-Fi network</string>
+    <string name="label_qr_link">Link</string>
+    <string name="label_qr_text">Text</string>
+    <string name="label_qr_wifi_name">Name: %1$s</string>
+    <string name="label_qr_wifi_security">Security: %1$s</string>
+    <string name="button_copy">Copy</string>
+    <string name="button_share">Share</string>
+    <string name="button_open">Open</string>
+    <string name="button_copy_password">Copy password</string>
+    <string name="button_connect">Connect</string>
+    <string name="msg_wifi_refused">This network can’t be added automatically. The system doesn’t support passwords shorter than 8 characters or with non-ASCII characters, or WEP and enterprise networks. Copy the password and connect in Wi-Fi settings.</string>
+    <string name="label_macro">Macro</string>
 </resources>

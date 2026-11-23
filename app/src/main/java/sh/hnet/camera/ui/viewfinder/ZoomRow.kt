@@ -185,7 +185,7 @@ fun ZoomRow(
                         scale.ultrawide?.let { wide ->
                             val selected = zoom < start - 1e-6
                             val label = if (selected) stringResource(R.string.value_zoom, numbers.zoom(wide.ratio)) else numbers.zoom(wide.ratio)
-                            ZoomPill(label, selected, stringResource(R.string.tooltip_ultrawide), Modifier.height(44.dp).defaultMinSize(minWidth = 44.dp).finderGlass(CircleShape, glassColor()), turn) {
+                            ZoomPill(label, selected, stringResource(R.string.tooltip_ultrawide), Modifier.height(44.dp).defaultMinSize(minWidth = 44.dp).controlSurface(CircleShape, controlColor()), turn) {
                                 haptics.detent()
                                 onZoom(wide.ratio)
                             }
@@ -195,7 +195,7 @@ fun ZoomRow(
                             verticalAlignment = Alignment.CenterVertically,
                             modifier = Modifier
                                 .height(44.dp)
-                                .finderGlass(CircleShape, glassColor())
+                                .controlSurface(CircleShape, controlColor())
                                 .padding(4.dp)
                                 .onGloballyPositioned { coordinates ->
                                     // The group's bounds in the row's box, for telling a drag on the stops from one elsewhere
@@ -284,7 +284,7 @@ fun GlassIconButton(icon: Int, label: String, selected: Boolean, size: Int, icon
             contentAlignment = Alignment.Center,
             modifier = Modifier
                 .size(size.dp)
-                .then(if (selected) Modifier.background(colors.secondaryContainer, CircleShape) else Modifier.finderGlass(CircleShape, glassColor()))
+                .then(if (selected) Modifier.background(colors.secondaryContainer, CircleShape) else Modifier.controlSurface(CircleShape, controlColor()))
                 .clickable(role = Role.Button, onClick = onClick)
                 .semantics { contentDescription = label },
         ) {

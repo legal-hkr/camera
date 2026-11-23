@@ -52,10 +52,10 @@ class LinearScale(override val min: Double, override val max: Double, private va
 @Composable
 fun ValueRuler(scale: RulerScale, value: Double, ticks: List<Tick>, modifier: Modifier = Modifier, height: Dp = 48.dp) {
     val colors = MaterialTheme.colorScheme
-    val glass = glassColor()
+    val glass = controlColor()
     val measurer = rememberTextMeasurer()
     val labelStyle = TextStyle(fontSize = 10.sp, color = colors.onSurfaceVariant)
-    Box(modifier.fillMaxWidth().height(height).finderGlass(CircleShape, glass)) {
+    Box(modifier.fillMaxWidth().height(height).controlSurface(CircleShape, glass)) {
         Canvas(Modifier.fillMaxSize()) {
             val center = size.width / 2
             val now = scale.position(value)

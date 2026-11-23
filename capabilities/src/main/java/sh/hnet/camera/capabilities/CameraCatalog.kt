@@ -24,6 +24,8 @@ data class CameraSpec(
     val sensorOrientation: Int,
     val activeArray: PixelRect,
     val zoom: ZoomScale,
+    /** The physical lenses of the ultrawide: the camera streaming from one at 1× or more is in macro. */
+    val ultrawideIds: Set<String>,
     val jpegR: List<PixelSize>,
     val jpeg: List<PixelSize>,
     val preview: List<PixelSize>,
@@ -80,6 +82,7 @@ object CameraCatalog {
             sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0,
             activeArray = PixelRect(active.left, active.top, active.right, active.bottom),
             zoom = ZoomStops.compute(logical, physical, range),
+            ultrawideIds = ZoomStops.ultrawideIds(logical, physical),
             jpegR = sizes(map, ImageFormat.JPEG_R),
             jpeg = sizes(map, ImageFormat.JPEG),
             preview = map.getOutputSizes(SurfaceHolder::class.java)?.map { PixelSize(it.width, it.height) }.orEmpty(),

@@ -130,6 +130,7 @@ import sh.hnet.camera.R
 import sh.hnet.camera.camera.CameraStatus
 import sh.hnet.camera.camera.Flash
 import sh.hnet.camera.camera.Mode
+import sh.hnet.camera.camera.QrContent
 import sh.hnet.camera.camera.Recording
 import sh.hnet.camera.capabilities.model.Aspect
 import sh.hnet.camera.capabilities.model.Orientation
@@ -300,6 +301,12 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, onOpenSettings: () -> Uni
     val stepsPerThird = camera?.let { (1.0 / 3 / it.exposureStep).roundToInt().coerceAtLeast(1) } ?: 1
     val ev = (camera?.exposureStep ?: 0.0) * ui.exposure
 
+    // The QR code found in the analysis stream, only while the session has one
+    val found by viewModel.analyzer.qr.collectAsStateWithLifecycle()
+    val qr = found.takeIf { engine.analysis }
+    var qrSheet by remember { mutableStateOf<QrContent?>(null) }
+    val noApp = stringResource(R.string.msg_no_browser)
+
     BoxWithConstraints(Modifier.fillMaxSize().background(colors.surface)) {
         val nav = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
         val modeBottom = nav + 2.dp
@@ -349,6 +356,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, onOpenSettings: () -> Uni
                     exposure = if (ui.exposure != 0 || exposureOpen) numbers.exposure(ev) else null,
                     face = engine.face,
                 )
+                qr?.let { if (it.corners.isNotEmpty()) QrMarks(it.corners) }
                 Box(
                     Modifier
                         .fillMaxSize()
@@ -489,7 +497,11 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, onOpenSettings: () -> Uni
         Box(Modifier.align(Alignment.BottomCenter).padding(bottom = zoomBottom + 44.dp + 36.dp).height(32.dp)) {
             when {
                 zoomRulerOpen -> SolidChip(stringResource(R.string.value_zoom, numbers.zoom(ui.zoom)), primary = true)
+                // Macro (SPEC §4.5, above the lock): the camera took the ultrawide by itself; it can't be told not to, so the chip only says so (D8)
+                engine.macro && !exposureOpen -> SuggestionChip(R.drawable.ic_macro_auto, stringResource(R.string.label_macro), onDismiss = null)
                 ui.locked && !exposureOpen -> SuggestionChip(R.drawable.ic_lock, stringResource(R.string.label_ae_af_locked), onDismiss = { viewModel.unlock() })
+                // A QR code: its domain, network or first words; a tap opens what it holds (SPEC §7.10)
+                qr != null && !exposureOpen -> SuggestionChip(qrIcon(qr.content), qrChipText(qr.content), onDismiss = null, onClick = { qrSheet = qr.content })
             }
         }
         // The exposure ruler above the zoom row, in the suggestion slot's place
@@ -574,6 +586,20 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, onOpenSettings: () -> Uni
                 viewModel.selectMode(it)
             },
             modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = modeBottom),
+        )
+    }
+
+    val wifiRefused = stringResource(R.string.msg_wifi_refused)
+    qrSheet?.let { content ->
+        QrSheet(
+            content,
+            onDismiss = { qrSheet = null },
+            onNoApp = { explain(noApp) },
+            // The snackbar would stand behind the sheet
+            onWifiRefused = {
+                qrSheet = null
+                explain(wifiRefused)
+            },
         )
     }
 
@@ -744,9 +770,9 @@ private fun SwitchCameraButton(turn: Float, onClick: () -> Unit, modifier: Modif
 
 /** A suggestion chip (SPEC §4.5): 32 dp, small corners, `secondaryContainer`, a filled icon and an optional close. */
 @Composable
-private fun SuggestionChip(icon: Int, text: String, onDismiss: (() -> Unit)?) {
+private fun SuggestionChip(icon: Int, text: String, onDismiss: (() -> Unit)?, onClick: (() -> Unit)? = null) {
     val colors = MaterialTheme.colorScheme
-    Surface(shape = RoundedCornerShape(8.dp), color = colors.secondaryContainer, contentColor = colors.onSecondaryContainer, modifier = Modifier.height(32.dp)) {
+    Surface(shape = RoundedCornerShape(8.dp), color = colors.secondaryContainer, contentColor = colors.onSecondaryContainer, modifier = Modifier.height(32.dp).then(if (onClick != null) Modifier.clickable(role = Role.Button, onClick = onClick) else Modifier)) {
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(start = 8.dp, end = if (onDismiss == null) 12.dp else 0.dp)) {
             Icon(painterResource(icon), contentDescription = null, modifier = Modifier.size(18.dp))
             Spacer(Modifier.width(8.dp))
@@ -877,7 +903,7 @@ private fun IndicatorChip(icon: Int, label: String, modifier: Modifier, onClick:
     Box(
         modifier
             .height(28.dp)
-            .finderGlass(CircleShape, glassColor())
+            .controlSurface(CircleShape, controlColor())
             .clickable(role = Role.Button, onClick = onClick),
         contentAlignment = Alignment.Center,
     ) {

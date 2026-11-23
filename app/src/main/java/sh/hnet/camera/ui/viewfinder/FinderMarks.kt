@@ -135,7 +135,7 @@ private inline fun DrawScope.doubleStroke(core: Color, outline: Color, draw: Dra
 @Composable
 private fun MarkChip(modifier: Modifier, glass: Boolean, content: @Composable () -> Unit) {
     val colors = MaterialTheme.colorScheme
-    Box(modifier.height(28.dp).then(if (glass) Modifier.finderGlass(CircleShape, glassColor()) else Modifier.finderGlass(CircleShape, colors.primaryContainer)), contentAlignment = Alignment.Center) {
+    Box(modifier.height(28.dp).then(if (glass) Modifier.controlSurface(CircleShape, controlColor()) else Modifier.controlSurface(CircleShape, colors.primaryContainer)), contentAlignment = Alignment.Center) {
         Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(horizontal = if (glass) 10.dp else 6.dp)) {
             CompositionLocalProvider(LocalContentColor provides if (glass) colors.onSurface else colors.onPrimaryContainer) { content() }
         }

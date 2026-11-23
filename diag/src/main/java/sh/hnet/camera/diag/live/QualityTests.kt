@@ -66,7 +66,93 @@ class QualityTests(context: Context, private val preview: PreviewHost) {
         LiveTest("zoom_sources", R.string.title_test_zoom_sources) { zoomSources(it) },
         LiveTest("raw_50mp", R.string.title_test_raw_50mp) { raw50(it) },
         LiveTest("compare", R.string.title_test_compare, inRunAll = false) { compare(it) },
+        LiveTest("macro", R.string.title_test_macro, inRunAll = false) { macro(it) },
     )
+
+    /**
+     * Macro (D8): does the logical camera switch to the ultrawide by itself when the subject is too close for the main lens at 1×? The phone is held about 5 cm
+     * from something with detail; for 8 s with continuous AF, then 4 s after an AF trigger in the middle, every frame's active lens, focus distance and AF state
+     * are counted.
+     */
+    private suspend fun macro(id: String): JsonObject {
+        val chars = chars(id)
+        if (chars.get(CameraCharacteristics.LENS_FACING) != CameraCharacteristics.LENS_FACING_BACK) return buildJsonObject { put("skipped", "back camera only") }
+        val surface = preview.surface(previewSize(map(chars)))
+        val minFocus = chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE)
+        return manager.withCamera(id) { device, thread ->
+            val session = device.session(listOf(OutputConfiguration(surface)), thread)
+            try {
+                buildJsonObject {
+                    put("minimumFocusCm", jsonOf(minFocus?.takeIf { it > 0 }?.let { 100 / it }))
+                    // Centimetres mean something only when the focus distance is calibrated
+                    put("focusCalibration", jsonOf(chars.get(CameraCharacteristics.LENS_INFO_FOCUS_DISTANCE_CALIBRATION)?.let { listOf("uncalibrated", "approximate", "calibrated").getOrElse(it) { "$it" } }))
+                    put("continuous", macroPhase(device, session, thread, surface, trigger = false, ms = 8_000))
+                    put("afterTrigger", macroPhase(device, session, thread, surface, trigger = true, ms = 4_000))
+                }
+            } finally {
+                session.close()
+            }
+        }
+    }
+
+    private fun afStateName(state: Int?) = when (state) {
+        CameraMetadata.CONTROL_AF_STATE_INACTIVE -> "inactive"
+        CameraMetadata.CONTROL_AF_STATE_PASSIVE_SCAN -> "passive scan"
+        CameraMetadata.CONTROL_AF_STATE_PASSIVE_FOCUSED -> "passive focused"
+        CameraMetadata.CONTROL_AF_STATE_PASSIVE_UNFOCUSED -> "passive unfocused"
+        CameraMetadata.CONTROL_AF_STATE_ACTIVE_SCAN -> "active scan"
+        CameraMetadata.CONTROL_AF_STATE_FOCUSED_LOCKED -> "focused locked"
+        CameraMetadata.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED -> "not focused locked"
+        null -> "none"
+        else -> state.toString()
+    }
+
+    private suspend fun macroPhase(device: CameraDevice, session: CameraCaptureSession, thread: CameraThread, surface: Surface, trigger: Boolean, ms: Long): JsonObject {
+        // Written by the camera thread's callbacks, read here once they have stopped (counted under one lock)
+        val lock = Any()
+        val lenses = mutableMapOf<String, Int>()
+        val states = mutableMapOf<String, Int>()
+        var nearestCm: Float? = null
+        var frames = 0
+        val watch = object : CameraCaptureSession.CaptureCallback() {
+            override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult): Unit = synchronized(lock) {
+                frames++
+                val lens = result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID) ?: "logical"
+                lenses[lens] = (lenses[lens] ?: 0) + 1
+                val state = afStateName(result.get(CaptureResult.CONTROL_AF_STATE))
+                states[state] = (states[state] ?: 0) + 1
+                result.get(CaptureResult.LENS_FOCUS_DISTANCE)?.takeIf { it > 0 }?.let { diopters ->
+                    val cm = 100 / diopters
+                    val nearest = nearestCm
+                    if (nearest == null || cm < nearest) nearestCm = cm
+                }
+            }
+        }
+        val mode = if (trigger) CameraMetadata.CONTROL_AF_MODE_AUTO else CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+        device.repeating(session, thread, listOf(surface), callback = watch) {
+            set(CaptureRequest.CONTROL_ZOOM_RATIO, 1f)
+            set(CaptureRequest.CONTROL_AF_MODE, mode)
+        }
+        if (trigger) {
+            val request = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                addTarget(surface)
+                set(CaptureRequest.CONTROL_ZOOM_RATIO, 1f)
+                set(CaptureRequest.CONTROL_AF_MODE, mode)
+                set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START)
+            }
+            session.capture(request.build(), null, thread.handler)
+        }
+        delay(ms)
+        session.stopRepeating()
+        // Results already on their way still arrive for a moment
+        delay(300)
+        return synchronized(lock) { buildJsonObject {
+            put("frames", frames)
+            put("activeLenses", buildJsonObject { lenses.forEach { (k, v) -> put(k, v) } })
+            put("afStates", buildJsonObject { states.forEach { (k, v) -> put(k, v) } })
+            put("nearestFocusCm", jsonOf(nearestCm))
+        } }
+    }
 
     private fun chars(id: String) = manager.getCameraCharacteristics(id)
     private fun map(chars: CameraCharacteristics): StreamConfigurationMap = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)!!

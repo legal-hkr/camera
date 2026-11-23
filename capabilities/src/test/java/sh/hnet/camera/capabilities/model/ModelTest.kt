@@ -27,6 +27,11 @@ class ZoomStopsTest {
         assertTrue(scale.hasControl)
     }
 
+    @Test fun pixel9ProUltrawideLenses() {
+        assertEquals(setOf("3", "9"), ZoomStops.ultrawideIds(pixelLogical, pixelPhysical))
+        assertEquals(emptySet<String>(), ZoomStops.ultrawideIds(pixelLogical, emptyList()))
+    }
+
     @Test fun pixel9ProFrontHasNoControl() {
         // Logical 1 over 8 (main) and 7 (a wider mode of the same lens): 0.9 is no ultrawide
         val scale = ZoomStops.compute(LensOptics("1", 2.713, 4.816), listOf(LensOptics("8", 2.713, 4.816), LensOptics("7", 2.713, 5.376)), 0.89583337..10.0)

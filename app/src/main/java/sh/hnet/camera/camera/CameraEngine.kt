@@ -103,6 +103,10 @@ data class EngineState(
     /** Video mode: what the session records. */
     val video: VideoFormat? = null,
     val recording: Recording? = null,
+    /** The camera switched to the ultrawide by itself at 1× or more, for a close subject (SPEC §3.3: shown, it does it on its own). */
+    val macro: Boolean = false,
+    /** The session has the analysis stream: QR codes and the finder glass's picture come only then. */
+    val analysis: Boolean = false,
     /** A recording is being finished and saved: the shutter waits for it. */
     val finishing: Boolean = false,
     /** A frame of the current session has been shown (the viewfinder's crossfade ends then). */
@@ -175,6 +179,9 @@ class CameraEngine(context: Context) {
     private var sessionKey: Desired? = null
     private var still: StillOutput? = null
     private var recorder: VideoRecorder? = null
+    /** Written on the camera thread, read on the analysis thread: frames of a session that is going aren't handed on. */
+    @Volatile
+    private var analyzing: AnalysisOutput? = null
     private var silenceWatch: Job? = null
     /** A recording being finished: a new one, or closing the session, waits for it. */
     private var stopping: Deferred<Boolean>? = null
@@ -521,12 +528,12 @@ class CameraEngine(context: Context) {
     }
 
     /** One rung of a ladder: the range, the still stream (none in a video session without photos) and the video stream (Video mode). */
-    private data class Rung(val range: PictureRange, val still: StillFormat?, val video: VideoFormat?)
+    private data class Rung(val range: PictureRange, val still: StillFormat?, val video: VideoFormat?, val analysis: Boolean = false)
 
     private fun rungs(request: CameraRequest): List<Rung> {
         val spec = request.camera
         return when (request.mode) {
-            Mode.PHOTO -> SessionLadder.photo(spec.hlg, spec.jpegR.isNotEmpty(), wantMotion = false, wantAnalysis = false, wantUltraHdr = request.ultraHdr).map { Rung(it.range, it.still, null) }
+            Mode.PHOTO -> SessionLadder.photo(spec.hlg, spec.jpegR.isNotEmpty(), wantMotion = false, wantAnalysis = true, wantUltraHdr = request.ultraHdr).map { Rung(it.range, it.still, null, it.analysis) }
             Mode.VIDEO -> {
                 val hevc = Encoders.hevc()
                 SessionLadder.video(request.video, spec.hlg, spec.jpegR.isNotEmpty(), spec.video, spec.fixedFps, Encoders.limits(hevc))
@@ -558,21 +565,28 @@ class CameraEngine(context: Context) {
             val format = if (rung.still == StillFormat.JPEG_R) ImageFormat.JPEG_R else ImageFormat.JPEG
             val last = index == rungs.lastIndex
             if (!last && spec.sessionQueries && Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM && supported(spec.id, request, previewSize, rung, stillPlan, format) == false) continue
+            // A rung with the analysis stream needs a size for it; without one the next rung (without analysis) is tried
+            val analysisSize = if (rung.analysis) analysisSize(spec, rung.range) ?: continue else null
             var output: StillOutput? = null
             var video: VideoRecorder? = null
+            var analysis: AnalysisOutput? = null
             val made = try {
                 output = stillPlan?.let { StillOutput(it, rung.still, format) }
                 video = rung.video?.let { VideoRecorder(it, audio, scope) }
+                analysis = analysisSize?.let { AnalysisOutput(it, rung.range == PictureRange.HLG, spec) }
                 val profile = if (rung.range == PictureRange.HLG) DynamicRangeProfiles.HLG10 else DynamicRangeProfiles.STANDARD
                 val outputs = listOfNotNull(
                     OutputConfiguration(surface).apply { dynamicRangeProfile = profile },
                     // Frames for the encoder in the monotonic clock, which the sound follows (the default for an encoder's surface, set so nothing hangs on it)
                     video?.let { OutputConfiguration(it.surface).apply { dynamicRangeProfile = profile; timestampBase = OutputConfiguration.TIMESTAMP_BASE_MONOTONIC } },
                     output?.let { OutputConfiguration(it.reader.surface) },
+                    // The analysis frames share the preview's range (one request may not mix them): P010 next to HLG, YUV next to SDR
+                    analysis?.let { OutputConfiguration(it.reader.surface).apply { dynamicRangeProfile = profile } },
                 )
                 val closeOutputs: () -> Unit = {
                     output?.close()
                     video?.release()
+                    analysis?.close()
                 }
                 configure(device, sessionParameters(device.createCaptureRequest(template(request)), request, rung.video), outputs, closeOutputs)
             } catch (e: Exception) {
@@ -583,6 +597,7 @@ class CameraEngine(context: Context) {
             if (made == null) {
                 output?.close()
                 video?.release()
+                analysis?.close()
                 continue
             }
             // The world may have moved while the session was being made: the device lost, another request or surface wanted
@@ -593,9 +608,10 @@ class CameraEngine(context: Context) {
             session = made
             still = output
             recorder = video
+            analyzing = analysis
             previewSurface = surface
             controls = controls.copy(zoom = controls.zoom.coerceIn(spec.zoom.min, spec.zoom.max))
-            _state.update { EngineState(CameraStatus.Ready, request, rung.range, rung.video, frameShown = false) }
+            _state.update { EngineState(CameraStatus.Ready, request, rung.range, rung.video, frameShown = false, analysis = analysis != null) }
             repeat()
             return true
         }
@@ -623,7 +639,11 @@ class CameraEngine(context: Context) {
         val preview = OutputConfiguration(ImageFormat.PRIVATE, Size(previewSize.width, previewSize.height), HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE or HardwareBuffer.USAGE_COMPOSER_OVERLAY)
         preview.dynamicRangeProfile = profile
         val video = rung.video?.let { OutputConfiguration(ImageFormat.PRIVATE, Size(it.size.width, it.size.height), HardwareBuffer.USAGE_VIDEO_ENCODE).apply { dynamicRangeProfile = profile; timestampBase = OutputConfiguration.TIMESTAMP_BASE_MONOTONIC } }
-        val outputs = listOfNotNull(preview, video, still?.let { OutputConfiguration(format, Size(it.capture.width, it.capture.height)) })
+        val analysis = if (rung.analysis) analysisSize(request.camera, rung.range)?.let { size ->
+            val tenBit = rung.range == PictureRange.HLG
+            OutputConfiguration(if (tenBit) ImageFormat.YCBCR_P010 else ImageFormat.YUV_420_888, Size(size.width, size.height)).apply { dynamicRangeProfile = profile }
+        } else null
+        val outputs = listOfNotNull(preview, video, still?.let { OutputConfiguration(format, Size(it.capture.width, it.capture.height)) }, analysis)
         val config = SessionConfiguration(SessionConfiguration.SESSION_REGULAR, outputs)
         config.setSessionParameters(sessionParameters(setup.createCaptureRequest(template(request)), request, rung.video))
         setup.isSessionConfigurationSupported(config)
@@ -736,10 +756,46 @@ class CameraEngine(context: Context) {
     private fun addRecordingTarget(builder: CaptureRequest.Builder) {
         val recording = _state.value.recording
         if (recording != null && recording.pausedAt == null) recorder?.let { builder.addTarget(it.surface) }
+        // The analysis frames go with every preview frame (the analyzer takes what it can keep up with)
+        analyzing?.let { builder.addTarget(it.reader.surface) }
     }
 
-    /** A one-off request with an AF trigger (and the exposure's precapture metering for a lock), on top of the repeating one. */
-    /** [flashMetering]: the pre-capture meters with the flash's exposure mode (a flash shot), else with plain auto-exposure (a lock). */
+    /** The analysis stream's size: the smallest 4:3 at least 640 wide (QR codes need the detail), in 10 bits next to an HLG preview. */
+    private fun analysisSize(spec: CameraSpec, range: PictureRange): PixelSize? =
+        // 4:3 only: the frame must cover whatever the preview shows (the QR corners and the glass are mapped from it)
+        Sizes.analysis(if (range == PictureRange.HLG) spec.p010 else spec.yuv, minWidth = ANALYSIS_WIDTH)?.takeIf { Sizes.near(it, Aspect.FOUR_THREE) }
+
+    /** Who reads the analysis frames (QR codes, the finder glass); called on the analysis thread, the frame valid only during the call. */
+    @Volatile
+    var analyzer: ((AnalysisFrame) -> Unit)? = null
+
+    private val analysisThread = HandlerThread("camera-analysis").apply { start() }
+    private val analysisHandler = Handler(analysisThread.looper)
+
+    /** The analysis stream's reader; frames are handed to [analyzer] on their own thread, the newest only. */
+    private inner class AnalysisOutput(size: PixelSize, val tenBit: Boolean, val spec: CameraSpec) {
+        val reader: ImageReader = ImageReader.Builder(size.width, size.height).setImageFormat(if (tenBit) ImageFormat.YCBCR_P010 else ImageFormat.YUV_420_888).setMaxImages(ANALYSIS_BUFFERS).build()
+        private var closed = false
+
+        init {
+            reader.setOnImageAvailableListener({ r ->
+                val image = runCatching { r.acquireLatestImage() }.getOrNull() ?: return@setOnImageAvailableListener
+                image.use { frame -> if (analyzing === this) analyzer?.let { runCatching { it(AnalysisFrame(frame, tenBit, spec.sensorOrientation, spec.front)) } } }
+            }, analysisHandler)
+        }
+
+        /** Closed on the analysis thread, after a frame being read there (its buffers would go under it). */
+        fun close() {
+            if (closed) return
+            closed = true
+            analysisHandler.post { reader.close() }
+        }
+    }
+
+    /**
+     * A one-off request with an AF trigger (and the exposure's precapture metering), on top of the repeating one. [flashMetering]: the pre-capture meters with the
+     * flash's exposure mode (a flash shot), else with plain auto-exposure (a lock).
+     */
     private fun trigger(af: Int, precapture: Boolean, flashMetering: Boolean) {
         val session = session ?: return
         val device = device ?: return
@@ -824,9 +880,11 @@ class CameraEngine(context: Context) {
             val dark = iso >= DARK_ISO || exposure >= DARK_EXPOSURE_NS
             // The exposure's own word where the camera gives it; the Pixel doesn't in the preview, so a dark scene counts too (as for the front camera's screen flash)
             val flashNeeded = aeState == CameraMetadata.CONTROL_AE_STATE_FLASH_REQUIRED || dark
+            val lens = result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)
+            val macro = lens != null && lens in request.camera.ultrawideIds && controls.zoom >= (request.camera.zoom.group.firstOrNull()?.ratio ?: 1.0) - 1e-6
             _state.update {
-                if (it.frameShown && it.focusing == focusing && it.face == face && it.dark == dark && it.flashNeeded == flashNeeded) it
-                else it.copy(frameShown = true, focusing = focusing, face = face, dark = dark, flashNeeded = flashNeeded)
+                if (it.frameShown && it.focusing == focusing && it.face == face && it.dark == dark && it.flashNeeded == flashNeeded && it.macro == macro) it
+                else it.copy(frameShown = true, focusing = focusing, face = face, dark = dark, flashNeeded = flashNeeded, macro = macro)
             }
         }
     }
@@ -882,6 +940,7 @@ class CameraEngine(context: Context) {
         sessionKey = null
         still = null
         recorder = null
+        analyzing = null
         previewSurface = null
     }
 
@@ -925,6 +984,8 @@ class CameraEngine(context: Context) {
         const val LOCK_MIN_WAIT_MS = 150L
         const val LOCK_MAX_WAIT_MS = 800L
         const val SILENCE_CHECK_MS = 500L
+        const val ANALYSIS_WIDTH = 640
+        const val ANALYSIS_BUFFERS = 4
         const val PRECAPTURE_MAX_MS = 1_500L
         const val PRECAPTURE_POLL_MS = 16L
         const val DARK_ISO = 1600
