@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Camera diagnostics</string>
+    <string name="msg_permission">The tests open the cameras and record short photos and videos into DCIM/CameraDiag.</string>
+    <string name="button_allow">Allow camera</string>
+    <string name="button_probes">Read capabilities</string>
+    <string name="msg_aim">Point the phone at a bright scene with shadows and hold it still while a test runs.</string>
+    <string name="button_run_all">Run all tests</string>
+    <string name="button_run">Run</string>
+    <string name="msg_report">Report: %1$s</string>
+</resources>
