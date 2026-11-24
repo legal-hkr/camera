@@ -7,6 +7,7 @@ import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraConstrainedHighSpeedCaptureSession
 import android.hardware.camera2.CameraDevice
+import android.hardware.camera2.CameraExtensionCharacteristics
 import android.hardware.camera2.CameraExtensionSession
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
@@ -65,6 +66,8 @@ class LiveTests(context: Context, private val preview: PreviewHost) {
         LiveTest("slow_motion", R.string.title_test_slow_motion) { slowMotion(it) },
         LiveTest("motion_photo", R.string.title_test_motion_photo) { motionPhoto(it) },
         LiveTest("extensions", R.string.title_test_extensions) { extensions(it) },
+        LiveTest("night_queue", R.string.title_test_night_queue) { nightQueue(it) },
+        LiveTest("burst_long", R.string.title_test_burst_long) { burstLong(it) },
         LiveTest("raw", R.string.title_test_raw) { raw(it) },
     )
 
@@ -447,6 +450,147 @@ class LiveTests(context: Context, private val preview: PreviewHost) {
             } finally {
                 session.close()
             }
+        }
+    }
+
+    /** Whether the Night extension's session takes an HLG preview, and whether a second Night capture can be asked for while the first is still processing (queued, refused or failed). */
+    private suspend fun nightQueue(id: String): JsonObject {
+        val ext = manager.getCameraExtensionCharacteristics(id)
+        if (CameraExtensionCharacteristics.EXTENSION_NIGHT !in ext.supportedExtensions) return notOffered("the Night extension")
+        val night = CameraExtensionCharacteristics.EXTENSION_NIGHT
+        val previewSizes = ext.getExtensionSupportedSizes(night, SurfaceTexture::class.java)
+        val previewSize = previewSizes.firstOrNull { it.width == 1920 && it.height == 1440 } ?: previewSizes.filter { it.width <= 1920 }.maxByOrNull { area(it) } ?: previewSizes.first()
+        val jpegR = ext.getExtensionSupportedSizes(night, ImageFormat.JPEG_R)
+        val format = if (jpegR.isNotEmpty()) ImageFormat.JPEG_R else ImageFormat.JPEG
+        val size = ext.getExtensionSupportedSizes(night, format).maxBy { area(it) }
+        val surface = preview.surface(previewSize)
+        return manager.withCamera(id) { device, thread ->
+            buildJsonObject {
+                put("previewSize", sizeText(previewSize))
+                put("hlgPreview", probe {
+                    ImageQueue(imageReader(size.width, size.height, format, 2), thread).use { queue ->
+                        val hlg = OutputConfiguration(surface).apply { dynamicRangeProfile = DynamicRangeProfiles.HLG10 }
+                        val session = device.extensionSession(night, listOf(hlg, OutputConfiguration(queue.reader.surface)), thread)
+                        try {
+                            session.setRepeatingRequest(device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply { addTarget(surface) }.build(), thread.executor, object : CameraExtensionSession.ExtensionCaptureCallback() {})
+                            delay(1500)
+                            buildJsonObject { put("configured", true) }
+                        } finally {
+                            session.close()
+                        }
+                    }
+                })
+                delay(500)
+                put("secondCapture", probe {
+                    ImageQueue(imageReader(size.width, size.height, format, 2), thread).use { queue ->
+                        val session = device.extensionSession(night, listOf(OutputConfiguration(surface), OutputConfiguration(queue.reader.surface)), thread)
+                        try {
+                            session.setRepeatingRequest(device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply { addTarget(surface) }.build(), thread.executor, object : CameraExtensionSession.ExtensionCaptureCallback() {})
+                            delay(2000)
+                            val start = SystemClock.elapsedRealtime()
+                            val events = mutableListOf<String>()
+                            fun ask(n: Int): String = try {
+                                val request = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                                    addTarget(queue.reader.surface)
+                                    still(id)
+                                }.build()
+                                session.capture(request, thread.executor, object : CameraExtensionSession.ExtensionCaptureCallback() {
+                                    override fun onCaptureStarted(session: CameraExtensionSession, request: CaptureRequest, timestamp: Long) {
+                                        events += "started $n at ${SystemClock.elapsedRealtime() - start} ms"
+                                    }
+
+                                    override fun onCaptureProcessStarted(session: CameraExtensionSession, request: CaptureRequest) {
+                                        events += "processing $n at ${SystemClock.elapsedRealtime() - start} ms"
+                                    }
+
+                                    override fun onCaptureFailed(session: CameraExtensionSession, request: CaptureRequest) {
+                                        events += "failed $n at ${SystemClock.elapsedRealtime() - start} ms"
+                                    }
+
+                                    override fun onCaptureSequenceCompleted(session: CameraExtensionSession, sequenceId: Int) {
+                                        events += "completed $n at ${SystemClock.elapsedRealtime() - start} ms"
+                                    }
+                                })
+                                "asked"
+                            } catch (e: Exception) {
+                                "refused: ${e.javaClass.simpleName}: ${e.message}"
+                            }
+                            val first = ask(1)
+                            delay(1000)
+                            val second = ask(2)
+                            val arrived = mutableListOf<Long>()
+                            repeat(2) {
+                                val image = runCatching { queue.next(20_000) }.getOrNull() ?: return@repeat
+                                image.close()
+                                arrived += SystemClock.elapsedRealtime() - start
+                            }
+                            buildJsonObject {
+                                put("first", first)
+                                put("second", second)
+                                put("imagesArrivedMs", jsonOf(arrived))
+                                put("events", jsonOf(events.toList()))
+                            }
+                        } finally {
+                            session.close()
+                        }
+                    }
+                })
+            }
+        }
+    }
+
+    /** A 5-second burst – about 150 frames – in JPEG and in JPEG_R at full size: the real rate, the longest gap and the frames' size. */
+    private suspend fun burstLong(id: String): JsonObject {
+        val map = map(id)
+        val surface = preview.surface(previewSize(map))
+        val fps = chars(id).get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)?.filter { it.lower == it.upper }?.maxByOrNull { it.upper }
+        return manager.withCamera(id) { device, thread ->
+            buildJsonObject {
+                for (format in listOf(ImageFormat.JPEG, ImageFormat.JPEG_R)) {
+                    val size = largest(map, format) ?: continue
+                    put(Names.format(format), probe { burstLongOf(id, device, thread, surface, format, size, fps) })
+                }
+            }
+        }
+    }
+
+    private suspend fun burstLongOf(id: String, device: CameraDevice, thread: CameraThread, surface: Surface, format: Int, size: Size, fps: Range<Int>?): JsonObject {
+        val reader = imageReader(size.width, size.height, format, 6)
+        val timestamps = mutableListOf<Long>()
+        val sizes = mutableListOf<Int>()
+        reader.setOnImageAvailableListener({ r ->
+            r.acquireNextImage()?.use { image ->
+                timestamps += image.timestamp
+                sizes += image.planes[0].buffer.remaining()
+            }
+        }, thread.handler)
+        try {
+            val session = device.session(listOf(OutputConfiguration(surface), OutputConfiguration(reader.surface)), thread)
+            try {
+                device.repeating(session, thread, listOf(surface))
+                delay(1000)
+                device.repeating(session, thread, listOf(surface, reader.surface), CameraDevice.TEMPLATE_STILL_CAPTURE) {
+                    still(id)
+                    fps?.let { set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
+                }
+                delay(5000)
+                session.stopRepeating()
+                delay(500)
+            } finally {
+                session.close()
+            }
+        } finally {
+            reader.close()
+        }
+        val t = timestamps.sorted()
+        return buildJsonObject {
+            put("size", sizeText(size))
+            put("frames", t.size)
+            if (t.size > 1) {
+                put("fps", (t.size - 1) * 1e9 / (t.last() - t.first()))
+                put("maxGapMs", t.zipWithNext { a, b -> b - a }.max() / 1e6)
+            }
+            if (sizes.isNotEmpty()) put("averageKB", sizes.average() / 1024)
         }
     }
 

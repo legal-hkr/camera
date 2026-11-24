@@ -44,4 +44,6 @@
     <string name="button_capture_photo_small">Zdjęcie, małe</string>
     <string name="button_capture_video_file">Film, 5 s</string>
     <string name="button_capture_video_limited">Film, 5 MB, niska</string>
+    <string name="title_test_night_queue">Noc: podgląd HDR i drugie zdjęcie</string>
+    <string name="title_test_burst_long">Seria 5 s (JPEG, JPEG_R)</string>
 </resources>
