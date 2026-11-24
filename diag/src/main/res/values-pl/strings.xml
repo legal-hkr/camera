@@ -38,4 +38,10 @@
     <string name="title_test_raw_50mp">RAW 50 Mpx z każdego obiektywu, układ matrycy</string>
     <string name="title_test_compare">Scena porównawcza: Ultra HDR i serie RAW (ok. 1 GB, jedna scena na uruchomienie)</string>
     <string name="title_test_macro">Makro: 1× ok. 5 cm od przedmiotu ze szczegółami (trzymaj nieruchomo 12 s)</string>
+    <string name="title_system_camera">Aparat systemowy (appka Aparat)</string>
+    <string name="desc_system_camera">Prosi Aparat o ujęcie tak jak inna aplikacja i pokazuje, co wróciło.</string>
+    <string name="button_capture_photo_file">Zdjęcie do pliku</string>
+    <string name="button_capture_photo_small">Zdjęcie, małe</string>
+    <string name="button_capture_video_file">Film, 5 s</string>
+    <string name="button_capture_video_limited">Film, 5 MB, niska</string>
 </resources>

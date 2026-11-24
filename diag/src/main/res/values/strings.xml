@@ -38,4 +38,10 @@
     <string name="title_test_raw_50mp">50 MP RAW of every lens, sensor layout</string>
     <string name="title_test_compare">Comparison scene: Ultra HDR vs RAW bursts (about 1 GB, one scene per run)</string>
     <string name="title_test_macro">Macro: 1× about 5 cm from a subject with detail (hold still 12 s)</string>
+    <string name="title_system_camera">System camera (Camera app)</string>
+    <string name="desc_system_camera">Asks Camera for a shot as another app does; shows what came back.</string>
+    <string name="button_capture_photo_file">Photo to file</string>
+    <string name="button_capture_photo_small">Photo, small</string>
+    <string name="button_capture_video_file">Video, 5 s</string>
+    <string name="button_capture_video_limited">Video, 5 MB, low</string>
 </resources>

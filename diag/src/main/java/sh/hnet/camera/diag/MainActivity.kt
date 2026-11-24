@@ -152,6 +152,7 @@ private fun DiagScreen(model: DiagViewModel = viewModel()) {
             }
             LazyColumn(Modifier.fillMaxWidth().weight(1f), contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 item { Text(stringResource(R.string.msg_aim), style = MaterialTheme.typography.bodyMedium) }
+                item { SystemCameraCard() }
                 if (state.probeSummary.isNotEmpty()) item {
                     Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)) {
                         Text(state.probeSummary.joinToString("\n"), Modifier.padding(16.dp), fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
