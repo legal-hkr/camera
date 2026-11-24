@@ -25,10 +25,11 @@ object FirstRun {
     fun markRequested(context: Context, permissions: Array<String>) = context.firstRun().edit { permissions.forEach { putBoolean("asked:$it", true) } }
 
     /**
-     * Right after a request came back refused: whether the system refused for good (it stops showing its dialog after the second refusal), so only its settings
-     * page helps. Asked only then: before a request the same answer also means a one-time grant expired or a dialog closed with Back.
+     * Right after a request came back refused, before it is marked as asked: whether the system refused for good (it stops showing its dialog after the second
+     * refusal), so only its settings page helps. The first answer never is: a dialog closed with Back leaves no rationale either, and the system asks again.
      */
-    fun refusedForGood(activity: Activity?, permissions: Array<String>): Boolean = activity != null && permissions.none { activity.shouldShowRequestPermissionRationale(it) }
+    fun refusedForGood(activity: Activity?, permissions: Array<String>): Boolean =
+        activity != null && permissions.all { requested(activity, it) } && permissions.none { activity.shouldShowRequestPermissionRationale(it) }
 
     /** The app's page in the system's settings, where its permissions are. */
     fun openAppSettings(context: Context) {

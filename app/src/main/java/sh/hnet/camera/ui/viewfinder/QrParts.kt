@@ -13,6 +13,7 @@ import android.net.wifi.WifiNetworkSuggestion
 import android.os.PersistableBundle
 import android.provider.ContactsContract
 import android.provider.Settings
+import androidx.activity.compose.LocalActivity
 import androidx.annotation.DrawableRes
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -100,8 +101,11 @@ fun qrChipText(content: QrContent) = when (content) {
  * another app (the camera has no Internet); a network is offered to the system's own add-network dialog.
  */
 @Composable
-fun QrSheet(content: QrContent, onDismiss: () -> Unit, onNoApp: () -> Unit, onWifiRefused: () -> Unit, onNoContactsApp: () -> Unit) {
+fun QrSheet(content: QrContent, locked: Boolean, onDismiss: () -> Unit, onNoApp: () -> Unit, onWifiRefused: () -> Unit, onNoContactsApp: () -> Unit) {
     val context = LocalContext.current
+    val activity = LocalActivity.current
+    // Over the lock screen another app's page shows only after the phone is unlocked: it is asked for first
+    fun gated(action: () -> Unit) = unlockThen(activity, locked, action)
     val colors = MaterialTheme.colorScheme
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = colors.surfaceContainerLow) {
         Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp).padding(bottom = 16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
@@ -146,23 +150,25 @@ fun QrSheet(content: QrContent, onDismiss: () -> Unit, onNoApp: () -> Unit, onWi
                 when (content) {
                     is QrContent.Link -> {
                         OutlinedButton(onClick = { copy(context, content.raw.trim(), sensitive = false) }) { ButtonContent(R.drawable.ic_content_copy, stringResource(R.string.button_copy)) }
-                        OutlinedButton(onClick = { share(context, content.raw.trim()) }) { ButtonContent(R.drawable.ic_share, stringResource(R.string.button_share)) }
+                        OutlinedButton(onClick = { gated { share(context, content.raw.trim()) } }) { ButtonContent(R.drawable.ic_share, stringResource(R.string.button_share)) }
                         Button(onClick = {
-                            try {
-                                context.startActivity(Intent(Intent.ACTION_VIEW, content.raw.trim().toUri().normalizeScheme()))
-                                onDismiss()
-                            } catch (_: ActivityNotFoundException) {
-                                onNoApp()
+                            gated {
+                                try {
+                                    context.startActivity(Intent(Intent.ACTION_VIEW, content.raw.trim().toUri().normalizeScheme()))
+                                    onDismiss()
+                                } catch (_: ActivityNotFoundException) {
+                                    onNoApp()
+                                }
                             }
                         }) { ButtonContent(R.drawable.ic_open_in_new, stringResource(R.string.button_open)) }
                     }
                     is QrContent.Contact -> {
-                        OutlinedButton(onClick = { contactFile(context, content)?.let { share(context, it) } }) { ButtonContent(R.drawable.ic_share, stringResource(R.string.button_share)) }
-                        Button(onClick = { if (addContact(context, content)) onDismiss() else onNoContactsApp() }) { ButtonContent(R.drawable.ic_person_add, stringResource(R.string.button_add_contact)) }
+                        OutlinedButton(onClick = { gated { contactFile(context, content)?.let { share(context, it) } } }) { ButtonContent(R.drawable.ic_share, stringResource(R.string.button_share)) }
+                        Button(onClick = { gated { if (addContact(context, content)) onDismiss() else onNoContactsApp() } }) { ButtonContent(R.drawable.ic_person_add, stringResource(R.string.button_add_contact)) }
                     }
                     is QrContent.Text -> {
                         OutlinedButton(onClick = { copy(context, content.raw, sensitive = false) }) { ButtonContent(R.drawable.ic_content_copy, stringResource(R.string.button_copy)) }
-                        Button(onClick = { share(context, content.raw) }) { ButtonContent(R.drawable.ic_share, stringResource(R.string.button_share)) }
+                        Button(onClick = { gated { share(context, content.raw) } }) { ButtonContent(R.drawable.ic_share, stringResource(R.string.button_share)) }
                     }
                     is QrContent.Wifi -> {
                         content.password?.let { password ->
@@ -175,11 +181,13 @@ fun QrSheet(content: QrContent, onDismiss: () -> Unit, onNoApp: () -> Unit, onWi
                                 onWifiRefused()
                                 return@Button
                             }
-                            try {
-                                context.startActivity(Intent(Settings.ACTION_WIFI_ADD_NETWORKS).putParcelableArrayListExtra(Settings.EXTRA_WIFI_NETWORK_LIST, arrayListOf(network)))
-                                onDismiss()
-                            } catch (_: ActivityNotFoundException) {
-                                onNoApp()
+                            gated {
+                                try {
+                                    context.startActivity(Intent(Settings.ACTION_WIFI_ADD_NETWORKS).putParcelableArrayListExtra(Settings.EXTRA_WIFI_NETWORK_LIST, arrayListOf(network)))
+                                    onDismiss()
+                                } catch (_: ActivityNotFoundException) {
+                                    onNoApp()
+                                }
                             }
                         }) { ButtonContent(R.drawable.ic_wifi, stringResource(R.string.button_connect)) }
                     }

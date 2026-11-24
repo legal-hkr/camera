@@ -21,6 +21,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import sh.hnet.camera.camera.CapturedPhoto
 import sh.hnet.camera.camera.VideoTarget
+import sh.hnet.camera.capabilities.model.PixelSize
 
 /**
  * A shot for another app (SPEC §15.3, LOGIKA §11): it goes only to that app, never to `DCIM/Camera`. A photo is written to the address the app gave, or comes
@@ -132,8 +133,10 @@ class CaptureOutput(private val context: Context) {
         val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, BitmapFactory.Options().apply { inSampleSize = sample })
         val degrees = runCatching { ExifInterface(ByteArrayInputStream(bytes)).rotationDegrees }.getOrDefault(0)
         // The crop as StillCrop makes it, centred, at the decoded scale
-        val cropW = photo.crop?.let { (it.width / sample).coerceIn(1, decoded.width) } ?: decoded.width
-        val cropH = photo.crop?.let { (it.height / sample).coerceIn(1, decoded.height) } ?: decoded.height
+        // The crop is the sensor's way round; pixels the camera turned itself are the other way
+        val turnedCrop = photo.crop?.let { c -> if ((decoded.width < decoded.height) != (c.width < c.height)) PixelSize(c.height, c.width) else c }
+        val cropW = turnedCrop?.let { (it.width / sample).coerceIn(1, decoded.width) } ?: decoded.width
+        val cropH = turnedCrop?.let { (it.height / sample).coerceIn(1, decoded.height) } ?: decoded.height
         val scale = maxSide.toFloat() / maxOf(cropW, cropH)
         val matrix = Matrix().apply {
             if (scale < 1f) postScale(scale, scale)

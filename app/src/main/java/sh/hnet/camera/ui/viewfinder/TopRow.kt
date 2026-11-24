@@ -289,6 +289,12 @@ class PanelState(
     val torchAvailable: Boolean,
     val ultraHdrAvailable: Boolean,
     val motionPhoto: MotionPhoto,
+    /** Motion photos are offered (not for another app's photo). */
+    val motionAvailable: Boolean,
+    /** The video's HDR switch: a camera with HLG, and not another app's low-quality video. */
+    val hdrAvailable: Boolean,
+    /** Size and rate are offered (not when another app asked for low quality). */
+    val qualityAvailable: Boolean,
     val ultraHdr: Boolean,
     val location: Boolean,
 )
@@ -328,7 +334,7 @@ fun QuickSettings(state: PanelState, actions: PanelActions) {
             }
             if (!state.video) {
                 if (state.ultraHdrAvailable) row { PanelSwitchRow(it, stringResource(R.string.label_panel_ultra_hdr), state.ultraHdr) { actions.onUltraHdr() } }
-                row { shapes ->
+                if (state.motionAvailable) row { shapes ->
                     PanelRow(shapes, stringResource(R.string.label_panel_motion_photo)) {
                         Toggles(MotionPhoto.entries, state.motionPhoto, { stringResource(motionName(it)) }, actions.onMotionPhoto) { Icon(painterResource(motionIcon(it)), contentDescription = null, modifier = Modifier.size(20.dp)) }
                     }
@@ -361,15 +367,15 @@ fun QuickSettings(state: PanelState, actions: PanelActions) {
                     }
                 }
             } else {
-                row { PanelSwitchRow(it, stringResource(R.string.label_panel_hdr), state.hdr && state.hdrPossible) { actions.onHdr() } }
-                if (state.uhdAvailable) row { shapes ->
+                if (state.hdrAvailable) row { PanelSwitchRow(it, stringResource(R.string.label_panel_hdr), state.hdr && state.hdrPossible) { actions.onHdr() } }
+                if (state.uhdAvailable && state.qualityAvailable) row { shapes ->
                     PanelRow(shapes, stringResource(R.string.label_panel_resolution)) {
                         Toggles(listOf(true, false), state.uhd, { stringResource(if (it) R.string.menu_resolution_4k else R.string.menu_resolution_1080p) }, actions.onUhd) {
                             Text(stringResource(if (it) R.string.menu_resolution_4k else R.string.menu_resolution_1080p), maxLines = 1)
                         }
                     }
                 }
-                if (state.fpsChoices.size > 1) row { shapes ->
+                if (state.fpsChoices.size > 1 && state.qualityAvailable) row { shapes ->
                     PanelRow(shapes, stringResource(R.string.label_panel_frame_rate)) {
                         Toggles(state.fpsChoices, state.fps, { stringResource(R.string.value_fps, it) }, actions.onFps) { Text(numbers.zoom(it.toDouble()), maxLines = 1) }
                     }

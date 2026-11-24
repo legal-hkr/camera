@@ -268,6 +268,8 @@ class VideoRecorder(val format: VideoFormat, private val audioManager: AudioMana
         }
         silenceWatch = callback
         audioManager.registerAudioRecordingCallback(callback, handler)
+        // The callback says only what changes: a microphone already silenced (another app, Quick Settings) is read now
+        silenced = audioManager.activeRecordingConfigurations.firstOrNull { it.clientAudioSessionId == sound.session }?.isClientSilenced == true
     }
 
     private fun stopWatching() {
@@ -397,7 +399,8 @@ private class Mux(val target: VideoTarget, orientation: Int, location: Pair<Doub
         var ok = false
         if (started) {
             flush()
-            ok = written > 0 && runCatching { muxer.stop() }.isSuccess
+            // Stopped even with nothing written: release() would try it itself, throw, and leave the native writer behind
+            ok = runCatching { muxer.stop() }.isSuccess && written > 0
         }
         // A muxer never started (or whose stop failed) must not be stopped again by release
         runCatching { muxer.release() }

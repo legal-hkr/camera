@@ -50,6 +50,8 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
 import kotlinx.coroutines.delay
 import sh.hnet.camera.R
 
@@ -102,6 +104,8 @@ private fun ReviewVideo(review: Review.Video) {
         }
     }
     DisposableEffect(Unit) { onDispose { view?.stopPlayback() } }
+    // Leaving the app takes the video's surface: back, it waits for Play again
+    LifecycleEventEffect(Lifecycle.Event.ON_STOP) { playing = false }
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         AndroidView(
             factory = { context ->

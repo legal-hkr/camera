@@ -92,11 +92,12 @@ fun PhotosSettingsScreen(onBack: () -> Unit) {
     }
     val activity = LocalActivity.current
     val locationLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
+        val final = FirstRun.refusedForGood(activity, result.keys.toTypedArray())
         FirstRun.markRequested(context, result.keys.toTypedArray())
         locationAllowed = result.values.any { it }
         if (locationAllowed) scope.launch { preferences.setLocation(true) }
         // Refused for good: the dialog no longer shows, so the system's settings
-        else if (FirstRun.refusedForGood(activity, result.keys.toTypedArray())) FirstRun.openAppSettings(context)
+        else if (final) FirstRun.openAppSettings(context)
     }
     SettingsPage(title = stringResource(R.string.title_settings_photos), onBack = onBack) {
         SettingsGroup {

@@ -322,7 +322,8 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
                 null -> _ui.value.mode to _ui.value.cameraIndex
             }
         }
-        if (recording && (mode != _ui.value.mode || index != _ui.value.cameraIndex)) return
+        // A recording goes on as it is: no other mode or camera, and its flashlight, exposure and focus stay
+        if (recording) return
         val point = entry is Entry.App && entry.start == Start.QR
         _ui.update { it.copy(mode = mode, cameraIndex = index, pointAtCode = point, focus = null, locked = false, exposure = 0, torch = false) }
         engine.setTorch(false)
@@ -334,7 +335,10 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     private var pendingEntry: Entry? = null
 
     /** A code was found, or the hint dismissed. */
-    fun clearPointAtCode() = _ui.update { it.copy(pointAtCode = false) }
+    fun clearPointAtCode() {
+        _ui.update { it.copy(pointAtCode = false) }
+        analyzer.qrEnabled = _ui.value.mode == Mode.PHOTO && _ui.value.settings.qrCodes
+    }
 
     fun request(): CameraRequest? {
         val ui = _ui.value
@@ -351,7 +355,10 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     fun retry() = engine.retry()
 
     private fun configure() {
-        analyzer.qrEnabled = _ui.value.mode == Mode.PHOTO && _ui.value.settings.qrCodes
+        // The QR shortcut reads codes even with QR codes off in Settings: it was asked for
+        analyzer.qrEnabled = _ui.value.mode == Mode.PHOTO && (_ui.value.settings.qrCodes || _ui.value.pointAtCode)
+        // A viewfinder not shown doesn't touch the shared engine (another one may have it); start() configures
+        if (!started) return
         // Not under a recording or a countdown: a new session would cut the video or lose the timed shot
         if (recording || _ui.value.countdown != null) {
             configureLater = true
@@ -652,7 +659,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
             timerJob = null
             _ui.update { it.copy(countdown = null) }
             engine.setTorch(_ui.value.torch && !ledBlocked)
-            // A session put off by the countdown comes first; the shot waits for it in the engine's queue
+            // A session put off by the countdown comes first; the engine waits for it before taking the shot or starting the recording
             if (configureLater) configure()
             // Storage may have filled during the countdown
             if (phone.state.value.storageFull) return@launch

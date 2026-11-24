@@ -127,9 +127,10 @@ private fun AccessStep(step: String, onNext: () -> Unit) {
     }
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
         val permissions = result.keys.toTypedArray()
+        val final = FirstRun.refusedForGood(activity, permissions)
         FirstRun.markRequested(context, permissions)
         val row = ACCESSES.indexOfFirst { access -> access.permissions.any { it in result.keys } }
-        if (row >= 0 && result.values.none { it } && FirstRun.refusedForGood(activity, permissions)) refused = refused + row
+        if (row >= 0 && result.values.none { it } && final) refused = refused + row
         recheck()
     }
     WizardStep(step, stringResource(R.string.app_name), stringResource(R.string.desc_welcome), stringResource(R.string.button_next), onNext) {
@@ -170,7 +171,7 @@ private fun BackupStep(step: String, snackbars: SnackbarHostState, messageScope:
     WizardStep(step, stringResource(R.string.title_wizard_backup), stringResource(R.string.desc_backup_no_media), stringResource(R.string.button_start), onConfirm = { if (restore) restoreAction.pick() else onNext() }) {
         Column(Modifier.selectableGroup(), verticalArrangement = Arrangement.spacedBy(2.dp)) {
             SettingsRadioRow(groupShapes(0, 2), stringResource(R.string.title_start_fresh), selected = !restore, onSelect = { restore = false }, supporting = stringResource(R.string.desc_start_fresh))
-            SettingsRadioRow(groupShapes(1, 2), stringResource(R.string.title_restore_backup), selected = restore, onSelect = { restore = true }, supporting = stringResource(R.string.desc_restore_backup))
+            SettingsRadioRow(groupShapes(1, 2), stringResource(R.string.title_restore_backup), selected = restore, onSelect = { restore = true }, supporting = stringResource(R.string.desc_restore_backup_wizard))
         }
     }
 }

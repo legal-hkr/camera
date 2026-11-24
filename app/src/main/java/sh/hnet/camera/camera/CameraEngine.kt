@@ -33,6 +33,7 @@ import android.util.Size
 import android.view.Surface
 import androidx.annotation.RequiresApi
 import java.util.concurrent.Executor
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -354,6 +355,9 @@ class CameraEngine(context: Context) {
 
     /** Takes a still; [onShutter] runs on the camera thread when the exposure starts (the blink, the sound). Null when there is no session or the camera didn't deliver. */
     suspend fun takePhoto(deviceRotation: Int, location: Location?, precapture: Boolean, onShutter: () -> Unit): CapturedPhoto? = withContext(dispatcher) {
+        // A session being built (a mode, a setting, the end of a countdown that put it off) is waited for, not taken as none; before the still is counted
+        // as in flight, which the session's close would wait for
+        awaitSession()
         val done = CompletableDeferred<Unit>()
         capture = done
         try {
@@ -393,11 +397,13 @@ class CameraEngine(context: Context) {
         val video = request.mode == Mode.VIDEO
         val builder = device.createCaptureRequest(if (video) CameraDevice.TEMPLATE_VIDEO_SNAPSHOT else CameraDevice.TEMPLATE_STILL_CAPTURE)
         builder.addTarget(output.reader.surface)
-        // The motion photo's video keeps its frame at the shot where one request may hold both (SDR; HLG streams can't go with the still's)
-        if (_state.value.range == PictureRange.SDR) motion?.let { builder.addTarget(it.surface) }
+        // The motion photo's video keeps its frame at the shot where one request may hold both (SDR; HLG streams can't go with the still's), and not when the
+        // still may come from an earlier frame (ZSL), whose time would go back in the video
+        val zsl = request.camera.zsl && !video && !metered
+        if (_state.value.range == PictureRange.SDR && !zsl) motion?.let { builder.addTarget(it.surface) }
         applyControls(builder, request)
         // Set either way: the still template may turn the buffer on by itself, and a flash photo must not come from it
-        if (request.camera.zsl) builder.set(CaptureRequest.CONTROL_ENABLE_ZSL, !video && !metered)
+        if (request.camera.zsl) builder.set(CaptureRequest.CONTROL_ENABLE_ZSL, zsl)
         location?.let { builder.set(CaptureRequest.JPEG_GPS_LOCATION, it) }
         val orientation = Orientation.jpeg(request.camera.sensorOrientation, deviceRotation, request.camera.front)
         builder.set(CaptureRequest.JPEG_ORIENTATION, orientation)
@@ -414,11 +420,13 @@ class CameraEngine(context: Context) {
             }
 
             override fun onCaptureFailed(session: CameraCaptureSession, request: CaptureRequest, failure: CaptureFailure) {
-                failed.complete(Unit)
+                // The image may still come (its metadata failed, not the picture)
+                if (!failure.wasImageCaptured()) failed.complete(Unit)
             }
 
             override fun onCaptureBufferLost(session: CameraCaptureSession, request: CaptureRequest, target: Surface, frameNumber: Long) {
-                failed.complete(Unit)
+                // Only the still's own buffer matters; the motion video's encoder may drop one
+                if (target == output.reader.surface) failed.complete(Unit)
             }
         }, handler)
         val image = withTimeoutOrNull(STILL_TIMEOUT_MS) {
@@ -472,11 +480,22 @@ class CameraEngine(context: Context) {
         }
     }
 
-    /** A still in flight finishes before its session goes (at most the still's timeout), and a recording is ended and saved. */
+    /** A still in flight finishes before its session goes (at most the still's timeout), a motion photo's video gets its 1.5 s after the shot, and a recording is ended and saved. */
     private suspend fun awaitCapture() {
         capture?.let { inFlight -> withTimeoutOrNull(STILL_TIMEOUT_MS) { inFlight.await() } }
+        if (clipping.get() > 0) withTimeoutOrNull(CLIP_WAIT_MS) { while (clipping.get() > 0) delay(SETTLE_POLL_MS) }
         finishRecording()
     }
+
+    /** Waits (on the camera's thread, letting the reconcile run) until the session is the one wanted now; gives up after a few seconds. */
+    private suspend fun awaitSession() {
+        withTimeoutOrNull(SETTLE_MS) {
+            while (!(session != null && sessionKey == desired.value && _state.value.status == CameraStatus.Ready)) delay(SETTLE_POLL_MS)
+        }
+    }
+
+    /** Motion photos still gathering their video: the session waits for them before it closes. */
+    private val clipping = AtomicInteger(0)
 
     private suspend fun openDevice(request: CameraRequest): Boolean {
         _state.update { it.copy(status = CameraStatus.Opening, request = request, frameShown = false) }
@@ -595,6 +614,8 @@ class CameraEngine(context: Context) {
         val rungs = rungs(request)
         for ((index, rung) in rungs.withIndex()) {
             if (!surface.isValid) return false
+            // The device went (another app, a call) while a rung was tried: that is already said, not a failure of this session
+            if (this.device !== device || deviceLost) return false
             val stillPlan = rung.still?.let { Sizes.still(if (it == StillFormat.JPEG_R) spec.jpegR else spec.jpeg, request.pictureAspect) }
             if (rung.still != null && stillPlan == null) continue
             val format = if (rung.still == StillFormat.JPEG_R) ImageFormat.JPEG_R else ImageFormat.JPEG
@@ -658,7 +679,7 @@ class CameraEngine(context: Context) {
             return true
         }
         Log.w(TAG, "No session of the ladder could be configured")
-        if (surface.isValid) failed(CameraDevice.StateCallback.ERROR_CAMERA_DEVICE)
+        if (surface.isValid && this.device === device && !deviceLost) failed(CameraDevice.StateCallback.ERROR_CAMERA_DEVICE)
         return false
     }
 
@@ -713,6 +734,7 @@ class CameraEngine(context: Context) {
     suspend fun startRecording(target: VideoTarget, deviceRotation: Int, location: Pair<Double, Double>?): Boolean = scope.async { start(target, deviceRotation, location) }.await()
 
     private suspend fun start(target: VideoTarget, deviceRotation: Int, location: Pair<Double, Double>?): Boolean = withContext(NonCancellable) {
+        awaitSession()
         stopping?.await()
         val recorder = recorder
         val request = desired.value.request
@@ -756,7 +778,15 @@ class CameraEngine(context: Context) {
     }
 
     /** The motion photo's clip around a photo (its sensor time); null without a motion stream or when nothing usable came. */
-    suspend fun motionClip(photo: CapturedPhoto): MotionClip? = photo.motionSource?.clip(photo.sensorTimeNs / 1000, photo.orientation)
+    suspend fun motionClip(photo: CapturedPhoto): MotionClip? {
+        val source = photo.motionSource ?: return null
+        clipping.incrementAndGet()
+        return try {
+            source.clip(photo.sensorTimeNs / 1000, photo.orientation)
+        } finally {
+            clipping.decrementAndGet()
+        }
+    }
 
     /** Ends the recording and saves it, in the engine's own scope (a screen going away doesn't cut it short); true when a video was saved. */
     suspend fun stopRecording(): Boolean = scope.async { finishRecording() }.await()
@@ -1029,6 +1059,11 @@ class CameraEngine(context: Context) {
         const val JPEG_QUALITY: Byte = 95
         const val STILL_BUFFERS = 3
         const val STILL_TIMEOUT_MS = 10_000L
+        /** A session being built is waited for this long by a shot or a recording. */
+        const val SETTLE_MS = 3_000L
+        const val SETTLE_POLL_MS = 20L
+        /** A motion photo's 1.5 s after the shot and its muxing, before the session closes under it. */
+        const val CLIP_WAIT_MS = 2_500L
         const val RESTARTS = 2
         const val RESTART_DELAY_MS = 1_000L
         const val LOCK_MIN_WAIT_MS = 150L

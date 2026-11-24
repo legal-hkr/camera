@@ -133,6 +133,7 @@ import kotlin.math.roundToInt
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import sh.hnet.camera.FirstRun
+import sh.hnet.camera.Grid
 import sh.hnet.camera.MotionPhoto
 import sh.hnet.camera.R
 import sh.hnet.camera.camera.CameraStatus
@@ -202,15 +203,15 @@ private fun ViewfinderContent(
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
         granted = ok
         asked = true
-        FirstRun.markRequested(context, camera)
         permanentlyDenied = !ok && FirstRun.refusedForGood(activity, camera)
+        FirstRun.markRequested(context, camera)
     }
-    // Access may have been given (or set to ask again) in the system's settings meanwhile
+    // Access may have been given meanwhile; back from the system's settings (which stop the activity, unlike the permission dialog, whose answer comes
+    // before the resume) it may be set to ask again
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
         granted = ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
-        permanentlyDenied = false
     }
-    ViewfinderWindow()
+    LifecycleEventEffect(Lifecycle.Event.ON_START) { permanentlyDenied = false }
     if (!granted) {
         NoCameraAccess(
             permanentlyDenied = permanentlyDenied,
@@ -251,6 +252,8 @@ private fun ViewfinderWindow() {
 
 @Composable
 private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSettings: (() -> Unit)?, onCancel: (() -> Unit)?, onResult: ((Intent) -> Unit)?) {
+    // The screen kept on and HDR only while there is a viewfinder (not over the no-access screen)
+    ViewfinderWindow()
     val context = LocalContext.current
     val haptics = rememberHaptics()
     val numbers = rememberNumbers()
@@ -298,6 +301,8 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
     val cover by animateFloatAsState(if (engine.frameShown) 0f else 1f, if (engine.frameShown) tween(300) else snap(), label = "cover")
 
     val recording = engine.recording
+    // A countdown or a recording closes the panel: its values would rebuild the session under them
+    LaunchedEffect(ui.countdown != null, recording != null) { if (ui.countdown != null || recording != null) quickSettings = false }
     // Back while recording ends it and saves, during a countdown cancels it; a second Back leaves (SPEC §3)
     BackHandler(enabled = recording != null || ui.countdown != null) { if (!viewModel.cancelTimer()) viewModel.record() }
     // The volume keys go to the viewfinder while it is shown (SPEC §7.9)
@@ -310,7 +315,6 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
     LaunchedEffect(Unit) { viewModel.countdownTick.collect { haptics.mode() } }
     val turn = controlTurn(ui.rotation)
     val fix by viewModel.location.fix.collectAsStateWithLifecycle()
-    val tilt by viewModel.tilt.collectAsStateWithLifecycle()
 
     // The microphone is asked for on the first entry into Video (SPEC §16); without it videos have no sound
     val activity = LocalActivity.current
@@ -321,13 +325,13 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
     var micRefused by rememberSaveable { mutableStateOf(false) }
     val micLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
         micGranted = ok
-        FirstRun.markRequested(context, mic)
         micRefused = !ok && FirstRun.refusedForGood(activity, mic)
+        FirstRun.markRequested(context, mic)
     }
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
         micGranted = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
-        micRefused = false
     }
+    LifecycleEventEffect(Lifecycle.Event.ON_START) { micRefused = false }
     LaunchedEffect(ui.mode) {
         // Not over the lock screen: the system's dialog would wait for the phone to be unlocked
         if (ui.mode == Mode.VIDEO && !micGranted && !micAsked && !entry.locked) {
@@ -344,17 +348,20 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
     fun explain(message: String) = scope.launch { snackbars.showSnackbar(message, duration = SnackbarDuration.Short) }
     // Location is asked for when it is first turned on (SPEC §16); refused, it stays off and a snackbar says why
     val locationLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
+        val final = FirstRun.refusedForGood(activity, result.keys.toTypedArray())
         FirstRun.markRequested(context, result.keys.toTypedArray())
         when {
             result.values.any { it } -> viewModel.setLocation(true)
             // Refused for good: the dialog no longer shows, so the system's settings
-            FirstRun.refusedForGood(activity, result.keys.toTypedArray()) -> FirstRun.openAppSettings(context)
+            final -> FirstRun.openAppSettings(context)
             else -> explain(locationDenied)
         }
     }
+    // On only with its access: a one-time grant that ended or access taken away in the system's settings reads as off (not "searching" forever)
+    val locationOn = ui.settings.location && viewModel.location.allowed()
     fun toggleLocation() {
         when {
-            ui.settings.location -> viewModel.setLocation(false)
+            locationOn -> viewModel.setLocation(false)
             viewModel.location.allowed() -> viewModel.setLocation(true)
             else -> unlockThen(activity, entry.locked) { locationLauncher.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)) }
         }
@@ -499,7 +506,8 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
             }
           }
           if (problem == null) {
-              GridAndLevel(ui.settings.grid, if (ui.settings.level) tilt else null, ui.rotation, Modifier.fillMaxSize())
+              // The tilt read in here only: it changes many times a second and must not recompose the whole viewfinder
+              Level(viewModel, ui.settings.grid, ui.settings.level, ui.rotation)
               ui.countdown?.let { Countdown(it, turn, Modifier.align(Alignment.Center)) }
               // Storage full: the picture stays, the shutter waits (SPEC §14.1)
               if (phone.storageFull && recording == null) StorageFull(activity, entry.locked, Modifier.align(Alignment.Center).padding(16.dp))
@@ -532,12 +540,12 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                     MenuButton(listOf(listOf(0, 3, 10).map { t -> MenuChoice(if (t == 0) stringResource(R.string.menu_timer_off) else stringResource(R.string.value_seconds, t), t == ui.timer) { viewModel.setTimer(t) } })) { open ->
                         TopButton(timerIcon(ui.timer), stringResource(R.string.tooltip_timer), null, filled = ui.timer != 0, turn = turn, onClick = open)
                     }
-                    val searching = settings.location && (fix == null || viewModel.location.current() == null)
+                    val searching = locationOn && (fix == null || viewModel.location.current() == null)
                     TopButton(
-                        if (!settings.location) R.drawable.ic_location_off else if (searching) R.drawable.ic_location_searching else R.drawable.ic_location_on,
+                        if (!locationOn) R.drawable.ic_location_off else if (searching) R.drawable.ic_location_searching else R.drawable.ic_location_on,
                         stringResource(R.string.tooltip_location),
-                        stringResource(if (!settings.location) R.string.desc_state_location_off else if (searching) R.string.desc_state_location_searching else R.string.desc_state_location_on),
-                        filled = settings.location,
+                        stringResource(if (!locationOn) R.string.desc_state_location_off else if (searching) R.string.desc_state_location_searching else R.string.desc_state_location_on),
+                        filled = locationOn,
                         turn = turn,
                     ) { toggleLocation() }
                 }
@@ -545,7 +553,8 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
             // Nothing that rebuilds the session while a countdown runs or a recording goes on
             if (recording == null && ui.countdown == null) {
                 Row(Modifier.align(Alignment.TopEnd).padding(end = 12.dp, top = topRowTop(status, start = maxWidth - 148.dp, end = maxWidth - 12.dp)), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    val hdrAvailable = if (video) camera.hlg else camera.jpegR.isNotEmpty()
+                    // Another app's low-quality video is SDR whatever the setting: no HDR to switch
+                    val hdrAvailable = if (video) camera.hlg && capture?.lowQuality != true else camera.jpegR.isNotEmpty()
                     if (hdrAvailable) {
                         val possible = !video || viewModel.videoHdrPossible
                         val on = (if (video) settings.hdrVideo else settings.ultraHdr) && possible
@@ -560,12 +569,13 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                             onDisabled = { explain(if (settings.videoHevc) hdrFps else hdrCodec) },
                         ) { viewModel.toggleHdr() }
                     }
-                    if (!video) {
+                    // Not for another app's photo: it never gets a motion photo (SPEC §15.3)
+                    if (!video && capture == null) {
                         MenuButton(listOf(MotionPhoto.entries.map { m -> MenuChoice(stringResource(motionName(m)), m == settings.motionPhoto) { viewModel.setMotionPhoto(m) } })) { open ->
                             TopButton(motionIcon(settings.motionPhoto), stringResource(R.string.tooltip_motion_photo), stringResource(motionState(settings.motionPhoto)), filled = settings.motionPhoto != MotionPhoto.AUTO, turn = turn, onClick = open)
                         }
                     }
-                    if (video) {
+                    if (video && capture?.lowQuality != true) {
                         val uhdAvailable = SessionLadder.UHD in camera.video
                         // A hot phone has no 4K at 60 fps (SPEC §14.1): not offered then
                         val rates = videoRates(camera.fixedFps).filter { !(phone.hot && settings.videoUhd && it > 30) }
@@ -661,7 +671,8 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
             onZoom = { viewModel.zoomTo(it) },
             onQuickSettings = { quickSettings = true },
             quickSettingsOpen = quickSettings,
-            showQuickSettings = recording == null,
+            // Not during a countdown either: the panel's values rebuild the session the timed shot waits for
+            showQuickSettings = recording == null && ui.countdown == null,
             turn = turn,
             modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = zoomBottom - 4.dp),
         )
@@ -736,6 +747,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
     qrSheet?.let { content ->
         QrSheet(
             content,
+            locked = entry.locked,
             onDismiss = { qrSheet = null },
             onNoApp = { explain(noApp) },
             // The snackbar would stand behind the sheet
@@ -797,8 +809,11 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                     torchAvailable = camera.flash && !ledBlocked,
                     ultraHdrAvailable = camera.jpegR.isNotEmpty(),
                     motionPhoto = settings.motionPhoto,
+                    motionAvailable = capture == null,
+                    hdrAvailable = camera.hlg && capture?.lowQuality != true,
+                    qualityAvailable = capture?.lowQuality != true,
                     ultraHdr = settings.ultraHdr,
-                    location = settings.location,
+                    location = locationOn,
                 ),
                 PanelActions(
                     onFlash = viewModel::setFlash,
@@ -1233,4 +1248,11 @@ private fun ScreenFlash(onLit: (Boolean) -> Unit) {
     MaterialTheme(colorScheme = lightColorScheme()) {
         Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surfaceContainerLowest))
     }
+}
+
+/** The grid and the level, the phone's tilt read only here (it changes many times a second). */
+@Composable
+private fun Level(viewModel: ViewfinderViewModel, grid: Grid, level: Boolean, rotation: Int) {
+    val tilt by viewModel.tilt.collectAsStateWithLifecycle()
+    GridAndLevel(grid, if (level) tilt else null, rotation, Modifier.fillMaxSize())
 }

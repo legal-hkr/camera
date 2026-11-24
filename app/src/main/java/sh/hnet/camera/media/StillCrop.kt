@@ -28,8 +28,10 @@ object StillCrop {
      */
     fun edit(bytes: ByteArray, crop: PixelSize?, mirror: Boolean): Edited? {
         val source = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return null
-        val width = (crop?.width ?: source.width).coerceAtMost(source.width)
-        val height = (crop?.height ?: source.height).coerceAtMost(source.height)
+        // The crop is the sensor's way round; a camera that turned the pixels itself (no EXIF turn) has them the other way
+        val size = crop?.let { if ((source.width < source.height) != (it.width < it.height)) PixelSize(it.height, it.width) else it }
+        val width = (size?.width ?: source.width).coerceAtMost(source.width)
+        val height = (size?.height ?: source.height).coerceAtMost(source.height)
         val x = (source.width - width) / 2
         val y = (source.height - height) / 2
         val quarter = mirror && runCatching { ExifInterface(ByteArrayInputStream(bytes)).rotationDegrees % 180 != 0 }.getOrDefault(false)

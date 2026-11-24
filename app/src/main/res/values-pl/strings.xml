@@ -254,4 +254,5 @@
     <string name="msg_recording_stopped_call">Nadeszło połączenie. Nagrywanie zostało zatrzymane, a film zapisany.</string>
     <string name="msg_recording_not_saved_storage">Pamięć jest pełna. Nie udało się zapisać nagrania.</string>
     <string name="msg_too_hot_to_record">Telefon jest za gorący, aby nagrywać. Poczekaj, aż ostygnie.</string>
+    <string name="desc_restore_backup_wizard">Wybierz plik JSON zapisany w Ustawieniach.</string>
 </resources>

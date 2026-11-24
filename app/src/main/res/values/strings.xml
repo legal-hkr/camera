@@ -253,4 +253,5 @@
     <string name="msg_recording_stopped_call">A call came in. The recording was stopped and saved.</string>
     <string name="msg_recording_not_saved_storage">Storage is full. The recording couldn’t be saved.</string>
     <string name="msg_too_hot_to_record">The phone is too hot to record. Let it cool down.</string>
+    <string name="desc_restore_backup_wizard">Choose a JSON file saved in Settings.</string>
 </resources>

@@ -106,6 +106,8 @@ class MotionBuffer(size: PixelSize, hdr: Boolean, private val cacheDir: File) {
 
     /** Keeps the last few seconds, starting at a key frame. */
     private fun keep(frame: Frame) = synchronized(lock) {
+        // A frame whose time doesn't move on (a repeated or older one) would break the video's track
+        if (frames.isNotEmpty() && frame.timeUs <= newestUs) return@synchronized
         frames.addLast(frame)
         newestUs = frame.timeUs
         while (frames.size > 1 && frames[1].timeUs < frame.timeUs - KEEP_US) frames.removeFirst()
