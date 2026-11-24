@@ -234,4 +234,24 @@
     <string name="label_shortcut_video_long">Nagraj film</string>
     <string name="label_shortcut_qr_short">Kod QR</string>
     <string name="label_shortcut_qr_long">Zeskanuj kod QR</string>
+    <!-- Stage 1d-3: the phone's states -->
+    <string name="label_phone_hot">Telefon jest gorący</string>
+    <string name="label_battery_level">%1$d%%</string>
+    <string name="label_minutes_left">%1$d min</string>
+    <plurals name="label_photos_left">
+        <item quantity="one">%1$d zdjęcie</item>
+        <item quantity="few">%1$d zdjęcia</item>
+        <item quantity="many">%1$d zdjęć</item>
+        <item quantity="other">%1$d zdjęcia</item>
+    </plurals>
+    <string name="title_storage_full">Brak miejsca w pamięci</string>
+    <string name="desc_storage_full">Zdjęcia i filmy nie zmieszczą się w telefonie. Zwolnij miejsce, aby robić nowe.</string>
+    <string name="button_open_storage_settings">Otwórz ustawienia pamięci</string>
+    <string name="msg_phone_hot">Telefon jest gorący. 4K przy 60 kl./s i lampa błyskowa są niedostępne.</string>
+    <string name="msg_recording_stopped_hot">Telefon jest za gorący. Nagrywanie zostało zatrzymane, a film zapisany.</string>
+    <string name="msg_flash_battery">Bateria jest prawie rozładowana. Lampa błyskowa jest wyłączona.</string>
+    <string name="msg_recording_stopped_storage">Pamięć jest pełna. Nagranie zostało zapisane do ostatniej klatki.</string>
+    <string name="msg_recording_stopped_call">Nadeszło połączenie. Nagrywanie zostało zatrzymane, a film zapisany.</string>
+    <string name="msg_recording_not_saved_storage">Pamięć jest pełna. Nie udało się zapisać nagrania.</string>
+    <string name="msg_too_hot_to_record">Telefon jest za gorący, aby nagrywać. Poczekaj, aż ostygnie.</string>
 </resources>

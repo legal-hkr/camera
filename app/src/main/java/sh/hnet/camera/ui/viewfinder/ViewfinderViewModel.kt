@@ -28,7 +28,9 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -47,6 +49,8 @@ import sh.hnet.camera.camera.EngineState
 import sh.hnet.camera.camera.Flash
 import sh.hnet.camera.camera.FrameAnalyzer
 import sh.hnet.camera.camera.Mode
+import sh.hnet.camera.camera.PhoneState
+import sh.hnet.camera.camera.PhoneStates
 import sh.hnet.camera.capabilities.CameraSpec
 import sh.hnet.camera.capabilities.model.Aspect
 import sh.hnet.camera.capabilities.model.PixelSize
@@ -92,6 +96,11 @@ data class ViewfinderUi(
     val aspect: Aspect get() = settings.aspect
 }
 
+/** What ended a recording by itself (SPEC §14.1), and whether the video was saved: said in a snackbar. */
+enum class Stop { HOT, CALL, STORAGE }
+
+class Stopped(val why: Stop, val saved: Boolean)
+
 /** A shot for another app waiting for Use or Retake (SPEC §15.3). */
 sealed interface Review {
     /** [preview] upright and mirrored as it will be handed over; null when it couldn't be decoded. */
@@ -131,6 +140,23 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
 
     /** This lock-screen session's shots, newest first, for the gallery's secure review. */
     fun sessionShots(): List<MediaFiles.Saved> = media.saved.value.filter { it.at >= sessionStart }.reversed()
+
+    /** Heat, battery, calls and storage while the viewfinder is shown (SPEC §14.1). */
+    private val phone = PhoneStates(app, viewModelScope)
+    val phoneState: StateFlow<PhoneState> = phone.state
+
+    private val _stopped = MutableSharedFlow<Stopped>(extraBufferCapacity = 2)
+    val stopped: SharedFlow<Stopped> = _stopped
+
+    private val _refused = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+    /** A recording refused because the phone is too hot. */
+    val refused: SharedFlow<Unit> = _refused
+
+    /** A new session waits for the recording or the countdown to end (a heat change, a setting): never cut under them. */
+    private var configureLater = false
+
+    /** The flash's LED can't be used now (heat, battery); the front camera's screen flash can. */
+    val ledBlocked: Boolean get() = phone.state.value.ledBlocked && camera?.front != true
 
     private val _review = MutableStateFlow<Review?>(null)
     val review: StateFlow<Review?> = _review.asStateFlow()
@@ -207,6 +233,67 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
         viewModelScope.launch { media.refreshLast() }
+        viewModelScope.launch {
+            var before = phone.state.value
+            phone.state.collect { now ->
+                // A stopped viewfinder's states are stale (another one may have the camera and its own recording)
+                if (started) {
+                    if (now.ledBlocked != before.ledBlocked) applyLed()
+                    // 4K at 60 fps comes back or goes with the heat: only Video's session changes, after a recording or a countdown
+                    if (now.hot != before.hot && _ui.value.mode == Mode.VIDEO) configure()
+                }
+                before = now
+            }
+        }
+        // A recording is stopped by the phone's state at any moment of it, also one started while the state already held (SPEC §14.1)
+        viewModelScope.launch {
+            var callBefore = phone.state.value.inCall
+            var stopping = false
+            combine(phone.state, engineState.map { it.recording != null }.distinctUntilChanged()) { state, on -> state to on }.collect { (now, on) ->
+                if (!on) stopping = false
+                val callStarted = now.inCall && !callBefore
+                callBefore = now.inCall
+                if (!started || !on || stopping) return@collect
+                // A call stops it when it begins during the recording (one already going when it started doesn't)
+                val why = when {
+                    now.tooHot -> Stop.HOT
+                    callStarted -> Stop.CALL
+                    now.storageFull -> Stop.STORAGE
+                    else -> null
+                } ?: return@collect
+                stopping = true
+                application.appScope.launch {
+                    val saved = engine.stopRecording()
+                    _stopped.tryEmit(Stopped(why, saved))
+                }
+            }
+        }
+        viewModelScope.launch {
+            var wasRecording = false
+            engineState.collect { state ->
+                val now = state.recording != null
+                // While recording the storage is read every second; a finished video takes space
+                phone.fast = now
+                if (wasRecording && !now) {
+                    phone.refreshStorage()
+                    if (configureLater) configure()
+                }
+                wasRecording = now
+            }
+        }
+    }
+
+    /** The LED off while blocked (the flash and the flashlight), the chosen flash back after. */
+    private fun applyLed() {
+        if (ledBlocked) {
+            engine.setFlash(Flash.OFF, null)
+            if (_ui.value.torch) {
+                _ui.update { it.copy(torch = false) }
+                engine.setTorch(false)
+            }
+        } else {
+            engine.setFlash(_ui.value.flash, _ui.value.flashLevel)
+        }
     }
 
     val camera: CameraSpec? get() = cameras.getOrNull(_ui.value.cameraIndex)
@@ -264,8 +351,14 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     fun retry() = engine.retry()
 
     private fun configure() {
-        request()?.let { engine.configure(it) }
         analyzer.qrEnabled = _ui.value.mode == Mode.PHOTO && _ui.value.settings.qrCodes
+        // Not under a recording or a countdown: a new session would cut the video or lose the timed shot
+        if (recording || _ui.value.countdown != null) {
+            configureLater = true
+            return
+        }
+        configureLater = false
+        request()?.let { engine.configure(it) }
     }
 
     private var started = false
@@ -283,6 +376,8 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
                 media.refreshLast()
             }
         }
+        // The phone's states first: the first session asks for what the heat allows
+        phone.start()
         // Also after the camera permission was just given (the cameras couldn't be read before)
         configure()
         pendingEntry?.let { pending ->
@@ -295,8 +390,8 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         // The engine is the process's: this one's controls again, another viewfinder (the lock screen's, another app's shot) may have changed them
         _ui.update { it.copy(focus = null, locked = false) }
         engine.setZoom(_ui.value.zoom)
-        engine.setFlash(_ui.value.flash, _ui.value.flashLevel)
-        engine.setTorch(_ui.value.torch)
+        engine.setTorch(_ui.value.torch && !ledBlocked)
+        applyLed()
         engine.resetFocus(exposure = _ui.value.exposure)
         engine.start(this)
         sensors.getDefaultSensor(Sensor.TYPE_GRAVITY)?.let { sensors.registerListener(gravityListener, it, SensorManager.SENSOR_DELAY_UI) }
@@ -313,6 +408,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         unwatch = null
         cancelTimer()
         engine.stop(this)
+        phone.stop()
         sensors.unregisterListener(gravityListener)
         location.stop()
     }
@@ -345,7 +441,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         engine.setTorch(false)
         engine.setZoom(1.0)
         engine.resetFocus(exposure = 0)
-        engine.setFlash(_ui.value.flash, null)
+        applyLed()
         analyzer.reset()
         configure()
     }
@@ -385,6 +481,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun toggleTorch() {
+        if (ledBlocked) return
         val on = !_ui.value.torch
         _ui.update { it.copy(torch = on) }
         engine.setTorch(on)
@@ -392,12 +489,12 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
 
     fun setFlash(flash: Flash) {
         _ui.update { it.copy(flash = flash) }
-        engine.setFlash(flash, _ui.value.flashLevel)
+        applyLed()
     }
 
     fun setFlashLevel(level: Int) {
         _ui.update { it.copy(flashLevel = level) }
-        engine.setFlash(_ui.value.flash, level)
+        applyLed()
     }
 
     fun setTimer(seconds: Int) = _ui.update { it.copy(timer = seconds) }
@@ -414,7 +511,13 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     val videoHdrPossible: Boolean get() = videoFps <= SessionLadder.HLG_MAX_FPS && _ui.value.settings.videoHevc
 
     /** The frame rate the current camera records: the remembered one where it has it (a backup or the other camera may have set 60), else 30. */
-    val videoFps: Int get() = _ui.value.settings.videoFps.takeIf { fps -> camera?.let { fps in videoRates(it.fixedFps) } ?: true } ?: 30
+    val videoFps: Int
+        get() {
+            val settings = _ui.value.settings
+            val fps = settings.videoFps.takeIf { fps -> camera?.let { fps in videoRates(it.fixedFps) } ?: true } ?: 30
+            // A hot phone records 4K at 30 at most (SPEC §14.1); only Video's session asks for it, so Photo's isn't rebuilt by the heat
+            return if (fps > 30 && settings.videoUhd && phone.state.value.hot && _ui.value.mode == Mode.VIDEO) 30 else fps
+        }
 
     fun setVideoSize(uhd: Boolean) = viewModelScope.launch { preferences.setVideoUhd(uhd) }
 
@@ -436,6 +539,11 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
         if (engineState.value.finishing) return
+        // Too hot: it would be stopped at once (SPEC §14.1)
+        if (phone.state.value.tooHot) {
+            _refused.tryEmit(Unit)
+            return
+        }
         val place = placeNow()
         val capture = _entry.value as? Entry.Capture
         application.appScope.launch {
@@ -501,6 +609,8 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     /** The shutter: a recording ends, a running countdown is cancelled, a set timer starts one, else the photo is taken or the recording started. */
     fun shutterPressed() {
         if (_review.value != null) return
+        // Nothing more fits: only a recording may still be stopped, a countdown cancelled
+        if (phone.state.value.storageFull && !recording && _ui.value.countdown == null) return
         when {
             recording -> record()
             _ui.value.countdown != null -> cancelTimer()
@@ -517,7 +627,9 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         timerJob = null
         _ui.update { it.copy(countdown = null) }
         // The LED's blinking ends where the flashlight was
-        engine.setTorch(_ui.value.torch)
+        engine.setTorch(_ui.value.torch && !ledBlocked)
+        // A session put off by the countdown
+        if (configureLater) configure()
         return true
     }
 
@@ -527,7 +639,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
      */
     private fun startTimer(seconds: Int) {
         // Not while the flashlight is on: it stays on through the countdown
-        val led = _ui.value.settings.timerFlash && !_ui.value.torch && camera?.let { !it.front && it.flash } == true
+        val led = _ui.value.settings.timerFlash && !_ui.value.torch && !ledBlocked && camera?.let { !it.front && it.flash } == true
         timerJob = viewModelScope.launch {
             for (left in seconds downTo 1) {
                 _ui.update { it.copy(countdown = left) }
@@ -539,7 +651,11 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
             }
             timerJob = null
             _ui.update { it.copy(countdown = null) }
-            engine.setTorch(_ui.value.torch)
+            engine.setTorch(_ui.value.torch && !ledBlocked)
+            // A session put off by the countdown comes first; the shot waits for it in the engine's queue
+            if (configureLater) configure()
+            // Storage may have filled during the countdown
+            if (phone.state.value.storageFull) return@launch
             if (_ui.value.mode == Mode.VIDEO) record() else shoot(timed = true)
         }
     }
@@ -551,7 +667,8 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         for (pulse in 0 until pulses) {
             // The last half second stays dark
             val dark = left == 1 && pulse * period >= 500
-            if (!dark) engine.setTorch(true)
+            // The LED may be blocked during the countdown (heat, battery): it stays off then
+            if (!dark && !ledBlocked) engine.setTorch(true)
             delay(on)
             engine.setTorch(false)
             delay(period - on)
@@ -594,7 +711,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
                 val wantPlace = ui.settings.location && place == null
                 // A motion photo (LOGIKA §3.3) where the stream runs, not after the timer (its LED blinks in the video) nor with a flash (one lit frame); automatic
                 // only where the analysis can tell whether something moved
-                val flashFired = screenFlash || (camera?.flash == true && !ui.torch && (ui.flash == Flash.ON || (ui.flash == Flash.AUTO && engineState.value.flashNeeded)))
+                val flashFired = screenFlash || (camera?.flash == true && !ui.torch && !ledBlocked && (ui.flash == Flash.ON || (ui.flash == Flash.AUTO && engineState.value.flashNeeded)))
                 val motionMode = ui.settings.motionPhoto
                 val state = engineState.value
                 // Nor a mirrored selfie: the video can't be mirrored with it, and the picture would jump to the other side when it plays
@@ -607,6 +724,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
                     val clipping = if (wantMotion) async { engine.motionClip(photo) } else null
                     val uri = try {
                         val saved = media.savePhoto(photo.bytes, photo.takenAt, photo.crop, mirror)
+                        phone.refreshStorage()
                         if (clipping != null) {
                             val clip = clipping.await()
                             _ui.update { it.copy(motionWaiting = it.motionWaiting - 1) }
@@ -673,6 +791,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
 
     override fun onCleared() {
         cleared = true
+        phone.stop()
         timerJob?.cancel()
         sensors.unregisterListener(gravityListener)
         location.close()

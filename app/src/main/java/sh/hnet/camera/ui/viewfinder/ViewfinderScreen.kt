@@ -107,6 +107,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
@@ -137,6 +138,7 @@ import sh.hnet.camera.R
 import sh.hnet.camera.camera.CameraStatus
 import sh.hnet.camera.camera.Flash
 import sh.hnet.camera.camera.Mode
+import sh.hnet.camera.camera.PhoneState
 import sh.hnet.camera.camera.QrContent
 import sh.hnet.camera.camera.Recording
 import sh.hnet.camera.capabilities.model.Aspect
@@ -146,6 +148,9 @@ import sh.hnet.camera.capabilities.model.SessionLadder
 import sh.hnet.camera.media.LastShot
 import sh.hnet.camera.media.MediaFiles
 import sh.hnet.camera.ui.components.EmptyState
+import sh.hnet.camera.ui.components.ErrorDetails
+import sh.hnet.camera.ui.components.ErrorDetailsDialog
+import sh.hnet.camera.ui.components.reportFailure
 
 /** The exposure ruler closes this long after the last touch (SPEC §5.3). */
 private const val EXPOSURE_RULER_MS = 3_000L
@@ -355,6 +360,38 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
         }
     }
     val review by viewModel.review.collectAsStateWithLifecycle()
+    val phone by viewModel.phoneState.collectAsStateWithLifecycle()
+    // The LED's reason, said when its disabled controls are tapped
+    val ledReason = stringResource(if (phone.hot) R.string.msg_phone_hot else R.string.msg_flash_battery)
+    val ledBlocked = phone.ledBlocked && camera?.front != true
+    val flashBattery = stringResource(R.string.msg_flash_battery)
+    val stoppedHot = stringResource(R.string.msg_recording_stopped_hot)
+    val stoppedCall = stringResource(R.string.msg_recording_stopped_call)
+    val stoppedStorage = stringResource(R.string.msg_recording_stopped_storage)
+    val notSaved = stringResource(R.string.msg_recording_not_saved_storage)
+    val tooHot = stringResource(R.string.msg_too_hot_to_record)
+    LaunchedEffect(Unit) {
+        viewModel.stopped.collect { stop ->
+            explain(
+                when (stop.why) {
+                    Stop.HOT -> stoppedHot
+                    Stop.CALL -> stoppedCall
+                    Stop.STORAGE -> if (stop.saved) stoppedStorage else notSaved
+                },
+            )
+        }
+    }
+    LaunchedEffect(Unit) { viewModel.refused.collect { explain(tooHot) } }
+    // After both restarts failed: a snackbar with the error's details (SPEC §14.1)
+    val failedTitle = stringResource(R.string.title_camera_failed)
+    val show = stringResource(R.string.button_show)
+    var errorShown by remember { mutableStateOf<ErrorDetails?>(null) }
+    val failedCode = (engine.status as? CameraStatus.Error)?.takeIf { it.failed }?.code
+    // In the effect's own scope: a camera that comes back takes the snackbar away
+    LaunchedEffect(failedCode) {
+        failedCode?.let { code -> reportFailure(snackbars, failedTitle, code, show) { errorShown = it } }
+    }
+    errorShown?.let { ErrorDetailsDialog(it) { errorShown = null } }
     val capture = entry as? Entry.Capture
     // Back in Review is Retake (SPEC §15.3)
     BackHandler(enabled = review != null) { viewModel.retake() }
@@ -464,6 +501,8 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
           if (problem == null) {
               GridAndLevel(ui.settings.grid, if (ui.settings.level) tilt else null, ui.rotation, Modifier.fillMaxSize())
               ui.countdown?.let { Countdown(it, turn, Modifier.align(Alignment.Center)) }
+              // Storage full: the picture stays, the shutter waits (SPEC §14.1)
+              if (phone.storageFull && recording == null) StorageFull(activity, entry.locked, Modifier.align(Alignment.Center).padding(16.dp))
           } else {
               CameraProblem(problem, onRetry = { viewModel.retry() }, modifier = Modifier.align(Alignment.Center).padding(16.dp))
           }
@@ -475,13 +514,18 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
             val settings = ui.settings
             Row(Modifier.align(Alignment.TopStart).padding(start = 12.dp, top = topRowTop(status, start = 12.dp, end = 140.dp)), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                 if (video && camera.flash) {
-                    TopButton(if (ui.torch) R.drawable.ic_flashlight_on else R.drawable.ic_flashlight_off, stringResource(R.string.tooltip_flashlight), null, filled = ui.torch, turn = turn) { viewModel.toggleTorch() }
+                    TopButton(if (ui.torch) R.drawable.ic_flashlight_on else R.drawable.ic_flashlight_off, stringResource(R.string.tooltip_flashlight), null, filled = ui.torch, turn = turn, enabled = !ledBlocked, onDisabled = { explain(ledReason) }) { viewModel.toggleTorch() }
                 }
                 if (!video && (camera.flash || camera.front)) {
                     MenuButton(listOf(Flash.entries.map { f -> MenuChoice(stringResource(flashName(f)), f == ui.flash) { viewModel.setFlash(f) } })) { open ->
                         // Automatic: the button's background shows when the flash will fire (the exposure asks for it, or the scene is dark)
                         val willFire = ui.flash == Flash.AUTO && if (camera.front) engine.dark else engine.flashNeeded
-                        TopButton(flashIcon(ui.flash), stringResource(R.string.tooltip_flash), stringResource(flashState(ui.flash)), filled = ui.flash != Flash.OFF, turn = turn, accent = willFire, onClick = open)
+                        // Heat or a low battery: the flash shows off and says why (SPEC §14.1)
+                        if (ledBlocked) {
+                            TopButton(R.drawable.ic_flash_off, stringResource(R.string.tooltip_flash), stringResource(flashState(Flash.OFF)), filled = false, turn = turn, enabled = false, onDisabled = { explain(ledReason) }) {}
+                        } else {
+                            TopButton(flashIcon(ui.flash), stringResource(R.string.tooltip_flash), stringResource(flashState(ui.flash)), filled = ui.flash != Flash.OFF, turn = turn, accent = willFire, onClick = open)
+                        }
                     }
                 }
                 if (recording == null && ui.countdown == null) {
@@ -523,7 +567,8 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                     }
                     if (video) {
                         val uhdAvailable = SessionLadder.UHD in camera.video
-                        val rates = videoRates(camera.fixedFps)
+                        // A hot phone has no 4K at 60 fps (SPEC §14.1): not offered then
+                        val rates = videoRates(camera.fixedFps).filter { !(phone.hot && settings.videoUhd && it > 30) }
                         val groups = buildList {
                             if (uhdAvailable) add(listOf(MenuChoice(stringResource(R.string.menu_resolution_4k), settings.videoUhd) { viewModel.setVideoSize(true) }, MenuChoice(stringResource(R.string.menu_resolution_1080p), !settings.videoUhd) { viewModel.setVideoSize(false) }))
                             add(rates.map { fps -> MenuChoice(stringResource(R.string.value_fps, fps), fps == viewModel.videoFps, if (fps > SessionLadder.HLG_MAX_FPS && camera.hlg) stringResource(R.string.desc_fps_no_hdr) else null) { viewModel.setVideoFps(fps) } })
@@ -557,6 +602,12 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
             if (entry.locked) IndicatorChip(R.drawable.ic_lock, null, description = stringResource(R.string.content_description_locked)) {}
             capture?.caller?.let { IndicatorChip(R.drawable.ic_apps, stringResource(R.string.label_for_app, it)) {} }
             if (ui.motionWaiting > 0) IndicatorChip(R.drawable.ic_motion_photos_on, stringResource(R.string.label_motion), solid = true) {}
+            // The phone's states (SPEC §14.1): heat, a low battery, little room left
+            if (phone.hot) IndicatorChip(R.drawable.ic_device_thermostat, stringResource(R.string.label_phone_hot)) { explain(ledReason) }
+            if (phone.lowBattery) IndicatorChip(R.drawable.ic_battery_alert, stringResource(R.string.label_battery_level, phone.battery ?: 0)) { explain(flashBattery) }
+            roomLeft(phone, ui.mode == Mode.VIDEO, engine.video?.bitrate, ui.settings.motionPhoto != MotionPhoto.OFF)?.let { left ->
+                IndicatorChip(R.drawable.ic_storage, if (left.minutes) stringResource(R.string.label_minutes_left, left.count) else pluralStringResource(R.plurals.label_photos_left, left.count, left.count)) {}
+            }
             if (noSound) {
                 IndicatorChip(R.drawable.ic_mic_off, stringResource(R.string.label_no_sound)) {
                     if (!micGranted) {
@@ -655,7 +706,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                         else -> R.string.content_description_shutter_photo
                     },
                 ),
-                enabled = engine.status == CameraStatus.Ready && (!video || (engine.video != null && !engine.finishing)),
+                enabled = engine.status == CameraStatus.Ready && (!video || (engine.video != null && !engine.finishing)) && (!phone.storageFull || recording != null),
                 progress = ui.countdown?.let { 1f - it.toFloat() / ui.timer.coerceAtLeast(1) },
                 turn = turn,
                 onClick = {
@@ -728,7 +779,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
             QuickSettings(
                 PanelState(
                     video = ui.mode == Mode.VIDEO,
-                    flashAvailable = camera.flash || camera.front,
+                    flashAvailable = (camera.flash && !ledBlocked) || camera.front,
                     flash = ui.flash,
                     flashLevels = if (camera.front) 1 else camera.flashLevels,
                     flashLevel = ui.flashLevel ?: camera.flashDefaultLevel,
@@ -740,9 +791,10 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                     hdrPossible = viewModel.videoHdrPossible && camera.hlg,
                     uhdAvailable = SessionLadder.UHD in camera.video,
                     uhd = settings.videoUhd,
-                    fpsChoices = videoRates(camera.fixedFps),
+                    fpsChoices = videoRates(camera.fixedFps).filter { !(phone.hot && settings.videoUhd && it > 30) },
                     fps = viewModel.videoFps,
                     torch = ui.torch,
+                    torchAvailable = camera.flash && !ledBlocked,
                     ultraHdrAvailable = camera.jpegR.isNotEmpty(),
                     motionPhoto = settings.motionPhoto,
                     ultraHdr = settings.ultraHdr,
@@ -952,6 +1004,47 @@ private fun CameraProblem(status: CameraStatus, onRetry: () -> Unit, modifier: M
             if ((status is CameraStatus.Error && status.failed) || status == CameraStatus.Busy) {
                 Button(onClick = onRetry, modifier = Modifier.align(Alignment.End)) { Text(stringResource(R.string.button_restart_camera)) }
             }
+        }
+    }
+}
+
+/** How many more shots fit: photos under 100 or video minutes under 15 (SPEC §14.1); null with more room. */
+private class RoomLeft(val count: Int, val minutes: Boolean)
+
+private fun roomLeft(phone: PhoneState, video: Boolean, bitrate: Int?, motion: Boolean): RoomLeft? {
+    val free = phone.freeBytes ?: return null
+    if (phone.storageFull) return null
+    return if (video) {
+        // The video's own bit rate where the session runs, else 4K's; sound on top
+        val perSecond = ((bitrate ?: UHD_BITS) + AUDIO_BITS) / 8L
+        (free / perSecond / 60).toInt().takeIf { it < LOW_MINUTES }?.let { RoomLeft(it, minutes = true) }
+    } else {
+        // An Ultra HDR photo of the default size, with a motion photo's video when they are on
+        val perPhoto = if (motion) PHOTO_BYTES + MOTION_BYTES else PHOTO_BYTES
+        (free / perPhoto).toInt().takeIf { it < LOW_PHOTOS }?.let { RoomLeft(it, minutes = false) }
+    }
+}
+
+private const val UHD_BITS = 50_000_000
+private const val AUDIO_BITS = 256_000
+private const val PHOTO_BYTES = 5L * 1024 * 1024
+private const val MOTION_BYTES = 3L * 1024 * 1024
+private const val LOW_PHOTOS = 100
+private const val LOW_MINUTES = 15
+
+/** Storage full (SPEC §14.1): the family's problem card over the picture, with the way to the system's storage settings. */
+@Composable
+private fun StorageFull(activity: Activity?, locked: Boolean, modifier: Modifier) {
+    val context = LocalContext.current
+    val colors = MaterialTheme.colorScheme
+    Surface(shape = RoundedCornerShape(24.dp), color = colors.surfaceContainer, modifier = modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(stringResource(R.string.title_storage_full), style = MaterialTheme.typography.titleMedium)
+            Text(stringResource(R.string.desc_storage_full), style = MaterialTheme.typography.bodyMedium, color = colors.onSurfaceVariant)
+            // Over the lock screen the settings wait for the phone to be unlocked
+            Button(onClick = {
+                unlockThen(activity, locked) { runCatching { context.startActivity(Intent(Settings.ACTION_INTERNAL_STORAGE_SETTINGS)) } }
+            }, modifier = Modifier.align(Alignment.End)) { Text(stringResource(R.string.button_open_storage_settings)) }
         }
     }
 }

@@ -235,4 +235,22 @@
     <string name="label_shortcut_video_long">Record a video</string>
     <string name="label_shortcut_qr_short">QR code</string>
     <string name="label_shortcut_qr_long">Scan a QR code</string>
+    <!-- Stage 1d-3: the phone's states -->
+    <string name="label_phone_hot">The phone is hot</string>
+    <string name="label_battery_level">%1$d%%</string>
+    <string name="label_minutes_left">%1$d min</string>
+    <plurals name="label_photos_left">
+        <item quantity="one">%1$d photo</item>
+        <item quantity="other">%1$d photos</item>
+    </plurals>
+    <string name="title_storage_full">Storage is full</string>
+    <string name="desc_storage_full">Photos and videos won’t fit on the phone. Free up space to take new ones.</string>
+    <string name="button_open_storage_settings">Open storage settings</string>
+    <string name="msg_phone_hot">The phone is hot. 4K at 60 fps and the flash aren’t available.</string>
+    <string name="msg_recording_stopped_hot">The phone is too hot. The recording was stopped and saved.</string>
+    <string name="msg_flash_battery">The battery is almost empty. The flash is turned off.</string>
+    <string name="msg_recording_stopped_storage">Storage is full. The recording was saved up to the last frame.</string>
+    <string name="msg_recording_stopped_call">A call came in. The recording was stopped and saved.</string>
+    <string name="msg_recording_not_saved_storage">Storage is full. The recording couldn’t be saved.</string>
+    <string name="msg_too_hot_to_record">The phone is too hot to record. Let it cool down.</string>
 </resources>

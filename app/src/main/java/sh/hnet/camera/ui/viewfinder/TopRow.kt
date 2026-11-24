@@ -285,6 +285,8 @@ class PanelState(
     val fpsChoices: List<Int>,
     val fps: Int,
     val torch: Boolean,
+    /** The flashlight: a back camera with a flash whose LED isn't blocked (heat, battery). */
+    val torchAvailable: Boolean,
     val ultraHdrAvailable: Boolean,
     val motionPhoto: MotionPhoto,
     val ultraHdr: Boolean,
@@ -372,7 +374,7 @@ fun QuickSettings(state: PanelState, actions: PanelActions) {
                         Toggles(state.fpsChoices, state.fps, { stringResource(R.string.value_fps, it) }, actions.onFps) { Text(numbers.zoom(it.toDouble()), maxLines = 1) }
                     }
                 }
-                row { PanelSwitchRow(it, stringResource(R.string.label_panel_flashlight), state.torch) { actions.onTorch() } }
+                if (state.torchAvailable) row { PanelSwitchRow(it, stringResource(R.string.label_panel_flashlight), state.torch) { actions.onTorch() } }
             }
         }
         actions.onSettings?.let { onSettings ->
