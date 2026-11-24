@@ -54,7 +54,9 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Badge
 import androidx.compose.material3.Button
+import androidx.compose.material3.CircularWavyProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.FilledTonalIconButton
@@ -270,7 +272,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
     var usedAt by remember { mutableLongStateOf(SystemClock.uptimeMillis()) }
     val used = { usedAt = SystemClock.uptimeMillis() }
     val reviewing by viewModel.review.collectAsStateWithLifecycle()
-    val busy = engine.recording != null || ui.countdown != null || ui.motionWaiting > 0 || reviewing != null
+    val busy = engine.recording != null || ui.countdown != null || ui.motionWaiting > 0 || reviewing != null || ui.nightGathering || ui.processing > 0
     var keepOn by remember { mutableStateOf(true) }
     // A tapped focus that ends because the phone turned isn't use either
     LaunchedEffect(ui.copy(rotation = 0, focus = null), busy) { used() }
@@ -442,7 +444,9 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
     val colors = MaterialTheme.colorScheme
     val problem = engine.status.takeIf { it is CameraStatus.Busy || it is CameraStatus.Blocked || it is CameraStatus.Error }
     // For another app only the mode it asked for (SPEC §15.3)
-    val modes = if (capture != null) listOf(ui.mode) else listOf(Mode.PHOTO, Mode.VIDEO)
+    val modes = if (capture != null) listOf(ui.mode) else listOfNotNull(Mode.PHOTO, Mode.VIDEO, Mode.NIGHT.takeIf { camera?.night != null })
+    val night = ui.mode == Mode.NIGHT
+    val postview by viewModel.postviewImage.collectAsStateWithLifecycle()
     val stepsPerThird = camera?.let { (1.0 / 3 / it.exposureStep).roundToInt().coerceAtLeast(1) } ?: 1
     val ev = (camera?.exposureStep ?: 0.0) * ui.exposure
 
@@ -523,7 +527,8 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                             detectTapGestures(
                                 onTap = { offset ->
                                     viewModel.focusAt(Point((offset.x / size.width).toDouble(), (offset.y / size.height).toDouble()))
-                                    exposureOpen = true
+                                    // Night's extension has no exposure compensation
+                                    if (ui.mode != Mode.NIGHT) exposureOpen = true
                                     exposureTouch = System.currentTimeMillis()
                                 },
                                 onLongPress = { offset ->
@@ -533,8 +538,8 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                                 },
                             )
                         }
-                        .pointerInput(ui.mode) {
-                            // A horizontal swipe on the picture changes the mode by one
+                        .pointerInput(ui.mode, modes) {
+                            // A horizontal swipe on the picture changes the mode by one (the modes of this camera: Night only where it has it)
                             var travel = 0f
                             detectHorizontalDragGestures(onDragStart = { travel = 0f }) { change, amount ->
                                 travel += amount
@@ -556,7 +561,11 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
           }
           if (problem == null) {
               // The tilt read in here only: it changes many times a second and must not recompose the whole viewfinder
+              // Night's early postview over the picture until its file is out (SPEC §9.2)
+              postview?.takeIf { night }?.let { Image(it.asImageBitmap(), contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize()) }
               Level(viewModel, ui.settings.grid, ui.settings.level, ui.rotation)
+              // Hold still: the crosshairs while a Night photo gathers its frames
+              if (ui.nightGathering && camera != null) NightCrosshairs(camera.lensView, ui.zoom, if (ui.settings.aspect == Aspect.SIXTEEN_NINE) 9.0 / 16 else 0.75, Modifier.fillMaxSize())
               ui.countdown?.let { Countdown(it, turn, Modifier.align(Alignment.Center)) }
               // Storage full: the picture stays, the shutter waits (SPEC §14.1)
               if (phone.storageFull && recording == null) StorageFull(activity, entry.locked, Modifier.align(Alignment.Center).padding(16.dp))
@@ -573,7 +582,8 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                 if (video && camera.flash) {
                     TopButton(if (ui.torch) R.drawable.ic_flashlight_on else R.drawable.ic_flashlight_off, stringResource(R.string.tooltip_flashlight), null, filled = ui.torch, turn = turn, enabled = !ledBlocked, onDisabled = { explain(ledReason) }) { viewModel.toggleTorch() }
                 }
-                if (!video && (camera.flash || camera.front)) {
+                // Night's extension takes no flash
+                if (!video && !night && (camera.flash || camera.front)) {
                     MenuButton(listOf(Flash.entries.map { f -> MenuChoice(stringResource(flashName(f)), f == ui.flash) { viewModel.setFlash(f) } })) { open ->
                         // Automatic: the button's background shows when the flash will fire (the exposure asks for it, or the scene is dark)
                         val willFire = ui.flash == Flash.AUTO && if (camera.front) engine.dark else engine.flashNeeded
@@ -619,7 +629,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                         ) { viewModel.toggleHdr() }
                     }
                     // Not for another app's photo: it never gets a motion photo (SPEC §15.3)
-                    if (!video && capture == null) {
+                    if (!video && !night && capture == null) {
                         MenuButton(listOf(MotionPhoto.entries.map { m -> MenuChoice(stringResource(motionName(m)), m == settings.motionPhoto) { viewModel.setMotionPhoto(m) } })) { open ->
                             TopButton(motionIcon(settings.motionPhoto), stringResource(R.string.tooltip_motion_photo), stringResource(motionState(settings.motionPhoto)), filled = settings.motionPhoto != MotionPhoto.AUTO, turn = turn, onClick = open)
                         }
@@ -695,6 +705,10 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                 qr != null && !exposureOpen -> SuggestionChip(qrIcon(qr.content), qrChipText(qr.content), onDismiss = null, onClick = { qrSheet = qr.content })
                 // From the QR code shortcut, until a code is found (SPEC §15.5)
                 ui.pointAtCode && ui.mode == Mode.PHOTO && !exposureOpen -> SuggestionChip(R.drawable.ic_qr_code_scanner, stringResource(R.string.label_point_at_code), onDismiss = { viewModel.clearPointAtCode() })
+                // A Night photo gathering its frames (SPEC §9.2)
+                ui.nightGathering -> SuggestionChip(R.drawable.ic_back_hand, stringResource(R.string.label_hold_still), onDismiss = null)
+                // Dark for a while in Photo: Night offered, never switched to by itself (SPEC §9.1)
+                ui.nightSuggested && ui.mode == Mode.PHOTO && !exposureOpen -> SuggestionChip(R.drawable.ic_bedtime, stringResource(R.string.label_suggest_night), onDismiss = { viewModel.closeNightSuggestion() }, onClick = { viewModel.selectMode(Mode.NIGHT) })
             }
         }
         // The exposure ruler above the zoom row, in the suggestion slot's place
@@ -743,7 +757,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                 if (capture != null) {
                     RowButton(R.drawable.ic_close, stringResource(R.string.button_cancel), turn, Modifier.align(Alignment.CenterStart).padding(start = 34.dp)) { onCancel?.invoke() }
                 } else {
-                    Thumbnail(last, turn, Modifier.align(Alignment.CenterStart).padding(start = 34.dp)) { shot ->
+                    Thumbnail(last, turn, ui.processing, ui.nightProgress, Modifier.align(Alignment.CenterStart).padding(start = 34.dp)) { shot ->
                         if (entry.locked) reviewSecure(context, activity, viewModel.sessionShots(), shot) else openInGallery(context, shot)
                     }
                 }
@@ -754,6 +768,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
             ShutterButton(
                 look = when {
                     counting -> ShutterLook.TIMER
+                    ui.nightGathering -> ShutterLook.NIGHT
                     recording != null -> ShutterLook.RECORDING
                     video -> ShutterLook.VIDEO
                     else -> ShutterLook.PHOTO
@@ -761,13 +776,14 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                 label = stringResource(
                     when {
                         counting -> R.string.content_description_shutter_cancel_timer
+                        ui.nightGathering -> R.string.label_hold_still
                         recording != null -> R.string.content_description_shutter_stop
                         video -> R.string.content_description_shutter_record
                         else -> R.string.content_description_shutter_photo
                     },
                 ),
-                enabled = engine.status == CameraStatus.Ready && (!video || (engine.video != null && !engine.finishing)) && (!phone.storageFull || recording != null),
-                progress = ui.countdown?.let { 1f - it.toFloat() / ui.timer.coerceAtLeast(1) },
+                enabled = engine.status == CameraStatus.Ready && (!video || (engine.video != null && !engine.finishing)) && (!phone.storageFull || recording != null) && !ui.nightGathering && engine.request?.let { it.mode == ui.mode && it.camera.id == camera?.id } == true,
+                progress = if (ui.nightGathering) ui.gatherProgress else ui.countdown?.let { 1f - it.toFloat() / ui.timer.coerceAtLeast(1) },
                 turn = turn,
                 onClick = {
                     if (video && !counting && ui.timer == 0) {
@@ -779,10 +795,18 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
             )
         }
 
-        if (recording == null && ui.countdown == null) ModeRow(
+        if (recording == null && ui.countdown == null && !ui.nightGathering) ModeRow(
             modes = modes,
             selected = ui.mode,
-            label = { stringResource(if (it == Mode.VIDEO) R.string.label_mode_video else R.string.label_mode_photo) },
+            label = {
+                stringResource(
+                    when (it) {
+                        Mode.VIDEO -> R.string.label_mode_video
+                        Mode.NIGHT -> R.string.label_mode_night
+                        Mode.PHOTO -> R.string.label_mode_photo
+                    },
+                )
+            },
             onSelect = {
                 if (it != ui.mode) haptics.mode()
                 viewModel.selectMode(it)
@@ -840,7 +864,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
             QuickSettings(
                 PanelState(
                     video = ui.mode == Mode.VIDEO,
-                    flashAvailable = (camera.flash && !ledBlocked) || camera.front,
+                    flashAvailable = !night && ((camera.flash && !ledBlocked) || camera.front),
                     flash = ui.flash,
                     flashLevels = if (camera.front) 1 else camera.flashLevels,
                     flashLevel = ui.flashLevel ?: camera.flashDefaultLevel,
@@ -858,7 +882,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                     torchAvailable = camera.flash && !ledBlocked,
                     ultraHdrAvailable = camera.jpegR.isNotEmpty(),
                     motionPhoto = settings.motionPhoto,
-                    motionAvailable = capture == null,
+                    motionAvailable = capture == null && !night,
                     hdrAvailable = camera.hlg && capture?.lowQuality != true,
                     qualityAvailable = capture?.lowQuality != true,
                     ultraHdr = settings.ultraHdr,
@@ -939,7 +963,7 @@ private fun ExposureRuler(steps: Int, stepEv: Double, stepsPerThird: Int, limits
 
 /** The thumbnail of the newest own shot (SPEC §8.1); a tap hands it to the gallery with the rest to swipe through. */
 @Composable
-private fun Thumbnail(last: LastShot?, turn: Float, modifier: Modifier, onOpen: (LastShot) -> Unit) {
+private fun Thumbnail(last: LastShot?, turn: Float, processing: Int, progress: Float?, modifier: Modifier, onOpen: (LastShot) -> Unit) {
     val colors = MaterialTheme.colorScheme
     val label = stringResource(R.string.tooltip_last_shot)
     // The alignment goes on a box of our own: TooltipBox doesn't pass it to the row
@@ -962,6 +986,18 @@ private fun Thumbnail(last: LastShot?, turn: Float, modifier: Modifier, onOpen: 
                 if (bitmap != null) Image(bitmap.asImageBitmap(), contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize().rotate(turn))
                 else Icon(painterResource(R.drawable.ic_photo_library), contentDescription = null, tint = IconButtonDefaults.iconButtonColors().disabledContentColor, modifier = Modifier.rotate(turn))
             }
+        }
+        // Photos still being put together (SPEC §8.2): the newest one's progress at the top-end corner, how many at the top-start
+        if (processing > 0) {
+            Box(
+                Modifier.align(Alignment.TopEnd).offset(x = 8.dp, y = (-8).dp).size(26.dp).background(colors.surfaceContainerHigh, CircleShape),
+                contentAlignment = Alignment.Center,
+            ) {
+                val value = progress
+                if (value != null) CircularWavyProgressIndicator(progress = { value }, modifier = Modifier.size(20.dp))
+                else CircularWavyProgressIndicator(modifier = Modifier.size(20.dp))
+            }
+            Badge(Modifier.align(Alignment.TopStart).offset(x = (-6).dp, y = (-6).dp), containerColor = colors.primary, contentColor = colors.onPrimary) { Text("$processing") }
         }
     }
 }

@@ -254,4 +254,10 @@
     <string name="msg_recording_not_saved_storage">Storage is full. The recording couldn’t be saved.</string>
     <string name="msg_too_hot_to_record">The phone is too hot to record. Let it cool down.</string>
     <string name="desc_restore_backup_wizard">Choose a JSON file saved in Settings.</string>
+    <!-- Night -->
+    <string name="label_mode_night">Night</string>
+    <string name="label_suggest_night">Night mode</string>
+    <string name="label_hold_still">Hold still</string>
+    <string name="label_setting_night_suggestion">Night mode suggestion</string>
+    <string name="desc_setting_night_suggestion">When it gets dark</string>
 </resources>

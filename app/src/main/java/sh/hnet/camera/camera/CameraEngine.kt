@@ -4,11 +4,16 @@ import android.Manifest
 import android.app.admin.DevicePolicyManager
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
+import android.graphics.Matrix
 import android.hardware.HardwareBuffer
 import android.hardware.camera2.CameraAccessException
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraDevice
+import android.hardware.camera2.CameraExtensionCharacteristics
+import android.hardware.camera2.CameraExtensionSession
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureFailure
@@ -16,6 +21,7 @@ import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.params.DynamicRangeProfiles
+import android.hardware.camera2.params.ExtensionSessionConfiguration
 import android.hardware.camera2.params.MeteringRectangle
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
@@ -32,9 +38,12 @@ import android.util.Range
 import android.util.Size
 import android.view.Surface
 import androidx.annotation.RequiresApi
+import androidx.exifinterface.media.ExifInterface
+import java.io.ByteArrayInputStream
 import java.util.concurrent.Executor
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
+import kotlin.math.log2
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -70,7 +79,7 @@ import sh.hnet.camera.capabilities.model.StillFormat
 import sh.hnet.camera.capabilities.model.StillPlan
 import sh.hnet.camera.capabilities.model.VideoChoice
 
-enum class Mode { PHOTO, VIDEO }
+enum class Mode { PHOTO, VIDEO, NIGHT }
 
 /** What the viewfinder wants: which camera, in which mode and aspect ratio. */
 data class CameraRequest(val camera: CameraSpec, val mode: Mode, val aspect: Aspect, val video: VideoChoice = VideoChoice(), val ultraHdr: Boolean = true, val motion: Boolean = false, val motionFirst: Boolean = false) {
@@ -115,7 +124,7 @@ data class EngineState(
     /** A frame of the current session has been shown (the viewfinder's crossfade ends then). */
     val frameShown: Boolean = false,
     val focusing: Boolean = false,
-    /** The scene is dark (high sensitivity or a long exposure): the front camera's automatic screen flash fires. */
+    /** The scene is dark (about 14 lux or less): the front camera's automatic screen flash fires, Night is suggested. */
     val dark: Boolean = false,
     /** The flash is needed: the exposure says so, or the scene is dark (automatic flash: it will fire with the next photo). */
     val flashNeeded: Boolean = false,
@@ -135,6 +144,9 @@ data class Controls(
     /** The flash's strength level, null for the camera's default. */
     val flashLevel: Int? = null,
 )
+
+/** A Night photo on its way: its frames gathered (true) or not, the extension's progress (0–100) while it puts the photo together, and the photo. */
+class NightShot(val gathered: Deferred<Boolean>, val photo: Deferred<CapturedPhoto?>, val progress: StateFlow<Int>)
 
 /** A still as it came from the camera, with the crop the app still has to make for its aspect ratio. */
 class CapturedPhoto(
@@ -226,24 +238,6 @@ class CameraEngine(context: Context) {
         }
     }
 
-    init {
-        manager.registerAvailabilityCallback(executor, availability)
-        scope.launch {
-            desired.collect { want ->
-                try {
-                    reconcile(want)
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    Log.w(TAG, "Camera step failed: ${e.javaClass.simpleName}")
-                    runCatching { finishRecording() }
-                    closeDevice()
-                    failed(CameraDevice.StateCallback.ERROR_CAMERA_DEVICE)
-                }
-            }
-        }
-    }
-
     /** The viewfinder is shown. Coming back also tries again a camera that was busy, blocked or failed. */
     /** The viewfinders that want the camera (two activities may hand over in either order): it runs while there is one. */
     private val owners = mutableSetOf<Any>()
@@ -294,7 +288,14 @@ class CameraEngine(context: Context) {
     }
 
     /** The preview's buffer size for a request; the viewfinder sizes its surface with it before the session is made. */
-    fun previewSize(request: CameraRequest): PixelSize? = Sizes.preview(request.camera.preview, request.pictureAspect)
+    fun previewSize(request: CameraRequest): PixelSize? =
+        // Night previews in the extension's own sizes
+        if (request.mode == Mode.NIGHT) {
+            // An aspect the extension lacks previews in 4:3 rather than not at all
+            request.camera.night?.preview.orEmpty().let { Sizes.preview(it, request.pictureAspect) ?: Sizes.preview(it, Aspect.FOUR_THREE) }
+        } else {
+            Sizes.preview(request.camera.preview, request.pictureAspect)
+        }
 
     /** A new viewfinder starts from the defaults (1×, no compensation, no focus point): the engine outlives the screens. */
     fun resetControls() = scope.launch {
@@ -471,7 +472,7 @@ class CameraEngine(context: Context) {
             closeSession()
             return
         }
-        if (session != null && sessionKey == want) return
+        if ((session != null || nightSession != null) && sessionKey == want) return
         awaitCapture()
         closeSession()
         if (makeSession(want, request, surface)) {
@@ -484,13 +485,15 @@ class CameraEngine(context: Context) {
     private suspend fun awaitCapture() {
         capture?.let { inFlight -> withTimeoutOrNull(STILL_TIMEOUT_MS) { inFlight.await() } }
         if (clipping.get() > 0) withTimeoutOrNull(CLIP_WAIT_MS) { while (clipping.get() > 0) delay(SETTLE_POLL_MS) }
+        // Night photos the extension is still putting together: the session stays until they are out
+        if (nightInFlight.get() > 0) withTimeoutOrNull(NIGHT_TIMEOUT_MS) { while (nightInFlight.get() > 0) delay(SETTLE_POLL_MS) }
         finishRecording()
     }
 
     /** Waits (on the camera's thread, letting the reconcile run) until the session is the one wanted now; gives up after a few seconds. */
     private suspend fun awaitSession() {
         withTimeoutOrNull(SETTLE_MS) {
-            while (!(session != null && sessionKey == desired.value && _state.value.status == CameraStatus.Ready)) delay(SETTLE_POLL_MS)
+            while (!((session != null || nightSession != null) && sessionKey == desired.value && _state.value.status == CameraStatus.Ready)) delay(SETTLE_POLL_MS)
         }
     }
 
@@ -595,6 +598,8 @@ class CameraEngine(context: Context) {
                     // No encoder takes anything the camera offers: the preview alone, nothing to record
                     .ifEmpty { listOf(Rung(PictureRange.SDR, null, null)) }
             }
+            // Night's session is the extension's, made apart ([makeNight])
+            Mode.NIGHT -> emptyList()
         }
     }
 
@@ -603,6 +608,7 @@ class CameraEngine(context: Context) {
      * the plainest, which is always tried rather than leaving the viewfinder without a picture.
      */
     private suspend fun makeSession(want: Desired, request: CameraRequest, surface: Surface): Boolean {
+        if (request.mode == Mode.NIGHT) return makeNight(want, request, surface)
         val device = device ?: return false
         val spec = request.camera
         val previewSize = previewSize(request)
@@ -813,6 +819,10 @@ class CameraEngine(context: Context) {
 
     /** Sets the repeating request again with the current controls. */
     private fun repeat() {
+        nightSession?.let {
+            repeatNight(it)
+            return
+        }
         val session = session ?: return
         val device = device ?: return
         val surface = previewSurface ?: return
@@ -874,6 +884,7 @@ class CameraEngine(context: Context) {
      * flash's exposure mode (a flash shot), else with plain auto-exposure (a lock).
      */
     private fun trigger(af: Int, precapture: Boolean, flashMetering: Boolean) {
+        // Night's extension takes no one-off requests besides its photo: its focus follows the tapped region continuously
         val session = session ?: return
         val device = device ?: return
         val surface = previewSurface ?: return
@@ -943,7 +954,36 @@ class CameraEngine(context: Context) {
     }
 
     private val results = object : CameraCaptureSession.CaptureCallback() {
-        override fun onCaptureCompleted(session: CameraCaptureSession, captureRequest: CaptureRequest, result: TotalCaptureResult) {
+        override fun onCaptureCompleted(session: CameraCaptureSession, captureRequest: CaptureRequest, result: TotalCaptureResult) = onResult(result)
+    }
+
+    /** The Night extension's preview results, read as the regular session's. */
+    private val nightResults = object : CameraExtensionSession.ExtensionCaptureCallback() {
+        // An extension that reports no results still shows its frames: the cover goes with the first one
+        override fun onCaptureStarted(session: CameraExtensionSession, request: CaptureRequest, timestamp: Long) {
+            if (!_state.value.frameShown) _state.update { it.copy(frameShown = true) }
+        }
+
+        override fun onCaptureResultAvailable(session: CameraExtensionSession, request: CaptureRequest, result: TotalCaptureResult) = onResult(result)
+    }
+
+    /**
+     * The scene's brightness as EV at ISO 100, from what the exposure took: aperture, time and the whole gain (the sensor's and the one after RAW, where a phone may put what its analog
+     * gain lacks). Thresholds on the ISO or the time alone may miss dark scenes: the gain may go into the boost, and a session with a video stream may keep the
+     * time at 1/30 s. The user's compensation is added back (with +1 EV the exposure takes twice the light of the same scene).
+     */
+    private fun sceneEv(result: CaptureResult, request: CameraRequest): Double? {
+        val iso = result.get(CaptureResult.SENSOR_SENSITIVITY)?.takeIf { it > 0 } ?: return null
+        val time = result.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.takeIf { it > 0 } ?: return null
+        val boost = result.get(CaptureResult.CONTROL_POST_RAW_SENSITIVITY_BOOST)?.takeIf { it > 0 } ?: 100
+        val aperture = result.get(CaptureResult.LENS_APERTURE)?.takeIf { it > 0 }?.toDouble() ?: DEFAULT_APERTURE
+        val gain = iso * boost / 100.0
+        val compensation = controls.exposure.coerceIn(request.camera.exposureSteps) * request.camera.exposureStep
+        return log2(aperture * aperture / (time / 1e9)) - log2(gain / 100) + compensation
+    }
+
+    private fun onResult(result: TotalCaptureResult) {
+        run {
             val request = desired.value.request ?: return
             val afState = result.get(CaptureResult.CONTROL_AF_STATE)
             val aeState = result.get(CaptureResult.CONTROL_AE_STATE)
@@ -952,9 +992,9 @@ class CameraEngine(context: Context) {
             aeSettled.value = aeState == null || aeState == CameraMetadata.CONTROL_AE_STATE_CONVERGED || aeState == CameraMetadata.CONTROL_AE_STATE_FLASH_REQUIRED || aeState == CameraMetadata.CONTROL_AE_STATE_LOCKED
             val focusing = afState == CameraMetadata.CONTROL_AF_STATE_ACTIVE_SCAN || afState == CameraMetadata.CONTROL_AF_STATE_PASSIVE_SCAN
             val face = steadyFace(focusedFace(result, request))
-            val iso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: 0
-            val exposure = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: 0L
-            val dark = iso >= DARK_ISO || exposure >= DARK_EXPOSURE_NS
+            val light = sceneEv(result, request)
+            // Darker than the threshold to become dark, clearly lighter to stop being it: noise around the threshold would flicker the flash's amber and restart the Night suggestion's wait
+            val dark = light != null && if (_state.value.dark) light < LIGHT_EV else light <= DARK_EV
             // The exposure's own word where the camera gives it; the Pixel doesn't in the preview, so a dark scene counts too (as for the front camera's screen flash)
             val flashNeeded = aeState == CameraMetadata.CONTROL_AE_STATE_FLASH_REQUIRED || dark
             val lens = result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)
@@ -1007,6 +1047,268 @@ class CameraEngine(context: Context) {
         return found
     }
 
+    /** Night's session (the phone's extension, LOGIKA §17) in place of the regular one, with its photo's reader and the early postview's. */
+    private var nightSession: CameraExtensionSession? = null
+    private var postview: PostviewOutput? = null
+
+    /** Night photos asked for and not yet out (the extension queues them). */
+    private val nightInFlight = AtomicInteger(0)
+
+    private val _postviewImage = MutableStateFlow<Bitmap?>(null)
+
+    /** The newest Night photo's early postview, shown in the picture until its file is there; null when none is wanted. */
+    val postviewImage: StateFlow<Bitmap?> = _postviewImage.asStateFlow()
+
+    /** How the newest Night photo's postview lies: the sensor's turn, the photo's JPEG turn, the front camera. */
+    private class PostviewTurn(val sensor: Int, val jpeg: Int, val front: Boolean)
+
+    @Volatile
+    private var postviewTurn: PostviewTurn? = null
+
+    /**
+     * The postview turned to lie as the live picture does on the portrait screen: the sensor's turn, less what the camera already turned the pixels by (the
+     * JPEG's turn not left to the EXIF), and for the front camera mirrored as its preview is, so it covers the live picture without a jump.
+     */
+    private fun turnPostview(bytes: ByteArray, turn: PostviewTurn): Bitmap? {
+        val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return null
+        val exif = runCatching { ExifInterface(ByteArrayInputStream(bytes)).rotationDegrees }.getOrDefault(0)
+        val pixels = ((turn.jpeg - exif) % 360 + 360) % 360
+        val degrees = ((turn.sensor - pixels) % 360 + 360) % 360
+        val matrix = Matrix().apply {
+            postRotate(degrees.toFloat())
+            if (turn.front) postScale(-1f, 1f)
+        }
+        val upright = Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, matrix, true)
+        if (upright !== decoded) decoded.recycle()
+        return upright
+    }
+
+    /** Clears the postview shown (its photo is saved, or it was shown long enough). */
+    fun clearPostview() {
+        _postviewImage.value = null
+    }
+
+    /**
+     * Night's session: the extension with the preview (SDR: it takes no HLG, LOGIKA §21.1) and the photo (Ultra HDR where the extension and the setting allow, at
+     * the extension's largest size for the aspect – 5 MP on the Pixel, D10), plus the early postview where the extension has one.
+     */
+    private suspend fun makeNight(want: Desired, request: CameraRequest, surface: Surface): Boolean {
+        val device = device ?: return false
+        val spec = request.camera
+        val ext = spec.night
+        if (ext == null) {
+            Log.w(TAG, "No Night extension for this camera")
+            failed(CameraDevice.StateCallback.ERROR_CAMERA_DEVICE)
+            return false
+        }
+        // A ladder of its own: Ultra HDR (where the extension and the setting allow) before plain JPEG, each with the early postview before without it
+        val formats = listOfNotNull(ImageFormat.JPEG_R.takeIf { request.ultraHdr && ext.jpegR.isNotEmpty() }, ImageFormat.JPEG)
+        var made: CameraExtensionSession? = null
+        var output: StillOutput? = null
+        var post: PostviewOutput? = null
+        ladder@ for (format in formats) {
+            val formatPlan = Sizes.still(if (format == ImageFormat.JPEG_R) ext.jpegR else ext.jpeg, request.pictureAspect) ?: continue
+            val postSize = if (ext.postview) postviewSize(spec.id, formatPlan.capture, format) else null
+            for (withPostview in listOfNotNull(true.takeIf { postSize != null }, false)) {
+                if (!surface.isValid || this.device !== device || deviceLost) return false
+                val stillOutput = runCatching { StillOutput(formatPlan, if (format == ImageFormat.JPEG_R) StillFormat.JPEG_R else StillFormat.JPEG, format) }.getOrNull() ?: continue
+                val postOutput = if (withPostview && postSize != null) runCatching { PostviewOutput(postSize, format) }.getOrNull() else null
+                val session = try {
+                    suspendCancellableCoroutine<CameraExtensionSession?> { cont ->
+                        val config = ExtensionSessionConfiguration(
+                            CameraExtensionCharacteristics.EXTENSION_NIGHT,
+                            listOf(OutputConfiguration(surface), OutputConfiguration(stillOutput.reader.surface)),
+                            executor,
+                            object : CameraExtensionSession.StateCallback() {
+                                override fun onConfigured(session: CameraExtensionSession) {
+                                    if (cont.isActive) cont.resumeWith(Result.success(session)) else session.close()
+                                }
+
+                                override fun onConfigureFailed(session: CameraExtensionSession) {
+                                    if (cont.isActive) cont.resumeWith(Result.success(null))
+                                }
+
+                                override fun onClosed(session: CameraExtensionSession) {
+                                    stillOutput.close()
+                                    postOutput?.close()
+                                }
+                            },
+                        )
+                        postOutput?.let { config.postviewOutputConfiguration = OutputConfiguration(it.reader.surface) }
+                        device.createExtensionSession(config)
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Night session rung failed: ${e.javaClass.simpleName}")
+                    null
+                }
+                if (session == null) {
+                    stillOutput.close()
+                    postOutput?.close()
+                    continue
+                }
+                made = session
+                output = stillOutput
+                post = postOutput
+                break@ladder
+            }
+        }
+        if (made == null) {
+            if (surface.isValid && this.device === device && !deviceLost) failed(CameraDevice.StateCallback.ERROR_CAMERA_DEVICE)
+            return false
+        }
+        if (this.device !== device || deviceLost || desired.value != want) {
+            runCatching { made.close() }
+            return false
+        }
+        nightSession = made
+        still = output
+        postview = post
+        previewSurface = surface
+        controls = controls.copy(zoom = controls.zoom.coerceIn(spec.zoom.min, spec.zoom.max))
+        _state.update { EngineState(CameraStatus.Ready, request, PictureRange.SDR, null, frameShown = false) }
+        repeat()
+        return true
+    }
+
+    /**
+     * The postview's size for a photo: the photo's shape first (a 16:9 postview of a 4:3 photo is a cut of it and shows the photo zoomed in), then the width
+     * closest to the preview's (a picture to look at, not to keep).
+     */
+    private fun postviewSize(id: String, capture: PixelSize, format: Int): PixelSize? = runCatching {
+        val shape = capture.width.toDouble() / capture.height
+        manager.getCameraExtensionCharacteristics(id).getPostviewSupportedSizes(CameraExtensionCharacteristics.EXTENSION_NIGHT, Size(capture.width, capture.height), format)
+            .minWithOrNull(compareBy<Size> { abs(it.width.toDouble() / it.height - shape) > SHAPE_TOLERANCE }.thenBy { abs(it.width - POSTVIEW_WIDTH) })
+            ?.let { PixelSize(it.width, it.height) }
+    }.getOrNull()
+
+    private fun repeatNight(session: CameraExtensionSession) {
+        val device = device ?: return
+        val surface = previewSurface ?: return
+        val request = desired.value.request ?: return
+        try {
+            val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+            builder.addTarget(surface)
+            nightControls(builder, request)
+            session.setRepeatingRequest(builder.build(), executor, nightResults)
+        } catch (e: Exception) {
+            Log.w(TAG, "Night's repeating request failed: ${e.javaClass.simpleName}")
+        }
+    }
+
+    /** The keys the Night extension takes (LOGIKA §16): the zoom and the tapped region for focus and exposure, focus following it continuously (no trigger). */
+    private fun nightControls(builder: CaptureRequest.Builder, request: CameraRequest) {
+        val spec = request.camera
+        builder.set(CaptureRequest.CONTROL_ZOOM_RATIO, controls.zoom.toFloat())
+        if (spec.autofocus) builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+        controls.focus?.let { point ->
+            val region = Orientation.meteringRegion(point, spec.sensorOrientation, spec.front, visible(request))
+            val rect = arrayOf(MeteringRectangle(region.left, region.top, region.width, region.height, MeteringRectangle.METERING_WEIGHT_MAX - 1))
+            if (spec.afRegions > 0) builder.set(CaptureRequest.CONTROL_AF_REGIONS, rect)
+            if (spec.aeRegions > 0) builder.set(CaptureRequest.CONTROL_AE_REGIONS, rect)
+        }
+    }
+
+    /**
+     * A Night photo (LOGIKA §17): [onShutter] when its frames start, [NightShot.gathered] when they are all in (the phone may move again, another photo may be
+     * asked for), then the photo once the extension has put it together. Null when there is no Night session.
+     */
+    suspend fun takeNightPhoto(deviceRotation: Int, location: Location?, onShutter: () -> Unit): NightShot? = withContext(dispatcher) {
+        awaitSession()
+        val session = nightSession ?: return@withContext null
+        val output = still ?: return@withContext null
+        val request = desired.value.request ?: return@withContext null
+        val device = device ?: return@withContext null
+        val gathered = CompletableDeferred<Boolean>()
+        val progress = MutableStateFlow(0)
+        val failed = CompletableDeferred<Unit>()
+        val orientation = Orientation.jpeg(request.camera.sensorOrientation, deviceRotation, request.camera.front)
+        var startedAt = 0L
+        // This photo's postview, turned to lie as the live picture does (an earlier one goes)
+        _postviewImage.value = null
+        postviewTurn = PostviewTurn(request.camera.sensorOrientation, orientation, request.camera.front)
+        try {
+            val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+            builder.addTarget(output.reader.surface)
+            postview?.let { builder.addTarget(it.reader.surface) }
+            nightControls(builder, request)
+            builder.set(CaptureRequest.JPEG_ORIENTATION, orientation)
+            builder.set(CaptureRequest.JPEG_QUALITY, JPEG_QUALITY)
+            location?.let { builder.set(CaptureRequest.JPEG_GPS_LOCATION, it) }
+            session.capture(builder.build(), executor, object : CameraExtensionSession.ExtensionCaptureCallback() {
+                override fun onCaptureStarted(session: CameraExtensionSession, request: CaptureRequest, timestamp: Long) {
+                    startedAt = timestamp
+                    onShutter()
+                }
+
+                override fun onCaptureProcessStarted(session: CameraExtensionSession, request: CaptureRequest) {
+                    gathered.complete(true)
+                }
+
+                override fun onCaptureProcessProgressed(session: CameraExtensionSession, request: CaptureRequest, value: Int) {
+                    progress.value = value
+                }
+
+                override fun onCaptureFailed(session: CameraExtensionSession, request: CaptureRequest) {
+                    gathered.complete(false)
+                    failed.complete(Unit)
+                }
+            })
+        } catch (e: Exception) {
+            Log.w(TAG, "Night photo not asked for: ${e.javaClass.simpleName}")
+            return@withContext null
+        }
+        val takenAt = System.currentTimeMillis()
+        nightInFlight.incrementAndGet()
+        // The extension's photos come in the order they were asked for: each waits for the next image
+        val photo = scope.async {
+            try {
+                val image = withTimeoutOrNull(NIGHT_TIMEOUT_MS) {
+                    var found: Image? = null
+                    while (found == null) {
+                        val next = select<Image?> {
+                            output.images.onReceiveCatching { it.getOrNull() }
+                            failed.onAwait { null }
+                        } ?: break
+                        // A late image of an earlier photo that timed out is older than this one's start: it isn't taken for this one
+                        if (startedAt != 0L && next.timestamp < startedAt) next.close() else found = next
+                    }
+                    found
+                } ?: return@async null
+                val bytes = image.use { it.compressedBytes() }
+                // Its frames are in, whether or not the extension said so
+                gathered.complete(true)
+                CapturedPhoto(bytes, output.format, output.plan.crop, takenAt, if (startedAt != 0L) startedAt else image.timestamp, null, orientation)
+            } catch (e: Exception) {
+                Log.w(TAG, "Night photo failed: ${e.javaClass.simpleName}")
+                null
+            } finally {
+                gathered.complete(false)
+                nightInFlight.decrementAndGet()
+            }
+        }
+        NightShot(gathered, photo, progress.asStateFlow())
+    }
+
+    /** The early postview's reader: each image decoded small and shown (LOGIKA §17). */
+    private inner class PostviewOutput(size: PixelSize, format: Int) {
+        val reader: ImageReader = ImageReader.Builder(size.width, size.height).setImageFormat(format).setMaxImages(2).build()
+        private var closed = false
+
+        init {
+            reader.setOnImageAvailableListener({ r ->
+                val image = runCatching { r.acquireNextImage() }.getOrNull() ?: return@setOnImageAvailableListener
+                val bytes = image.use { it.compressedBytes() }
+                if (postview === this) _postviewImage.value = runCatching { postviewTurn?.let { turnPostview(bytes, it) } }.getOrNull()
+            }, handler)
+        }
+
+        fun close() {
+            if (closed) return
+            closed = true
+            reader.close()
+        }
+    }
+
     /** Closes the session; its still reader closes when the camera has really let go of it ([configure]'s `onClosed`). */
     private fun closeSession() {
         lockJob?.cancel()
@@ -1015,7 +1317,11 @@ class CameraEngine(context: Context) {
         // The motion photo's encoder too (the next session's may need the hardware at once)
         motion?.release()
         runCatching { session?.close() }
+        runCatching { nightSession?.close() }
         session = null
+        nightSession = null
+        postview = null
+        _postviewImage.value = null
         sessionKey = null
         still = null
         recorder = null
@@ -1054,11 +1360,35 @@ class CameraEngine(context: Context) {
 
     private class DeviceError(val error: Int) : Exception("camera error $error")
 
+    // Last in the class: the collector runs on the camera thread at once, and every property above must be set by then (a field declared below an init block is still null while it runs)
+    init {
+        manager.registerAvailabilityCallback(executor, availability)
+        scope.launch {
+            desired.collect { want ->
+                try {
+                    reconcile(want)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Log.w(TAG, "Camera step failed: ${e.javaClass.simpleName}")
+                    runCatching { finishRecording() }
+                    closeDevice()
+                    failed(CameraDevice.StateCallback.ERROR_CAMERA_DEVICE)
+                }
+            }
+        }
+    }
+
     private companion object {
         const val TAG = "CameraEngine"
         const val JPEG_QUALITY: Byte = 95
         const val STILL_BUFFERS = 3
         const val STILL_TIMEOUT_MS = 10_000L
+        /** The Night extension's longest shot (8 s on the Pixel) and a margin. */
+        const val NIGHT_TIMEOUT_MS = 15_000L
+        const val POSTVIEW_WIDTH = 1920
+        /** Two sizes of this much difference in width to height are the same shape (sizes are rounded to even pixels). */
+        const val SHAPE_TOLERANCE = 0.01
         /** A session being built is waited for this long by a shot or a recording. */
         const val SETTLE_MS = 3_000L
         const val SETTLE_POLL_MS = 20L
@@ -1073,8 +1403,11 @@ class CameraEngine(context: Context) {
         const val ANALYSIS_BUFFERS = 4
         const val PRECAPTURE_MAX_MS = 1_500L
         const val PRECAPTURE_POLL_MS = 16L
-        const val DARK_ISO = 1600
-        const val DARK_EXPOSURE_NS = 50_000_000L
+        /** A dark scene (about 14 lux) and the light one it waits for to stop being dark (about 28 lux). */
+        const val DARK_EV = 2.5
+        const val LIGHT_EV = 3.5
+        /** For a camera that doesn't report its aperture: a usual phone's main lens. */
+        const val DEFAULT_APERTURE = 1.8
         /** The reported inner face grown to the whole face: across it (cheek to cheek) and along it (forehead to chin). */
         const val FACE_ACROSS = 1.6
         const val FACE_ALONG = 2.2

@@ -255,4 +255,10 @@
     <string name="msg_recording_not_saved_storage">Pamięć jest pełna. Nie udało się zapisać nagrania.</string>
     <string name="msg_too_hot_to_record">Telefon jest za gorący, aby nagrywać. Poczekaj, aż ostygnie.</string>
     <string name="desc_restore_backup_wizard">Wybierz plik JSON zapisany w Ustawieniach.</string>
+    <!-- Night -->
+    <string name="label_mode_night">Noc</string>
+    <string name="label_suggest_night">Tryb „Noc”</string>
+    <string name="label_hold_still">Nie ruszaj telefonem</string>
+    <string name="label_setting_night_suggestion">Podpowiedź trybu „Noc”</string>
+    <string name="desc_setting_night_suggestion">Gdy robi się ciemno</string>
 </resources>

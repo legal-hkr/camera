@@ -1,5 +1,9 @@
 package sh.hnet.camera.ui.viewfinder
 
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.infiniteRepeatable
@@ -22,24 +26,32 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.rotate
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.LifecycleStartEffect
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.hypot
 import kotlin.math.roundToInt
 import kotlin.math.sin
+import kotlin.math.tan
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import sh.hnet.camera.Grid
@@ -214,3 +226,71 @@ private inline fun DrawScope.neutral(core: Color, outline: Color, width: Float, 
     draw(outline, width + 2.5.dp.toPx())
     draw(core, width)
 }
+
+/**
+ * Night's crosshairs (SPEC §5.5, §9.2): a fixed cross at the picture's centre and a moving one showing how far the phone has turned since the photo started –
+ * up and down, sideways (as the picture would shift, from the lens's field of view and the zoom) and around the lens's axis. Turns too small to show in the
+ * photo are left out; with the phone still the crosses cover each other. From the gyroscope's game rotation vector (no compass, no drift jumps).
+ */
+@Composable
+fun NightCrosshairs(lensView: Double, zoom: Double, widthShare: Double, modifier: Modifier) {
+    val context = LocalContext.current
+    val colors = MaterialTheme.colorScheme
+    // The turn since the start: about the screen's x (up/down), y (sideways) and z (the lens's axis), in radians
+    var turn by remember { mutableStateOf(Triple(0.0, 0.0, 0.0)) }
+    // Only while the viewfinder is in front: in the background the sensor would run on for nothing
+    LifecycleStartEffect(Unit) {
+        val sensors = context.getSystemService(SensorManager::class.java)
+        val sensor = sensors.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR)
+        var reference: FloatArray? = null
+        val listener = object : SensorEventListener {
+            override fun onSensorChanged(event: SensorEvent) {
+                val now = FloatArray(9)
+                SensorManager.getRotationMatrixFromVector(now, event.values)
+                val start = reference ?: now.also { reference = it }
+                // The turn in the phone's own axes: start⁻¹ · now; for small turns its skew part holds the angles
+                val d = FloatArray(9)
+                for (r in 0..2) for (c in 0..2) d[r * 3 + c] = (0..2).sumOf { k -> (start[k * 3 + r] * now[k * 3 + c]).toDouble() }.toFloat()
+                val x = (d[7] - d[5]) / 2.0
+                val y = (d[2] - d[6]) / 2.0
+                val z = (d[3] - d[1]) / 2.0
+                turn = Triple(x, y, z)
+            }
+
+            override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
+        }
+        sensor?.let { sensors.registerListener(listener, it, SensorManager.SENSOR_DELAY_GAME) }
+        onStopOrDispose { sensors.unregisterListener(listener) }
+    }
+    Canvas(modifier) {
+        val centre = Offset(size.width / 2, size.height / 2)
+        // The picture's focal length in pixels across the screen's width ([widthShare] of the sensor's long side: 3/4 for 4:3 and 1:1, 9/16 for 16:9), times the zoom
+        val focal = if (lensView > 0) size.width / (lensView * widthShare) * zoom else size.width.toDouble()
+        val (x, y, z) = turn
+        // The cross follows the phone: turned right (about its up axis, negative y) it goes right, tilted up (positive x) it goes up, rolled left (positive z)
+        // it turns left
+        val shiftX = if (abs(y) < Math.toRadians(STILL_SHIFT_DEGREES)) 0.0 else (-focal * tan(y)).coerceIn(-size.width / 2.0, size.width / 2.0)
+        val shiftY = if (abs(x) < Math.toRadians(STILL_SHIFT_DEGREES)) 0.0 else (-focal * tan(x)).coerceIn(-size.height / 2.0, size.height / 2.0)
+        val roll = if (abs(z) < Math.toRadians(STILL_ROLL_DEGREES)) 0f else -Math.toDegrees(z).toFloat()
+        val near = 8.dp.toPx()
+        val far = 26.dp.toPx()
+        val core = 1.5.dp.toPx()
+        val outline = core + 2.dp.toPx()
+        fun cross(at: Offset, angle: Float, coreColor: Color, outlineColor: Color) {
+            rotate(angle, at) {
+                for ((dx, dy) in listOf(1f to 0f, -1f to 0f, 0f to 1f, 0f to -1f)) {
+                    val a = Offset(at.x + dx * near, at.y + dy * near)
+                    val b = Offset(at.x + dx * far, at.y + dy * far)
+                    drawLine(outlineColor, a, b, outline, StrokeCap.Round)
+                    drawLine(coreColor, a, b, core, StrokeCap.Round)
+                }
+            }
+        }
+        cross(centre, 0f, colors.surface, colors.onSurface)
+        cross(Offset(centre.x + shiftX.toFloat(), centre.y + shiftY.toFloat()), roll, colors.primary, colors.surface)
+    }
+}
+
+/** Turns below these don't show in a Night photo: the moving cross stays on the fixed one. */
+private const val STILL_SHIFT_DEGREES = 0.3
+private const val STILL_ROLL_DEGREES = 1.0

@@ -58,6 +58,7 @@ data class BackupSettings(
     val mirror: Boolean? = null,
     val shutterSound: Boolean? = null,
     val videoHevc: Boolean? = null,
+    val nightSuggestion: Boolean? = null,
 ) {
     /** [current] with every value of this backup that this version knows. */
     fun applyTo(current: CameraSettings, locationAllowed: Boolean = true): CameraSettings = current.copy(
@@ -76,6 +77,7 @@ data class BackupSettings(
         mirror = mirror ?: current.mirror,
         shutterSound = shutterSound ?: current.shutterSound,
         videoHevc = videoHevc ?: current.videoHevc,
+        nightSuggestion = nightSuggestion ?: current.nightSuggestion,
     )
 
     companion object {
@@ -98,6 +100,7 @@ data class BackupSettings(
             mirror = settings.mirror,
             shutterSound = settings.shutterSound,
             videoHevc = settings.videoHevc,
+            nightSuggestion = settings.nightSuggestion,
         )
     }
 }

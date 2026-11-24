@@ -46,6 +46,8 @@ data class CameraSettings(
     val shutterSound: Boolean = true,
     /** Videos in HEVC, else AVC for older devices (Settings › Video); HLG needs HEVC. */
     val videoHevc: Boolean = true,
+    /** The "Night mode" suggestion when it gets dark (Settings › Controls). */
+    val nightSuggestion: Boolean = true,
 )
 
 /** Choices the user made in the UI that outlive the process (app-private, not backed up by the system). */
@@ -68,6 +70,7 @@ class Preferences(private val context: Context) {
         mirror = this[MIRROR] ?: false,
         shutterSound = this[SHUTTER_SOUND] ?: true,
         videoHevc = this[VIDEO_HEVC] ?: true,
+        nightSuggestion = this[NIGHT_SUGGESTION] ?: true,
     )
 
     suspend fun setAspect(value: Aspect) = context.settings.edit { it[ASPECT] = value.name }
@@ -85,6 +88,7 @@ class Preferences(private val context: Context) {
     suspend fun setMirror(value: Boolean) = context.settings.edit { it[MIRROR] = value }
     suspend fun setShutterSound(value: Boolean) = context.settings.edit { it[SHUTTER_SOUND] = value }
     suspend fun setVideoHevc(value: Boolean) = context.settings.edit { it[VIDEO_HEVC] = value }
+    suspend fun setNightSuggestion(value: Boolean) = context.settings.edit { it[NIGHT_SUGGESTION] = value }
 
     /** Every remembered value as the backup holds it (LOGIKA §12). */
     suspend fun snapshot(): BackupSettings = BackupSettings.of(camera.first())
@@ -109,6 +113,7 @@ class Preferences(private val context: Context) {
             p[MIRROR] = restored.mirror
             p[SHUTTER_SOUND] = restored.shutterSound
             p[VIDEO_HEVC] = restored.videoHevc
+            p[NIGHT_SUGGESTION] = restored.nightSuggestion
         }
     }
 
@@ -131,5 +136,6 @@ class Preferences(private val context: Context) {
         val MIRROR = booleanPreferencesKey("mirror")
         val SHUTTER_SOUND = booleanPreferencesKey("shutter_sound")
         val VIDEO_HEVC = booleanPreferencesKey("video_hevc")
+        val NIGHT_SUGGESTION = booleanPreferencesKey("night_suggestion")
     }
 }

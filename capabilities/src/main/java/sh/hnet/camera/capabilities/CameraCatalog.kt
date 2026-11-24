@@ -1,7 +1,9 @@
 package sh.hnet.camera.capabilities
 
 import android.graphics.ImageFormat
+import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraExtensionCharacteristics
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
@@ -52,6 +54,18 @@ data class CameraSpec(
     /** Fixed frame rates the exposure can hold (30, 60…). */
     val fixedFps: Set<Int>,
     val videoStabilization: Boolean,
+    /** How wide the logical camera sees at 1×: its sensor's long side over its focal length (the Night crosshairs turn angles into the picture's shifts with it). */
+    val lensView: Double = 0.0,
+    /** The phone's Night extension for this camera (Camera2 extensions), null without one. */
+    val night: NightSpec? = null,
+)
+
+/** The Night extension's sizes: the preview, the photo in Ultra HDR and in plain JPEG, and whether it gives an early postview of the photo. */
+data class NightSpec(
+    val preview: List<PixelSize>,
+    val jpegR: List<PixelSize>,
+    val jpeg: List<PixelSize>,
+    val postview: Boolean,
 )
 
 object CameraCatalog {
@@ -104,7 +118,21 @@ object CameraCatalog {
             video = map.getOutputSizes(MediaRecorder::class.java)?.map { PixelSize(it.width, it.height) }.orEmpty(),
             fixedFps = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)?.filter { it.lower == it.upper }?.map { it.upper }?.toSet().orEmpty(),
             videoStabilization = chars.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)?.contains(CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON) == true,
+            lensView = logical.view,
+            night = runCatching { night(manager, id) }.getOrNull(),
         )
+    }
+
+    /** The Night extension where the phone has one for this camera. */
+    private fun night(manager: CameraManager, id: String): NightSpec? {
+        val ext = manager.getCameraExtensionCharacteristics(id)
+        val night = CameraExtensionCharacteristics.EXTENSION_NIGHT
+        if (night !in ext.supportedExtensions) return null
+        fun sizes(format: Int) = runCatching { ext.getExtensionSupportedSizes(night, format) }.getOrNull().orEmpty().map { PixelSize(it.width, it.height) }
+        val preview = ext.getExtensionSupportedSizes(night, SurfaceTexture::class.java).map { PixelSize(it.width, it.height) }
+        val jpeg = sizes(ImageFormat.JPEG)
+        if (preview.isEmpty() || jpeg.isEmpty()) return null
+        return NightSpec(preview, sizes(ImageFormat.JPEG_R), jpeg, ext.isPostviewAvailable(night))
     }
 
     /** A lens' focal length and the width of the sensor area it uses (the active array's share of the physical sensor). */

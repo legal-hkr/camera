@@ -27,6 +27,7 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
@@ -91,6 +92,16 @@ data class ViewfinderUi(
     val rotation: Int = 0,
     /** Started from the QR code shortcut: "Point the camera at the code" until one is found (SPEC §15.5). */
     val pointAtCode: Boolean = false,
+    /** A Night photo is gathering its frames: hold still, the shutter waits (SPEC §9.2). */
+    val nightGathering: Boolean = false,
+    /** The Night photo gathering its frames: the extension's progress (0–1) on the shutter; null when it gives none. */
+    val gatherProgress: Float? = null,
+    /** The newest Night photo being put together: its progress (0–1) at the thumbnail; null when it gives none. */
+    val nightProgress: Float? = null,
+    /** Night photos being put together after their frames were gathered (SPEC §8.2): the queue at the thumbnail. */
+    val processing: Int = 0,
+    /** The scene has been dark for a while in Photo: the "Night mode" suggestion (SPEC §9.1). */
+    val nightSuggested: Boolean = false,
     val settings: CameraSettings = CameraSettings(),
 ) {
     val aspect: Aspect get() = settings.aspect
@@ -126,6 +137,9 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     /** Read again until the camera permission is there (some characteristics need it). */
     val cameras: List<CameraSpec> get() = engine.cameras
     val engineState: StateFlow<EngineState> = engine.state
+
+    /** Night's early postview, shown over the picture until its photo is out (SPEC §9.2). */
+    val postviewImage: StateFlow<Bitmap?> = engine.postviewImage
     private val _entry = MutableStateFlow<Entry>(Entry.App())
     val entry: StateFlow<Entry> = _entry.asStateFlow()
     private var entered = false
@@ -267,6 +281,19 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
                     _stopped.tryEmit(Stopped(why, saved))
                 }
             }
+        }
+        // Night suggested after the scene has been dark for two seconds in Photo, where the camera has Night and the setting allows (SPEC §9.1)
+        viewModelScope.launch {
+            combine(engineState.map { it.dark }.distinctUntilChanged(), _ui.map { it.mode == Mode.PHOTO && it.settings.nightSuggestion }.distinctUntilChanged()) { dark, allowed -> dark && allowed }
+                .distinctUntilChanged()
+                .collectLatest { dark ->
+                    if (!dark) {
+                        _ui.update { it.copy(nightSuggested = false) }
+                        return@collectLatest
+                    }
+                    delay(NIGHT_SUGGEST_MS)
+                    if (camera?.night != null && !application.nightSuggestionClosed && _entry.value !is Entry.Capture) _ui.update { it.copy(nightSuggested = true) }
+                }
         }
         viewModelScope.launch {
             var wasRecording = false
@@ -432,7 +459,9 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     private val recording: Boolean get() = engineState.value.recording != null
 
     fun selectMode(mode: Mode) {
-        if (mode == _ui.value.mode || recording || _entry.value is Entry.Capture) return
+        if (mode == _ui.value.mode || recording || _entry.value is Entry.Capture || _ui.value.nightGathering) return
+        // Night only on a camera with the extension
+        if (mode == Mode.NIGHT && camera?.night == null) return
         cancelTimer()
         _ui.update { it.copy(mode = mode, focus = null, locked = false, exposure = 0, torch = false, pointAtCode = false) }
         analyzer.reset()
@@ -442,9 +471,12 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun switchCamera() {
-        if (cameras.size < 2 || recording) return
+        if (cameras.size < 2 || recording || _ui.value.nightGathering) return
         cancelTimer()
-        _ui.update { it.copy(cameraIndex = (it.cameraIndex + 1) % cameras.size, zoom = 1.0, focus = null, locked = false, exposure = 0, torch = false, flashLevel = null) }
+        val next = (_ui.value.cameraIndex + 1) % cameras.size
+        // Night stays only where the other camera has it too
+        val mode = if (_ui.value.mode == Mode.NIGHT && cameras[next].night == null) Mode.PHOTO else _ui.value.mode
+        _ui.update { it.copy(cameraIndex = next, mode = mode, zoom = 1.0, focus = null, locked = false, exposure = 0, torch = false, flashLevel = null) }
         engine.setTorch(false)
         engine.setZoom(1.0)
         engine.resetFocus(exposure = 0)
@@ -477,6 +509,11 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun lockAt(point: Point) {
+        // Night's extension has no exposure lock: a long press focuses there as a tap does
+        if (_ui.value.mode == Mode.NIGHT) {
+            focusAt(point)
+            return
+        }
         gravityAtFocus = null
         _ui.update { it.copy(focus = point, locked = true) }
         engine.focusAt(point, lock = true)
@@ -616,6 +653,8 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     /** The shutter: a recording ends, a running countdown is cancelled, a set timer starts one, else the photo is taken or the recording started. */
     fun shutterPressed() {
         if (_review.value != null) return
+        // The session of another mode still stands (a Night photo being put together keeps it a moment): the shutter waits for this mode's
+        if (!sessionMatches) return
         // Nothing more fits: only a recording may still be stopped, a countdown cancelled
         if (phone.state.value.storageFull && !recording && _ui.value.countdown == null) return
         when {
@@ -623,6 +662,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
             _ui.value.countdown != null -> cancelTimer()
             _ui.value.timer > 0 -> startTimer(_ui.value.timer)
             _ui.value.mode == Mode.VIDEO -> record()
+            _ui.value.mode == Mode.NIGHT -> shootNight()
             else -> shoot()
         }
     }
@@ -663,7 +703,11 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
             if (configureLater) configure()
             // Storage may have filled during the countdown
             if (phone.state.value.storageFull) return@launch
-            if (_ui.value.mode == Mode.VIDEO) record() else shoot(timed = true)
+            when (_ui.value.mode) {
+                Mode.VIDEO -> record()
+                Mode.NIGHT -> shootNight()
+                Mode.PHOTO -> shoot(timed = true)
+            }
         }
     }
 
@@ -684,6 +728,80 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
 
     /** The place for a shot taken now, when the setting is on and a fresh fix is there. */
     private fun placeNow() = if (_ui.value.settings.location) location.current() else null
+
+    /**
+     * A Night photo (SPEC §9.2, LOGIKA §17): the shutter waits while its frames are gathered (about a second; hold still), then the next one may be taken while
+     * the extension puts this one together – shown in the queue at the thumbnail – and saves it. In the app's scope, like every photo.
+     */
+    private fun shootNight() {
+        if (_ui.value.nightGathering) return
+        val ui = _ui.value
+        val place = placeNow()
+        val front = camera?.front == true
+        val id = ++nightShots
+        _ui.update { it.copy(nightGathering = true, gatherProgress = null, nightSuggested = false) }
+        application.appScope.launch {
+            shots.withLock {
+                val shot = engine.takeNightPhoto(rotation, place) {
+                    if (!cleared && (ui.settings.shutterSound || MediaActionSound.mustPlayShutterSound())) sound.play(MediaActionSound.SHUTTER_CLICK)
+                    _shutter.tryEmit(Unit)
+                }
+                if (shot == null) {
+                    _ui.update { it.copy(nightGathering = false) }
+                    return@withLock
+                }
+                // The progress on the shutter while this photo gathers, then at the thumbnail while it is the newest one put together
+                var gathering = true
+                val progress = launch {
+                    shot.progress.collect { value ->
+                        val share = value / 100f
+                        _ui.update { if (gathering) it.copy(gatherProgress = share) else if (newestNight == id) it.copy(nightProgress = share) else it }
+                    }
+                }
+                shot.gathered.await()
+                gathering = false
+                newestNight = id
+                _ui.update { it.copy(nightGathering = false, gatherProgress = null, nightProgress = null, processing = it.processing + 1) }
+                // Put together and saved outside the lock: the next Night photo may start meanwhile. Waited for even when the extension didn't say its frames
+                // were in (the photo may still come)
+                application.appScope.launch {
+                    try {
+                        val photo = shot.photo.await() ?: return@launch
+                        val uri = media.savePhoto(photo.bytes, photo.takenAt, photo.crop, mirror = front && ui.settings.mirror)
+                        phone.refreshStorage()
+                        if (uri != null && ui.settings.location && place == null) {
+                            withTimeoutOrNull(LATE_PLACE_MS) { location.fix.first { it != null && location.current() != null } }?.let { media.addLocation(uri, it) }
+                        }
+                    } finally {
+                        progress.cancel()
+                        _ui.update { it.copy(processing = (it.processing - 1).coerceAtLeast(0), nightProgress = if (newestNight == id) null else it.nightProgress) }
+                        // The postview stays a moment once the photo is out, then the thumbnail has it (SPEC §9.2)
+                        delay(POSTVIEW_HOLD_MS)
+                        if (_ui.value.processing == 0 && !_ui.value.nightGathering) engine.clearPostview()
+                    }
+                }
+            }
+        }
+    }
+
+    /** Night photos asked for, and the newest one being put together (whose progress the thumbnail shows). */
+    private var nightShots = 0L
+
+    @Volatile
+    private var newestNight = 0L
+
+    /** The engine's session is this viewfinder's mode and camera (after a switch it may still be the last one's for a moment). */
+    val sessionMatches: Boolean
+        get() {
+            val running = engineState.value.request ?: return false
+            return running.mode == _ui.value.mode && running.camera.id == camera?.id
+        }
+
+    /** The Night suggestion closed: not again until the app starts again (SPEC §9.1). */
+    fun closeNightSuggestion() {
+        application.nightSuggestionClosed = true
+        _ui.update { it.copy(nightSuggested = false) }
+    }
 
     /** Takes a photo and saves it in the app's scope, so leaving the viewfinder right after doesn't lose it. Shots queue up; the shutter never waits. */
     fun shoot(timed: Boolean = false) {
@@ -829,6 +947,9 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         const val REFRESH_SETTLE_MS = 300L
         const val MOTION_AROUND_NS = 1_500_000_000L
         const val LIMIT_CHECK_MS = 250L
+        const val POSTVIEW_HOLD_MS = 500L
+        /** How long the scene stays dark before Night is suggested (SPEC §9.1). */
+        const val NIGHT_SUGGEST_MS = 2_000L
         /** The sound's bit rate and a margin for the MP4's index, for the size limit's estimate. */
         const val AUDIO_BITS = 256_000L
         const val INDEX_BYTES = 64_000L

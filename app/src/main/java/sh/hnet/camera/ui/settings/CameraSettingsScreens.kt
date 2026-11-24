@@ -197,6 +197,9 @@ fun ControlsSettingsScreen(onBack: () -> Unit) {
             row { shapes ->
                 SettingsSwitchRow(shapes, R.drawable.ic_straighten, stringResource(R.string.label_setting_level), settings.level, { scope.launch { preferences.setLevel(it) } })
             }
+            if (cameras.isEmpty() || cameras.any { it.night != null }) row { shapes ->
+                SettingsSwitchRow(shapes, R.drawable.ic_bedtime, stringResource(R.string.label_setting_night_suggestion), settings.nightSuggestion, { scope.launch { preferences.setNightSuggestion(it) } }, stringResource(R.string.desc_setting_night_suggestion))
+            }
         }
         if (cameras.isEmpty() || cameras.any { !it.front && it.flash }) SettingsGroup(stringResource(R.string.title_setting_timer)) {
             row { shapes ->

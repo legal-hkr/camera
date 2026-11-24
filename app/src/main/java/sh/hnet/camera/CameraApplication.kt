@@ -22,6 +22,10 @@ class CameraApplication : Application() {
 
     val captures: CaptureOutput by lazy { CaptureOutput(this) }
 
+    /** The Night suggestion closed: hidden until the app starts again (SPEC §9.1). */
+    @Volatile
+    var nightSuggestionClosed = false
+
     val backup: BackupManager by lazy { BackupManager(this, getSharedPreferences("stamps", MODE_PRIVATE)) }
 
     override fun onCreate() {

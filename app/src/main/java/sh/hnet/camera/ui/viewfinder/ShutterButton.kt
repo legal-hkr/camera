@@ -34,7 +34,7 @@ import androidx.compose.ui.unit.dp
 import sh.hnet.camera.R
 
 /** The shutter's looks (SPEC §5.1); burst and long shot come with their modes. */
-enum class ShutterLook { PHOTO, VIDEO, RECORDING, TIMER }
+enum class ShutterLook { PHOTO, VIDEO, RECORDING, TIMER, NIGHT }
 
 /**
  * ShutterButton (SPEC §5.1): 80 dp in `primary`, its shape carrying the state. Photo: a ring inside a circle, both turning to rounded squares while the finger is
@@ -57,10 +57,16 @@ fun ShutterButton(look: ShutterLook, label: String, onClick: () -> Unit, enabled
     if (look == ShutterLook.TIMER) {
         CircularWavyProgressIndicator(progress = { progress ?: 0f }, modifier = Modifier.size(92.dp), color = MaterialTheme.colorScheme.primary, trackColor = MaterialTheme.colorScheme.secondaryContainer)
     }
+    // A Night photo gathering its frames: the extension's progress where it gives one, else a ring that just turns (SPEC §9.2)
+    if (look == ShutterLook.NIGHT) {
+        val value = progress
+        if (value != null) CircularWavyProgressIndicator(progress = { value }, modifier = Modifier.size(92.dp), color = MaterialTheme.colorScheme.primary, trackColor = MaterialTheme.colorScheme.secondaryContainer)
+        else CircularWavyProgressIndicator(modifier = Modifier.size(92.dp), color = MaterialTheme.colorScheme.primary, trackColor = MaterialTheme.colorScheme.secondaryContainer)
+    }
     Box(
         contentAlignment = Alignment.Center,
         modifier = Modifier
-            .size(if (look == ShutterLook.TIMER) 64.dp else 80.dp)
+            .size(if (look == ShutterLook.TIMER || look == ShutterLook.NIGHT) 64.dp else 80.dp)
             .clip(RoundedCornerShape(corner))
             .background(container)
             .clickable(interactionSource = interaction, indication = null, enabled = enabled, role = Role.Button, onClick = onClick)
@@ -71,6 +77,7 @@ fun ShutterButton(look: ShutterLook, label: String, onClick: () -> Unit, enabled
             ShutterLook.VIDEO -> Box(Modifier.size(26.dp).clip(CircleShape).background(content))
             ShutterLook.RECORDING -> Box(Modifier.size(24.dp).clip(RoundedCornerShape(4.dp)).background(content))
             ShutterLook.TIMER -> Icon(painterResource(R.drawable.ic_close), contentDescription = null, tint = content, modifier = Modifier.size(28.dp).rotate(turn))
+            ShutterLook.NIGHT -> Icon(painterResource(R.drawable.ic_bedtime), contentDescription = null, tint = content, modifier = Modifier.size(28.dp).rotate(turn))
         }
     }
     }
