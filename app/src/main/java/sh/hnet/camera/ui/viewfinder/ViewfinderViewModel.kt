@@ -1,6 +1,8 @@
 package sh.hnet.camera.ui.viewfinder
 
 import android.app.Application
+import android.content.Intent
+import android.graphics.Bitmap
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
@@ -8,10 +10,12 @@ import android.hardware.SensorManager
 import android.media.AudioManager
 import android.media.MediaActionSound
 import android.media.ToneGenerator
+import android.os.SystemClock
 import android.view.KeyEvent
 import android.view.Surface
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import java.io.File
 import kotlin.math.acos
 import kotlin.math.sqrt
 import kotlinx.coroutines.Job
@@ -20,9 +24,12 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -33,7 +40,9 @@ import sh.hnet.camera.CameraSettings
 import sh.hnet.camera.Grid
 import sh.hnet.camera.MotionPhoto
 import sh.hnet.camera.VolumeKeys
+import sh.hnet.camera.camera.AnalysisFrame
 import sh.hnet.camera.camera.CameraRequest
+import sh.hnet.camera.camera.CapturedPhoto
 import sh.hnet.camera.camera.EngineState
 import sh.hnet.camera.camera.Flash
 import sh.hnet.camera.camera.FrameAnalyzer
@@ -46,6 +55,7 @@ import sh.hnet.camera.capabilities.model.SessionLadder
 import sh.hnet.camera.capabilities.model.VideoChoice
 import sh.hnet.camera.media.LastShot
 import sh.hnet.camera.media.LocationTracker
+import sh.hnet.camera.media.MediaFiles
 
 /**
  * The viewfinder's own state. What isn't remembered starts the same way every time (back camera, Photo, 1×, flash and timer off; SPEC §17.5); what is
@@ -75,9 +85,19 @@ data class ViewfinderUi(
     val motionWaiting: Int = 0,
     /** How the phone is held (0, 90, 180, 270): the controls turn the other way. */
     val rotation: Int = 0,
+    /** Started from the QR code shortcut: "Point the camera at the code" until one is found (SPEC §15.5). */
+    val pointAtCode: Boolean = false,
     val settings: CameraSettings = CameraSettings(),
 ) {
     val aspect: Aspect get() = settings.aspect
+}
+
+/** A shot for another app waiting for Use or Retake (SPEC §15.3). */
+sealed interface Review {
+    /** [preview] upright and mirrored as it will be handed over; null when it couldn't be decoded. */
+    class Photo(val photo: CapturedPhoto, val mirror: Boolean, val preview: Bitmap?) : Review
+
+    class Video(val file: File) : Review
 }
 
 /** The phone's tilt for the level: gravity in the screen's axes (x right, y up, z out of the screen), as a unit vector. */
@@ -92,11 +112,29 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
 
     /** QR codes and the finder glass from the analysis stream, read against the preview's shape. */
     val analyzer = FrameAnalyzer { previewSize()?.ratio ?: (4.0 / 3) }
+    private val analyze: (AnalysisFrame) -> Unit = analyzer::analyze
 
     /** Read again until the camera permission is there (some characteristics need it). */
     val cameras: List<CameraSpec> get() = engine.cameras
     val engineState: StateFlow<EngineState> = engine.state
-    val lastShot: StateFlow<LastShot?> = media.last
+    private val _entry = MutableStateFlow<Entry>(Entry.App())
+    val entry: StateFlow<Entry> = _entry.asStateFlow()
+    private var entered = false
+
+    /** When this way in began: over the lock screen only the shots since then are shown (SPEC §15.2). */
+    private var sessionStart = System.currentTimeMillis()
+
+    /** The thumbnail's shot: the newest own one, over the lock screen only this session's. */
+    val lastShot: StateFlow<LastShot?> = combine(media.last, media.saved, _entry) { last, saved, entry ->
+        if (!entry.locked) last else last?.takeIf { shot -> saved.any { it.uri == shot.uri && it.at >= sessionStart } }
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, null)
+
+    /** This lock-screen session's shots, newest first, for the gallery's secure review. */
+    fun sessionShots(): List<MediaFiles.Saved> = media.saved.value.filter { it.at >= sessionStart }.reversed()
+
+    private val _review = MutableStateFlow<Review?>(null)
+    val review: StateFlow<Review?> = _review.asStateFlow()
+    private var limitJob: Job? = null
 
     private val _ui = MutableStateFlow(ViewfinderUi())
     val ui: StateFlow<ViewfinderUi> = _ui.asStateFlow()
@@ -173,10 +211,52 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
 
     val camera: CameraSpec? get() = cameras.getOrNull(_ui.value.cameraIndex)
 
+    /**
+     * The way in (LOGIKA §11), told by the screen as it is composed, so the first session is already the right one. A new one (another shortcut, another
+     * press of the power button) applies its start again; the same one does nothing.
+     */
+    fun enter(entry: Entry) {
+        if (entered && entry == _entry.value) return
+        // Without the camera permission the cameras can't be read: the start is applied when they can (start())
+        pendingEntry = if (cameras.isEmpty()) entry else null
+        entered = true
+        _entry.value = entry
+        sessionStart = System.currentTimeMillis()
+        cancelTimer()
+        val front = cameras.indexOfFirst { it.front }
+        val back = cameras.indexOfFirst { !it.front }.coerceAtLeast(0)
+        val (mode, index) = when (entry) {
+            is Entry.Capture -> (if (entry.video) Mode.VIDEO else Mode.PHOTO) to _ui.value.cameraIndex
+            is Entry.LockScreen -> Mode.PHOTO to back
+            is Entry.App -> when (entry.start) {
+                Start.PHOTO, Start.QR -> Mode.PHOTO to back
+                Start.VIDEO -> Mode.VIDEO to back
+                Start.SELFIE -> Mode.PHOTO to (if (front >= 0) front else back)
+                null -> _ui.value.mode to _ui.value.cameraIndex
+            }
+        }
+        if (recording && (mode != _ui.value.mode || index != _ui.value.cameraIndex)) return
+        val point = entry is Entry.App && entry.start == Start.QR
+        _ui.update { it.copy(mode = mode, cameraIndex = index, pointAtCode = point, focus = null, locked = false, exposure = 0, torch = false) }
+        engine.setTorch(false)
+        engine.resetFocus(exposure = 0)
+        analyzer.reset()
+        configure()
+    }
+
+    private var pendingEntry: Entry? = null
+
+    /** A code was found, or the hint dismissed. */
+    fun clearPointAtCode() = _ui.update { it.copy(pointAtCode = false) }
+
     fun request(): CameraRequest? {
         val ui = _ui.value
         val settings = ui.settings
-        return camera?.let { CameraRequest(it, ui.mode, settings.aspect, VideoChoice(settings.videoUhd, videoFps, settings.hdrVideo && settings.videoHevc, settings.videoHevc), settings.ultraHdr, motion = ui.mode == Mode.PHOTO && settings.motionPhoto != MotionPhoto.OFF, motionFirst = settings.motionPhoto == MotionPhoto.ON) }
+        // For another app: no motion photo (SPEC §15.3), and its low quality is 1080p SDR at 30 (LOGIKA §11)
+        val capture = _entry.value as? Entry.Capture
+        val video = if (capture?.lowQuality == true) VideoChoice(uhd = false, fps = 30, hdr = false, hevc = settings.videoHevc) else VideoChoice(settings.videoUhd, videoFps, settings.hdrVideo && settings.videoHevc, settings.videoHevc)
+        val motion = capture == null && ui.mode == Mode.PHOTO && settings.motionPhoto != MotionPhoto.OFF
+        return camera?.let { CameraRequest(it, ui.mode, settings.aspect, video, settings.ultraHdr, motion = motion, motionFirst = settings.motionPhoto == MotionPhoto.ON) }
     }
 
     fun previewSize(): PixelSize? = request()?.let { engine.previewSize(it) }
@@ -205,8 +285,20 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         }
         // Also after the camera permission was just given (the cameras couldn't be read before)
         configure()
-        engine.analyzer = analyzer::analyze
-        engine.start()
+        pendingEntry?.let { pending ->
+            if (cameras.isNotEmpty()) {
+                entered = false
+                enter(pending)
+            }
+        }
+        engine.analyzer = analyze
+        // The engine is the process's: this one's controls again, another viewfinder (the lock screen's, another app's shot) may have changed them
+        _ui.update { it.copy(focus = null, locked = false) }
+        engine.setZoom(_ui.value.zoom)
+        engine.setFlash(_ui.value.flash, _ui.value.flashLevel)
+        engine.setTorch(_ui.value.torch)
+        engine.resetFocus(exposure = _ui.value.exposure)
+        engine.start(this)
         sensors.getDefaultSensor(Sensor.TYPE_GRAVITY)?.let { sensors.registerListener(gravityListener, it, SensorManager.SENSOR_DELAY_UI) }
         updateLocation()
         viewModelScope.launch { media.refreshLast() }
@@ -214,12 +306,13 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
 
     fun stop() {
         started = false
-        engine.analyzer = null
+        // Only its own: another viewfinder may have taken the engine already
+        if (engine.analyzer === analyze) engine.analyzer = null
         analyzer.reset()
         unwatch?.invoke()
         unwatch = null
         cancelTimer()
-        engine.stop()
+        engine.stop(this)
         sensors.unregisterListener(gravityListener)
         location.stop()
     }
@@ -236,9 +329,9 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     private val recording: Boolean get() = engineState.value.recording != null
 
     fun selectMode(mode: Mode) {
-        if (mode == _ui.value.mode || recording) return
+        if (mode == _ui.value.mode || recording || _entry.value is Entry.Capture) return
         cancelTimer()
-        _ui.update { it.copy(mode = mode, focus = null, locked = false, exposure = 0, torch = false) }
+        _ui.update { it.copy(mode = mode, focus = null, locked = false, exposure = 0, torch = false, pointAtCode = false) }
         analyzer.reset()
         engine.setTorch(false)
         engine.resetFocus(exposure = 0)
@@ -344,9 +437,55 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         }
         if (engineState.value.finishing) return
         val place = placeNow()
+        val capture = _entry.value as? Entry.Capture
         application.appScope.launch {
+            if (capture != null) {
+                // For another app: into the cache, then Review (SPEC §15.3)
+                val video = application.captures.newVideo { file, saved -> if (saved) _review.value = Review.Video(file) } ?: return@launch
+                if (engine.startRecording(video.target, rotation, place?.let { it.latitude to it.longitude })) watchLimits(capture, video.file)
+                return@launch
+            }
             val target = media.newVideo(System.currentTimeMillis()) ?: return@launch
             engine.startRecording(target, rotation, place?.let { it.latitude to it.longitude })
+        }
+    }
+
+    /** The app's limits on its video (`EXTRA_DURATION_LIMIT`, `EXTRA_SIZE_LIMIT`): the recording stops by itself at either, a little before the size. */
+    private fun watchLimits(capture: Entry.Capture, file: File) {
+        if (capture.durationLimitMs == null && capture.sizeLimit == null) return
+        limitJob?.cancel()
+        limitJob = viewModelScope.launch {
+            while (true) {
+                delay(LIMIT_CHECK_MS)
+                val running = engineState.value.recording ?: break
+                val now = SystemClock.elapsedRealtime()
+                val elapsed = now - running.startedAt - running.pausedMs - (running.pausedAt?.let { now - it } ?: 0)
+                val long = capture.durationLimitMs?.let { elapsed >= it } == true
+                // The file grows in steps and its index comes last: stopped a second of data before the limit, by the larger of the file and the estimate
+                val perSecond = ((engineState.value.video?.bitrate ?: 0) + AUDIO_BITS) / 8L
+                val estimate = maxOf(file.length(), elapsed * perSecond / 1000)
+                val large = capture.sizeLimit?.let { estimate + perSecond + INDEX_BYTES >= it } == true
+                if (long || large) {
+                    application.appScope.launch { engine.stopRecording() }
+                    break
+                }
+            }
+        }
+    }
+
+    /** Review's Retake: back to the viewfinder; a video's file goes. */
+    fun retake() {
+        (_review.value as? Review.Video)?.file?.delete()
+        _review.value = null
+    }
+
+    /** Review's Use: the result for the calling app, null when it couldn't be written (the shot stays in Review). */
+    suspend fun deliver(): Intent? {
+        val capture = _entry.value as? Entry.Capture ?: return null
+        return when (val shot = _review.value) {
+            is Review.Photo -> application.captures.photoResult(shot.photo, shot.mirror, capture.output)
+            is Review.Video -> application.captures.videoResult(shot.file, capture.output)
+            null -> null
         }
     }
 
@@ -361,6 +500,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
 
     /** The shutter: a recording ends, a running countdown is cancelled, a set timer starts one, else the photo is taken or the recording started. */
     fun shutterPressed() {
+        if (_review.value != null) return
         when {
             recording -> record()
             _ui.value.countdown != null -> cancelTimer()
@@ -427,7 +567,8 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         val front = camera?.front == true
         val screenFlash = front && ui.mode == Mode.PHOTO && (ui.flash == Flash.ON || (ui.flash == Flash.AUTO && engineState.value.dark))
         val place = placeNow()
-        viewModelScope.launch {
+        // In the app's scope: a viewfinder going away right after the shutter (the lock screen's when the screen goes off) doesn't cancel the photo
+        application.appScope.launch {
             shots.withLock {
                 if (screenFlash) {
                     // The screen lit white at full brightness first – counted from when the overlay is really there – then the exposure metered for it (SPEC §7.2)
@@ -444,6 +585,12 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
                 } finally {
                     if (screenFlash) _ui.update { it.copy(screenFlash = false) }
                 } ?: return@withLock
+                // For another app: Review first, nothing saved here (SPEC §15.3)
+                if (_entry.value is Entry.Capture) {
+                    val mirror = front && ui.settings.mirror
+                    _review.value = Review.Photo(photo, mirror, application.captures.preview(photo, mirror, REVIEW_PX))
+                    return@withLock
+                }
                 val wantPlace = ui.settings.location && place == null
                 // A motion photo (LOGIKA §3.3) where the stream runs, not after the timer (its LED blinks in the video) nor with a flash (one lit frame); automatic
                 // only where the analysis can tell whether something moved
@@ -484,6 +631,8 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
      * or left to the volume. Returns true when the viewfinder took the key.
      */
     fun onVolumeKey(event: KeyEvent): Boolean {
+        // Review waits for Use or Retake: the keys do nothing (not the volume either, as the shutter they'd be taken for)
+        if (_review.value != null) return _ui.value.settings.volumeKeys != VolumeKeys.VOLUME
         when (_ui.value.settings.volumeKeys) {
             VolumeKeys.VOLUME -> return false
             VolumeKeys.SHUTTER -> {
@@ -553,5 +702,11 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         const val KEY_ZOOM_STEP = 1.1
         const val REFRESH_SETTLE_MS = 300L
         const val MOTION_AROUND_NS = 1_500_000_000L
+        const val LIMIT_CHECK_MS = 250L
+        /** The sound's bit rate and a margin for the MP4's index, for the size limit's estimate. */
+        const val AUDIO_BITS = 256_000L
+        const val INDEX_BYTES = 64_000L
+        /** Review's picture: sharp on the screen without decoding the whole photo. */
+        const val REVIEW_PX = 2048
     }
 }

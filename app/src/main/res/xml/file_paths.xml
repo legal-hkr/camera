@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- What the app hands to other apps: only the files made for it (a QR code's business card), in cache/share -->
+<!-- What the app hands to other apps: only the files made for them (a QR code's business card in cache/share, a video recorded for another app in cache/capture) -->
 <paths>
     <cache-path name="share" path="share/" />
+    <cache-path name="capture" path="capture/" />
 </paths>

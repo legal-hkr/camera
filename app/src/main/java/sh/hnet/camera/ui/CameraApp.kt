@@ -24,6 +24,7 @@ import androidx.compose.material3.SnackbarResult
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -55,14 +56,28 @@ import sh.hnet.camera.ui.settings.ResetScreen
 import sh.hnet.camera.ui.settings.SettingsRootScreen
 import sh.hnet.camera.ui.settings.VideoSettingsScreen
 import sh.hnet.camera.ui.settings.WhatsNewScreen
+import sh.hnet.camera.ui.viewfinder.Entry
 import sh.hnet.camera.ui.viewfinder.ViewfinderScreen
 import sh.hnet.camera.ui.welcome.WizardScreen
 
+/** How the app was opened: the viewfinder's way in (a shortcut, the system's camera actions), or Settings after unlocking from the lock screen. */
+data class Launch(val entry: Entry.App, val settings: Boolean = false)
+
 /** The app's shell: one back stack with the camera at its root (a camera has no navigation bar), Settings opened over it, snackbars. */
 @Composable
-fun CameraApp() {
+fun CameraApp(launch: Launch) {
     val stack = rememberNavBackStack(Screen.Camera)
     val back: () -> Unit = { if (stack.size > 1) stack.removeAt(stack.lastIndex) }
+    // A new way in: the camera it asks for in front, or Settings over it
+    // Once per launch: a recreation (a language change) keeps the pages that were open
+    var handled by rememberSaveable { mutableLongStateOf(-1L) }
+    LaunchedEffect(launch) {
+        if (launch.entry.id == handled) return@LaunchedEffect
+        handled = launch.entry.id
+        if (!launch.settings && launch.entry.start == null) return@LaunchedEffect
+        while (stack.size > 1) stack.removeAt(stack.lastIndex)
+        if (launch.settings) stack.add(Screen.Settings)
+    }
 
     val snackbars = remember { SnackbarHostState() }
     // Messages that outlive the page that started them (a restore ends on another page)
@@ -133,7 +148,7 @@ fun CameraApp() {
                     (slideOutHorizontally(spatial) { shift } + fadeOut(fastEffects))
             },
             entryProvider = entryProvider {
-                entry<Screen.Camera> { ViewfinderScreen(onOpenSettings = { stack.add(Screen.Settings) }) }
+                entry<Screen.Camera> { ViewfinderScreen(launch.entry, onOpenSettings = { stack.add(Screen.Settings) }) }
                 entry<Screen.Settings> {
                     SettingsRootScreen(
                         onBack = back,

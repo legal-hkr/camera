@@ -305,7 +305,8 @@ class PanelActions(
     val onUltraHdr: () -> Unit,
     val onMotionPhoto: (MotionPhoto) -> Unit,
     val onLocation: () -> Unit,
-    val onSettings: () -> Unit,
+    /** None for another app's shot: its Settings are the app's own business. */
+    val onSettings: (() -> Unit)?,
 )
 
 /** The quick-settings panel's content (SPEC §7.12): the mode's values, the most used lowest (nearest the thumb), Settings at the foot. */
@@ -374,10 +375,12 @@ fun QuickSettings(state: PanelState, actions: PanelActions) {
                 row { PanelSwitchRow(it, stringResource(R.string.label_panel_flashlight), state.torch) { actions.onTorch() } }
             }
         }
-        FilledTonalButton(onClick = actions.onSettings, modifier = Modifier.fillMaxWidth().height(48.dp)) {
-            Icon(painterResource(R.drawable.ic_settings), contentDescription = null, modifier = Modifier.size(ButtonDefaults.IconSize))
-            Spacer(Modifier.width(ButtonDefaults.IconSpacing))
-            Text(stringResource(R.string.button_panel_settings))
+        actions.onSettings?.let { onSettings ->
+            FilledTonalButton(onClick = onSettings, modifier = Modifier.fillMaxWidth().height(48.dp)) {
+                Icon(painterResource(R.drawable.ic_settings), contentDescription = null, modifier = Modifier.size(ButtonDefaults.IconSize))
+                Spacer(Modifier.width(ButtonDefaults.IconSpacing))
+                Text(stringResource(R.string.button_panel_settings))
+            }
         }
     }
 }

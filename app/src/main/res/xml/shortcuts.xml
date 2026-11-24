@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Static shortcuts (SPEC §15.5): the viewfinder started on the front camera, in Video, or waiting for a QR code -->
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut
+        android:shortcutId="selfie"
+        android:enabled="true"
+        android:icon="@drawable/ic_shortcut_selfie"
+        android:shortcutShortLabel="@string/label_shortcut_selfie_short"
+        android:shortcutLongLabel="@string/label_shortcut_selfie_long">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetClass="sh.hnet.camera.MainActivity"
+            android:targetPackage="sh.hnet.camera">
+            <extra
+                android:name="sh.hnet.camera.START"
+                android:value="SELFIE" />
+        </intent>
+    </shortcut>
+    <shortcut
+        android:shortcutId="video"
+        android:enabled="true"
+        android:icon="@drawable/ic_shortcut_video"
+        android:shortcutShortLabel="@string/label_shortcut_video_short"
+        android:shortcutLongLabel="@string/label_shortcut_video_long">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetClass="sh.hnet.camera.MainActivity"
+            android:targetPackage="sh.hnet.camera">
+            <extra
+                android:name="sh.hnet.camera.START"
+                android:value="VIDEO" />
+        </intent>
+    </shortcut>
+    <shortcut
+        android:shortcutId="qr"
+        android:enabled="true"
+        android:icon="@drawable/ic_shortcut_qr"
+        android:shortcutShortLabel="@string/label_shortcut_qr_short"
+        android:shortcutLongLabel="@string/label_shortcut_qr_long">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetClass="sh.hnet.camera.MainActivity"
+            android:targetPackage="sh.hnet.camera">
+            <extra
+                android:name="sh.hnet.camera.START"
+                android:value="QR" />
+        </intent>
+    </shortcut>
+</shortcuts>

@@ -21,6 +21,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.withContext
 import sh.hnet.camera.camera.MotionClip
 import sh.hnet.camera.camera.VideoTarget
@@ -120,9 +121,16 @@ class MediaFiles(private val context: Context) {
     @Volatile
     private var latest: Pair<Uri, String>? = null
 
+    /** A shot this process saved, and when (the lock screen's session shows only its own, SPEC §15.2). */
+    data class Saved(val uri: Uri, val mimeType: String, val at: Long)
+
+    private val _saved = MutableStateFlow<List<Saved>>(emptyList())
+    val saved: StateFlow<List<Saved>> = _saved.asStateFlow()
+
     /** Shows a shot just saved in the thumbnail. */
     private suspend fun show(uri: Uri, mime: String) = withContext(Dispatchers.IO) {
         latest = uri to mime
+        _saved.update { (it + Saved(uri, mime, System.currentTimeMillis())).takeLast(SAVED_KEPT) }
         val thumbnail = runCatching { resolver.loadThumbnail(uri, Size(THUMBNAIL_PX, THUMBNAIL_PX), null) }.getOrNull()
         _last.value = LastShot(uri, mime, thumbnail)
     }
@@ -198,6 +206,8 @@ class MediaFiles(private val context: Context) {
     }
 
     private companion object {
+        /** The shots of a lock-screen session: far more than one takes before unlocking. */
+        const val SAVED_KEPT = 500
         const val TAG = "MediaFiles"
         const val CAMERA_DIR = "DCIM/Camera"
         /** The thumbnail is 52 dp; this covers it at up to 3.7× density. */

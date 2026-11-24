@@ -218,4 +218,20 @@
     <string name="title_start_fresh">Zacznij od zera</string>
     <string name="desc_start_fresh">Ustawienia domyślne.</string>
     <string name="title_restore_backup">Przywróć z kopii</string>
+    <!-- Stage 1d-2: the system camera -->
+    <string name="content_description_locked">Telefon zablokowany</string>
+    <string name="label_for_app">Dla aplikacji: %1$s</string>
+    <string name="label_point_at_code">Skieruj aparat na kod</string>
+    <string name="button_retake">Powtórz</string>
+    <string name="button_use_photo">Użyj zdjęcia</string>
+    <string name="button_use_video">Użyj filmu</string>
+    <string name="content_description_play">Odtwórz</string>
+    <string name="value_playback_time">%1$s / %2$s</string>
+    <string name="msg_capture_not_saved">Nie udało się przekazać ujęcia aplikacji.</string>
+    <string name="label_shortcut_selfie_short">Selfie</string>
+    <string name="label_shortcut_selfie_long">Zrób selfie</string>
+    <string name="label_shortcut_video_short">Wideo</string>
+    <string name="label_shortcut_video_long">Nagraj film</string>
+    <string name="label_shortcut_qr_short">Kod QR</string>
+    <string name="label_shortcut_qr_long">Zeskanuj kod QR</string>
 </resources>

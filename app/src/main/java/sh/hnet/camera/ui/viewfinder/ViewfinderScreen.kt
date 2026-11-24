@@ -3,7 +3,9 @@
 package sh.hnet.camera.ui.viewfinder
 
 import android.Manifest
+import android.app.Activity
 import android.content.ActivityNotFoundException
+import android.content.ClipData
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
@@ -11,6 +13,7 @@ import android.content.pm.PackageManager
 import android.os.SystemClock
 import android.provider.MediaStore
 import android.provider.Settings
+import android.view.KeyEvent
 import android.view.OrientationEventListener
 import android.view.WindowManager
 import androidx.activity.compose.BackHandler
@@ -59,7 +62,6 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.LoadingIndicator
-import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialShapes
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
@@ -96,7 +98,6 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.rotate
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
@@ -119,6 +120,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
+import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.LifecycleStartEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -140,6 +142,7 @@ import sh.hnet.camera.capabilities.model.Orientation
 import sh.hnet.camera.capabilities.model.Point
 import sh.hnet.camera.capabilities.model.SessionLadder
 import sh.hnet.camera.media.LastShot
+import sh.hnet.camera.media.MediaFiles
 import sh.hnet.camera.ui.components.EmptyState
 
 /** The exposure ruler closes this long after the last touch (SPEC §5.3). */
@@ -154,9 +157,20 @@ private const val EV_RANGE = 2.0
  * exposure, photos with the thumbnail.
  */
 @Composable
-fun ViewfinderScreen(onOpenSettings: () -> Unit, viewModel: ViewfinderViewModel = viewModel()) {
+fun ViewfinderScreen(
+    entry: Entry,
+    onOpenSettings: (() -> Unit)?,
+    onCancel: (() -> Unit)? = null,
+    onResult: ((Intent) -> Unit)? = null,
+    viewModel: ViewfinderViewModel = viewModel(),
+) {
     val context = LocalContext.current
     val activity = LocalActivity.current
+    // Told before anything below starts the camera, so the first session is the way in's (a selfie opens on the front camera)
+    remember(entry) {
+        viewModel.enter(entry)
+        entry
+    }
     var granted by remember { mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) }
     // Asked by itself only once ever (not again after the wizard: a second refusal would be for good); Allow always asks, and the system's settings take over
     // only when the system has just refused without its dialog
@@ -179,15 +193,18 @@ fun ViewfinderScreen(onOpenSettings: () -> Unit, viewModel: ViewfinderViewModel 
         NoCameraAccess(
             permanentlyDenied = permanentlyDenied,
             onAllow = {
-                if (permanentlyDenied) FirstRun.openAppSettings(context)
-                else launcher.launch(Manifest.permission.CAMERA)
+                // Over the lock screen the system's dialog waits for the phone to be unlocked
+                unlockThen(activity, entry.locked) {
+                    if (permanentlyDenied) FirstRun.openAppSettings(context)
+                    else launcher.launch(Manifest.permission.CAMERA)
+                }
             },
             onOpenSettings = onOpenSettings,
         )
-        LaunchedEffect(Unit) { if (!asked) launcher.launch(Manifest.permission.CAMERA) }
+        LaunchedEffect(Unit) { if (!asked && !entry.locked) launcher.launch(Manifest.permission.CAMERA) }
         return
     }
-    Viewfinder(viewModel, onOpenSettings)
+    Viewfinder(viewModel, entry, onOpenSettings, onCancel, onResult)
 }
 
 /** While the viewfinder is shown: no status bar (a swipe brings it for a moment), the display's HDR headroom for the preview, the screen kept on. */
@@ -211,7 +228,7 @@ private fun ViewfinderWindow() {
 }
 
 @Composable
-private fun Viewfinder(viewModel: ViewfinderViewModel, onOpenSettings: () -> Unit) {
+private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSettings: (() -> Unit)?, onCancel: (() -> Unit)?, onResult: ((Intent) -> Unit)?) {
     val context = LocalContext.current
     val haptics = rememberHaptics()
     val numbers = rememberNumbers()
@@ -262,9 +279,11 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, onOpenSettings: () -> Uni
     // Back while recording ends it and saves, during a countdown cancels it; a second Back leaves (SPEC §3)
     BackHandler(enabled = recording != null || ui.countdown != null) { if (!viewModel.cancelTimer()) viewModel.record() }
     // The volume keys go to the viewfinder while it is shown (SPEC §7.9)
-    DisposableEffect(viewModel) {
-        HardwareKeys.handler = { viewModel.onVolumeKey(it) }
-        onDispose { HardwareKeys.handler = null }
+    // Only while this viewfinder is in front, and cleared only when still its own (another activity's may have taken over)
+    val keys = remember(viewModel) { { event: KeyEvent -> viewModel.onVolumeKey(event) } }
+    LifecycleResumeEffect(keys) {
+        HardwareKeys.handler = keys
+        onPauseOrDispose { if (HardwareKeys.handler === keys) HardwareKeys.handler = null }
     }
     LaunchedEffect(Unit) { viewModel.countdownTick.collect { haptics.mode() } }
     val turn = controlTurn(ui.rotation)
@@ -288,7 +307,8 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, onOpenSettings: () -> Uni
         micRefused = false
     }
     LaunchedEffect(ui.mode) {
-        if (ui.mode == Mode.VIDEO && !micGranted && !micAsked) {
+        // Not over the lock screen: the system's dialog would wait for the phone to be unlocked
+        if (ui.mode == Mode.VIDEO && !micGranted && !micAsked && !entry.locked) {
             micAsked = true
             micLauncher.launch(Manifest.permission.RECORD_AUDIO)
         }
@@ -314,19 +334,25 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, onOpenSettings: () -> Uni
         when {
             ui.settings.location -> viewModel.setLocation(false)
             viewModel.location.allowed() -> viewModel.setLocation(true)
-            else -> locationLauncher.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION))
+            else -> unlockThen(activity, entry.locked) { locationLauncher.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)) }
         }
     }
+    val review by viewModel.review.collectAsStateWithLifecycle()
+    val capture = entry as? Entry.Capture
+    // Back in Review is Retake (SPEC §15.3)
+    BackHandler(enabled = review != null) { viewModel.retake() }
 
     val colors = MaterialTheme.colorScheme
     val problem = engine.status.takeIf { it is CameraStatus.Busy || it is CameraStatus.Blocked || it is CameraStatus.Error }
-    val modes = listOf(Mode.PHOTO, Mode.VIDEO)
+    // For another app only the mode it asked for (SPEC §15.3)
+    val modes = if (capture != null) listOf(ui.mode) else listOf(Mode.PHOTO, Mode.VIDEO)
     val stepsPerThird = camera?.let { (1.0 / 3 / it.exposureStep).roundToInt().coerceAtLeast(1) } ?: 1
     val ev = (camera?.exposureStep ?: 0.0) * ui.exposure
 
     // The QR code found in the analysis stream, only while the session has one
     val found by viewModel.analyzer.qr.collectAsStateWithLifecycle()
     val qr = found.takeIf { engine.analysis }
+    LaunchedEffect(qr != null) { if (qr != null) viewModel.clearPointAtCode() }
     var qrSheet by remember { mutableStateOf<QrContent?>(null) }
     val noApp = stringResource(R.string.msg_no_browser)
 
@@ -504,27 +530,26 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, onOpenSettings: () -> Uni
         // The recording's time, centred under the cutout
         // In line with the top row, in its free middle
         if (recording != null) RecordingTime(recording, Modifier.align(Alignment.TopCenter).padding(top = status + 10.dp))
-        // Indicators at the picture's top-start: a motion photo's video still recording (SPEC §7.6)
-        if (ui.motionWaiting > 0) {
-            IndicatorChip(
-                R.drawable.ic_motion_photos_on,
-                stringResource(R.string.label_motion),
-                Modifier.align(Alignment.TopStart).padding(start = 12.dp, top = status + maxOf(52.dp, pictureTop) + 8.dp),
-                solid = true,
-            ) {}
-        }
-        // No sound in Video
+        // Indicators at the picture's top-start, one under another (SPEC §4.4): over the lock screen, for another app, a motion photo's video still
+        // recording (SPEC §7.6), no sound in Video
         val noSound = ui.mode == Mode.VIDEO && problem == null && (!micGranted || recording?.silenced == true)
-        if (noSound) {
-            IndicatorChip(
-                R.drawable.ic_mic_off,
-                stringResource(R.string.label_no_sound),
-                Modifier.align(Alignment.TopStart).padding(start = 12.dp, top = status + maxOf(52.dp, pictureTop) + 8.dp),
-            ) {
-                if (!micGranted) {
-                    if (micRefused) FirstRun.openAppSettings(context) else micLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        Column(
+            Modifier.align(Alignment.TopStart).padding(start = 12.dp, top = status + maxOf(52.dp, pictureTop) + 8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            if (entry.locked) IndicatorChip(R.drawable.ic_lock, null, description = stringResource(R.string.content_description_locked)) {}
+            capture?.caller?.let { IndicatorChip(R.drawable.ic_apps, stringResource(R.string.label_for_app, it)) {} }
+            if (ui.motionWaiting > 0) IndicatorChip(R.drawable.ic_motion_photos_on, stringResource(R.string.label_motion), solid = true) {}
+            if (noSound) {
+                IndicatorChip(R.drawable.ic_mic_off, stringResource(R.string.label_no_sound)) {
+                    if (!micGranted) {
+                        unlockThen(activity, entry.locked) {
+                            if (micRefused) FirstRun.openAppSettings(context) else micLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                        }
+                    } else {
+                        scope.launch { snackbars.showSnackbar(micBusy, duration = SnackbarDuration.Short) }
+                    }
                 }
-                else scope.launch { snackbars.showSnackbar(micBusy, duration = SnackbarDuration.Short) }
             }
         }
         // Snackbars 8 dp above the suggestion slot (SPEC §14.2)
@@ -541,6 +566,8 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, onOpenSettings: () -> Uni
                 ui.locked && !exposureOpen -> SuggestionChip(R.drawable.ic_lock, stringResource(R.string.label_ae_af_locked), onDismiss = { viewModel.unlock() })
                 // A QR code: its domain, network or first words; a tap opens what it holds (SPEC §7.10)
                 qr != null && !exposureOpen -> SuggestionChip(qrIcon(qr.content), qrChipText(qr.content), onDismiss = null, onClick = { qrSheet = qr.content })
+                // From the QR code shortcut, until a code is found (SPEC §15.5)
+                ui.pointAtCode && ui.mode == Mode.PHOTO && !exposureOpen -> SuggestionChip(R.drawable.ic_qr_code_scanner, stringResource(R.string.label_point_at_code), onDismiss = { viewModel.clearPointAtCode() })
             }
         }
         // The exposure ruler above the zoom row, in the suggestion slot's place
@@ -579,11 +606,19 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, onOpenSettings: () -> Uni
                 RowButton(if (paused) R.drawable.ic_play_arrow else R.drawable.ic_pause, stringResource(if (paused) R.string.tooltip_resume else R.string.tooltip_pause), turn, Modifier.align(Alignment.CenterStart).padding(start = 34.dp)) {
                     if (paused) viewModel.resumeRecording() else viewModel.pauseRecording()
                 }
-                if (engine.video != null && engine.range != null) {
+                // Not for another app: such a photo would land in the gallery
+                if (engine.video != null && engine.range != null && capture == null) {
                     RowButton(R.drawable.ic_photo_camera, stringResource(R.string.tooltip_photo_while_recording), turn, Modifier.align(Alignment.CenterEnd).padding(end = 34.dp)) { viewModel.shoot() }
                 }
             } else {
-                Thumbnail(last, turn, Modifier.align(Alignment.CenterStart).padding(start = 34.dp))
+                // For another app Cancel takes the thumbnail's place (SPEC §15.3); over the lock screen the thumbnail shows this session's shots
+                if (capture != null) {
+                    RowButton(R.drawable.ic_close, stringResource(R.string.button_cancel), turn, Modifier.align(Alignment.CenterStart).padding(start = 34.dp)) { onCancel?.invoke() }
+                } else {
+                    Thumbnail(last, turn, Modifier.align(Alignment.CenterStart).padding(start = 34.dp)) { shot ->
+                        if (entry.locked) reviewSecure(context, activity, viewModel.sessionShots(), shot) else openInGallery(context, shot)
+                    }
+                }
                 if (viewModel.cameras.size > 1) SwitchCameraButton(turn, onClick = { viewModel.switchCamera() }, modifier = Modifier.align(Alignment.CenterEnd).padding(end = 34.dp))
             }
             val video = ui.mode == Mode.VIDEO
@@ -649,6 +684,27 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, onOpenSettings: () -> Uni
 
     if (ui.screenFlash) ScreenFlash(viewModel::onScreenLit)
 
+    review?.let { shot ->
+        val notHanded = stringResource(R.string.msg_capture_not_saved)
+        // Use once: a second tap while the file is written would hand it over twice
+        var delivering by remember(shot) { mutableStateOf(false) }
+        ReviewScreen(
+            shot,
+            onRetake = { if (!delivering) viewModel.retake() },
+            onUse = {
+                if (!delivering) {
+                    delivering = true
+                    scope.launch {
+                        val result = viewModel.deliver()
+                        if (result != null) onResult?.invoke(result) else explain(notHanded)
+                        delivering = false
+                    }
+                }
+            },
+            snackbars = snackbars,
+        )
+    }
+
     if (quickSettings && camera != null) {
         val settings = ui.settings
         ModalBottomSheet(onDismissRequest = { quickSettings = false }, containerColor = colors.surfaceContainerLow) {
@@ -700,9 +756,11 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, onOpenSettings: () -> Uni
                     onUhd = { viewModel.setVideoSize(it) },
                     onFps = { viewModel.setVideoFps(it) },
                     onTorch = viewModel::toggleTorch,
-                    onSettings = {
-                        quickSettings = false
-                        onOpenSettings()
+                    onSettings = onOpenSettings?.let { open ->
+                        {
+                            quickSettings = false
+                            open()
+                        }
                     },
                 ),
             )
@@ -748,8 +806,7 @@ private fun ExposureRuler(steps: Int, stepEv: Double, stepsPerThird: Int, limits
 
 /** The thumbnail of the newest own shot (SPEC §8.1); a tap hands it to the gallery with the rest to swipe through. */
 @Composable
-private fun Thumbnail(last: LastShot?, turn: Float, modifier: Modifier) {
-    val context = LocalContext.current
+private fun Thumbnail(last: LastShot?, turn: Float, modifier: Modifier, onOpen: (LastShot) -> Unit) {
     val colors = MaterialTheme.colorScheme
     val label = stringResource(R.string.tooltip_last_shot)
     // The alignment goes on a box of our own: TooltipBox doesn't pass it to the row
@@ -765,7 +822,7 @@ private fun Thumbnail(last: LastShot?, turn: Float, modifier: Modifier) {
                     .size(52.dp)
                     .clip(RoundedCornerShape(12.dp))
                     .background(colors.surfaceContainerHigh)
-                    .clickable(enabled = last != null, role = Role.Button) { last?.let { openInGallery(context, it) } }
+                    .clickable(enabled = last != null, role = Role.Button) { last?.let(onOpen) }
                     .semantics { contentDescription = label },
             ) {
                 val bitmap = last?.thumbnail
@@ -773,6 +830,22 @@ private fun Thumbnail(last: LastShot?, turn: Float, modifier: Modifier) {
                 else Icon(painterResource(R.drawable.ic_photo_library), contentDescription = null, tint = IconButtonDefaults.iconButtonColors().disabledContentColor, modifier = Modifier.rotate(turn))
             }
         }
+    }
+}
+
+/**
+ * Over the lock screen (SPEC §15.2, LOGIKA §7): `ACTION_REVIEW_SECURE` with this session's shots only, the newest first; a gallery that can't show them over
+ * the lock screen gets them after the phone is unlocked.
+ */
+private fun reviewSecure(context: Context, activity: Activity?, shots: List<MediaFiles.Saved>, newest: LastShot) {
+    val uris = shots.map { it.uri }.ifEmpty { listOf(newest.uri) }
+    val intent = Intent(MediaStore.ACTION_REVIEW_SECURE).setDataAndType(newest.uri, newest.mimeType).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION).apply {
+        clipData = ClipData.newRawUri("", uris.first()).apply { uris.drop(1).forEach { addItem(ClipData.Item(it)) } }
+    }
+    try {
+        context.startActivity(intent)
+    } catch (_: ActivityNotFoundException) {
+        unlockThen(activity, true) { openInGallery(context, newest) }
     }
 }
 
@@ -868,7 +941,7 @@ private fun CameraProblem(status: CameraStatus, onRetry: () -> Unit, modifier: M
 
 /** Without camera access the viewfinder shows only this (SPEC §16): the app's mark, why, the way to allow it, and Settings. */
 @Composable
-private fun NoCameraAccess(permanentlyDenied: Boolean, onAllow: () -> Unit, onOpenSettings: () -> Unit) {
+private fun NoCameraAccess(permanentlyDenied: Boolean, onAllow: () -> Unit, onOpenSettings: (() -> Unit)?) {
     Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface).windowInsetsPadding(WindowInsets.navigationBars)) {
         EmptyState(
             R.drawable.ic_launcher_monochrome,
@@ -881,7 +954,7 @@ private fun NoCameraAccess(permanentlyDenied: Boolean, onAllow: () -> Unit, onOp
                 Text(stringResource(if (permanentlyDenied) R.string.button_open_app_settings else R.string.button_allow_access), textAlign = TextAlign.Center)
             }
         }
-        TextButton(onClick = onOpenSettings, modifier = Modifier.align(Alignment.CenterHorizontally).padding(bottom = 16.dp)) {
+        if (onOpenSettings != null) TextButton(onClick = onOpenSettings, modifier = Modifier.align(Alignment.CenterHorizontally).padding(bottom = 16.dp)) {
             Text(stringResource(R.string.button_settings))
         }
     }
@@ -936,28 +1009,33 @@ private fun RecordingTime(recording: Recording, modifier: Modifier) {
 }
 
 /** A length as "0:42", "12:05" or "1:02:03". */
-private fun duration(seconds: Long): String {
+internal fun duration(seconds: Long): String {
     val h = seconds / 3600
     val m = seconds / 60 % 60
     val s = seconds % 60
     return if (h > 0) "%d:%02d:%02d".format(Locale.ROOT, h, m, s) else "%d:%02d".format(Locale.ROOT, m, s)
 }
 
-/** An indicator chip (SPEC §4.4): 28 dp of finder glass with an icon and a short label; a tap explains it. */
+/** An indicator chip (SPEC §4.4): 28 dp, solid, with an icon and a short label (or the icon alone, [description] for the screen reader); a tap explains it. */
 @Composable
-private fun IndicatorChip(icon: Int, label: String, modifier: Modifier, solid: Boolean = false, onClick: () -> Unit) {
+private fun IndicatorChip(icon: Int, label: String?, modifier: Modifier = Modifier, description: String? = null, solid: Boolean = false, onClick: () -> Unit) {
     val colors = MaterialTheme.colorScheme
     Box(
         modifier
             .height(28.dp)
             .controlSurface(CircleShape, if (solid) colors.secondaryContainer else controlColor())
-            .clickable(role = Role.Button, onClick = onClick),
+            .clickable(role = Role.Button, onClick = onClick)
+            .semantics { description?.let { contentDescription = it } },
         contentAlignment = Alignment.Center,
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(horizontal = 10.dp)) {
-            Icon(painterResource(icon), contentDescription = null, tint = if (solid) colors.onSecondaryContainer else LocalContentColor.current, modifier = Modifier.size(16.dp))
-            Spacer(Modifier.width(4.dp))
-            Text(label, style = MaterialTheme.typography.labelMedium, color = if (solid) colors.onSecondaryContainer else Color.Unspecified)
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(horizontal = if (label == null) 6.dp else 10.dp)) {
+            // The content color of the chip's own container: the screen's default (black) would vanish on it
+            val content = if (solid) colors.onSecondaryContainer else colors.onSurface
+            Icon(painterResource(icon), contentDescription = null, tint = content, modifier = Modifier.size(16.dp))
+            if (label != null) {
+                Spacer(Modifier.width(4.dp))
+                Text(label, style = MaterialTheme.typography.labelMedium, color = content, maxLines = 1)
+            }
         }
     }
 }

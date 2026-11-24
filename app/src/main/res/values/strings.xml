@@ -219,4 +219,20 @@
     <string name="title_start_fresh">Start fresh</string>
     <string name="desc_start_fresh">Default settings.</string>
     <string name="title_restore_backup">Restore from a backup</string>
+    <!-- Stage 1d-2: the system camera -->
+    <string name="content_description_locked">Phone locked</string>
+    <string name="label_for_app">For app: %1$s</string>
+    <string name="label_point_at_code">Point the camera at the code</string>
+    <string name="button_retake">Retake</string>
+    <string name="button_use_photo">Use photo</string>
+    <string name="button_use_video">Use video</string>
+    <string name="content_description_play">Play</string>
+    <string name="value_playback_time">%1$s / %2$s</string>
+    <string name="msg_capture_not_saved">The shot couldn’t be handed over to the app.</string>
+    <string name="label_shortcut_selfie_short">Selfie</string>
+    <string name="label_shortcut_selfie_long">Take a selfie</string>
+    <string name="label_shortcut_video_short">Video</string>
+    <string name="label_shortcut_video_long">Record a video</string>
+    <string name="label_shortcut_qr_short">QR code</string>
+    <string name="label_shortcut_qr_long">Scan a QR code</string>
 </resources>

@@ -244,7 +244,19 @@ class CameraEngine(context: Context) {
     }
 
     /** The viewfinder is shown. Coming back also tries again a camera that was busy, blocked or failed. */
-    fun start() = scope.launch {
+    /** The viewfinders that want the camera (two activities may hand over in either order): it runs while there is one. */
+    private val owners = mutableSetOf<Any>()
+
+    fun start(owner: Any) {
+        synchronized(owners) { owners += owner }
+        scope.launch {
+            // Stopped again meanwhile
+            if (synchronized(owners) { owners.isEmpty() }) return@launch
+            open()
+        }
+    }
+
+    private fun open() {
         val status = _state.value.status
         if (status == CameraStatus.Busy || status == CameraStatus.Blocked || (status is CameraStatus.Error && status.failed)) {
             attempts = 0
@@ -253,7 +265,13 @@ class CameraEngine(context: Context) {
         desired.update { it.copy(started = true) }
     }
 
-    fun stop() = desired.update { it.copy(started = false) }
+    fun stop(owner: Any) {
+        val none = synchronized(owners) {
+            owners -= owner
+            owners.isEmpty()
+        }
+        if (none) desired.update { it.copy(started = false) }
+    }
 
     fun configure(request: CameraRequest) = desired.update { if (it.request == request) it else it.copy(request = request) }
 
