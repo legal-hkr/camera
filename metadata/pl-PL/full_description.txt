@@ -1,0 +1,27 @@
+Aparat robi zdjęcia i filmy w najlepszej jakości, na jaką pozwala sprzęt telefonu, i przechowuje je wyłącznie w telefonie. Nie ma uprawnienia dostępu do Internetu: pliki trafiają do folderu DCIM/Camera, gdzie znajdzie je każda galeria, i nic poza nimi nie opuszcza aplikacji.
+
+Zdjęcia:
+- Ultra HDR w pełnej domyślnej rozdzielczości każdej kamery, bez opóźnienia migawki
+- Zdjęcia ruchome (wyłączone, automatyczne albo włączone) w standardowym formacie Google
+- Proporcje 4:3, 16:9 i 1:1, lampa z regulacją mocy, błysk ekranu przy selfie i opcjonalnie selfie jak w lustrze
+- Samowyzwalacz 3 albo 10 s, opcjonalnie z odliczaniem diodą lampy
+- Ostrość i pomiar światła po dotknięciu, blokada ekspozycji i ostrości po przytrzymaniu, korekta ekspozycji, wykrywanie twarzy
+
+Filmy:
+- 4K i 1080p przy 24, 30 albo 60 kl./s, HDR (HLG) do 30 kl./s, kodek HEVC albo AVC
+- Dźwięk stereo, wstrzymywanie i wznawianie, zdjęcia w trakcie nagrywania, latarka
+
+Zoom:
+- Tylko obiektywy telefonu: ultraszerokokątny pod osobnym przyciskiem i płynny zoom z wyczuwalnymi przystankami na pozostałych
+- Informacja, gdy telefon sam przełącza się na makro
+
+A także:
+- Kody QR rozpoznawane w telefonie: linki, sieci Wi-Fi do połączenia i wizytówki do dodania do kontaktów
+- Uruchamianie na ekranie blokady dwukrotnym naciśnięciem przycisku zasilania; widoczne są wtedy tylko ujęcia z tej sesji
+- Zdjęcia i filmy dla innych aplikacji, z przeglądem przed przekazaniem
+- Skróty Selfie, Wideo i Kod QR
+- Siatka, poziomica i przyciski głośności jako spust albo zoom
+- Przy przegrzaniu, połączeniu i braku miejsca nagrywanie jest zatrzymywane, a film zapisywany; przy rozładowanej baterii lampa jest wyłączona
+- Kopia zapasowa ustawień w wybranym pliku
+- Język polski lub angielski, niezależnie od języka systemu
+- Wygląd Material 3 Expressive w kolorach systemu

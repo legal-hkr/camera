@@ -1,0 +1,10 @@
+v0.1.0
+
+Pierwsza wersja:
+- Zdjęcia Ultra HDR bez opóźnienia migawki, zdjęcia ruchome, 4:3, 16:9 i 1:1
+- Filmy 4K i 1080p do 60 kl./s, HDR (HLG) do 30 kl./s
+- Zoom z użyciem obiektywów telefonu, z automatycznym makro
+- Lampa, błysk ekranu przy selfie, samowyzwalacz, siatka i poziomica
+- Kody QR z linkami, sieciami Wi-Fi i wizytówkami
+- Działanie na ekranie blokady, dla innych aplikacji i ze skrótów
+- Bez dostępu do Internetu

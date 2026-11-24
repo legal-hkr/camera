@@ -1,4 +1,10 @@
 v0.1.0
 
-In development:
-- The app’s frame and the first settings pages
+First version:
+- Ultra HDR photos with zero shutter lag, motion photos, 4:3, 16:9 and 1:1
+- 4K and 1080p video up to 60 fps, HLG HDR up to 30 fps
+- Zoom using the phone’s own lenses, with automatic macro
+- Flash, screen flash for selfies, timer, grid and level
+- QR codes with links, Wi-Fi networks and business cards
+- Works over the lock screen, for other apps and from shortcuts
+- No Internet permission

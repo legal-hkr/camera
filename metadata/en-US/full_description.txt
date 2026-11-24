@@ -1,0 +1,27 @@
+Camera takes photos and videos at the best quality your phone’s hardware allows, and keeps them only on the phone. It has no Internet permission: files are saved to the DCIM/Camera folder, where any gallery app can find them, and nothing else leaves the app.
+
+Photos:
+- Ultra HDR at each camera’s full default resolution, with zero shutter lag
+- Motion photos (off, auto or on), in Google’s standard format
+- 4:3, 16:9 and 1:1 aspect ratios, flash with adjustable strength, a screen flash for selfies, and optional mirrored selfies
+- A 3- or 10-second timer, optionally counted down with the flash LED
+- Tap to focus and meter, touch and hold to lock exposure and focus, exposure compensation, face detection
+
+Video:
+- 4K and 1080p at 24, 30 or 60 fps, HLG HDR up to 30 fps, HEVC or AVC
+- Stereo sound, pause and resume, photos while recording, the flashlight
+
+Zoom:
+- Only the phone’s own lenses: a separate button for the ultrawide, and smooth zoom with haptic stops at the other lenses
+- A note when the phone switches to its automatic macro mode
+
+And also:
+- QR codes recognized on the phone: links, Wi-Fi networks to join and business cards to add to your contacts
+- Opens over the lock screen with a double press of the power button, showing only the shots from that session
+- Photos and videos for other apps, with a review before they are handed over
+- Selfie, Video and QR code shortcuts
+- Grid, level, and the volume keys as the shutter or zoom
+- If the phone overheats, a call comes in or storage fills up, recording stops and the video is saved; a low battery turns the flash off
+- Backup and restore of settings to a file you choose
+- English or Polish, independent of the system language
+- Material 3 Expressive design with your phone’s colors
