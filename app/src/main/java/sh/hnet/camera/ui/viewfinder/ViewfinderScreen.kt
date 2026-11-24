@@ -62,6 +62,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.LoadingIndicator
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialShapes
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
@@ -80,6 +81,7 @@ import androidx.compose.material3.lightColorScheme
 import androidx.compose.material3.rememberTooltipState
 import androidx.compose.material3.toShape
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -163,6 +165,21 @@ fun ViewfinderScreen(
     onCancel: (() -> Unit)? = null,
     onResult: ((Intent) -> Unit)? = null,
     viewModel: ViewfinderViewModel = viewModel(),
+) {
+    // The content color of the viewfinder's surface for everything on it: the lock screen's camera and another app's shot have no app shell (its Scaffold)
+    // that would provide it, and the default is black
+    CompositionLocalProvider(LocalContentColor provides MaterialTheme.colorScheme.onSurface) {
+        ViewfinderContent(entry, onOpenSettings, onCancel, onResult, viewModel)
+    }
+}
+
+@Composable
+private fun ViewfinderContent(
+    entry: Entry,
+    onOpenSettings: (() -> Unit)?,
+    onCancel: (() -> Unit)?,
+    onResult: ((Intent) -> Unit)?,
+    viewModel: ViewfinderViewModel,
 ) {
     val context = LocalContext.current
     val activity = LocalActivity.current
