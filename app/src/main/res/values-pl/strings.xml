@@ -36,7 +36,7 @@
         <item quantity="other">Wersja %1$s, %2$d zmiany</item>
     </plurals>
     <string name="whats_new_updated_snackbar">Zaktualizowano do wersji %1$s</string>
-    <!-- Stage 1a: viewfinder -->
+    <!-- The viewfinder -->
     <string name="label_mode_photo">Zdjęcie</string>
     <string name="label_mode_video">Wideo</string>
     <string name="tooltip_quick_settings">Szybkie ustawienia</string>
@@ -61,7 +61,7 @@
     <string name="title_camera_failed">Aparat nie działa</string>
     <string name="desc_camera_failed">Uruchom ponownie aparat albo telefon.</string>
     <string name="button_restart_camera">Uruchom ponownie</string>
-    <!-- Stage 1b: video -->
+    <!-- Video -->
     <string name="tooltip_flashlight">Latarka</string>
     <string name="tooltip_pause">Wstrzymaj</string>
     <string name="tooltip_resume">Wznów</string>
@@ -70,7 +70,7 @@
     <string name="content_description_recording">Nagrywanie</string>
     <string name="label_no_sound">Bez dźwięku</string>
     <string name="msg_mic_busy">Mikrofon jest używany przez inną aplikację. Film zostanie nagrany bez dźwięku.</string>
-    <!-- Stage 1c-1: common controls -->
+    <!-- Common controls -->
     <string name="tooltip_flash">Lampa błyskowa</string>
     <string name="tooltip_timer">Samowyzwalacz</string>
     <string name="tooltip_location">Lokalizacja</string>
@@ -114,7 +114,7 @@
     <string name="content_description_shutter_cancel_timer">Anuluj samowyzwalacz</string>
     <string name="label_panel_location">Lokalizacja</string>
     <string name="label_panel_ultra_hdr">Ultra HDR</string>
-    <!-- Stage 1c-2: QR codes -->
+    <!-- QR codes -->
     <string name="label_qr_wifi">Wi-Fi: %1$s</string>
     <string name="title_qr_code">Kod QR</string>
     <string name="title_qr_wifi">Sieć Wi-Fi</string>
@@ -132,7 +132,7 @@
     <string name="button_add_contact">Dodaj do kontaktów</string>
     <string name="msg_no_contacts_app">Brak aplikacji do zapisania kontaktu.</string>
     <string name="label_macro">Makro</string>
-    <!-- Stage 1c-2b: motion photos -->
+    <!-- Motion photos -->
     <string name="tooltip_motion_photo">Zdjęcie ruchome</string>
     <string name="desc_state_motion_off">Zdjęcie ruchome – wyłączone</string>
     <string name="desc_state_motion_auto">Zdjęcie ruchome – automatycznie</string>
@@ -142,7 +142,7 @@
     <string name="menu_motion_on">Włączone</string>
     <string name="label_panel_motion_photo">Zdjęcie ruchome</string>
     <string name="label_motion">Ruch</string>
-    <!-- Stage 1d-1: Settings and the first run -->
+    <!-- Settings and the first run -->
     <string name="title_settings_group_camera">Aparat</string>
     <string name="title_settings_photos">Zdjęcia</string>
     <string name="desc_settings_photos">Zdjęcie ruchome, kody QR, lokalizacja</string>
@@ -218,7 +218,7 @@
     <string name="title_start_fresh">Zacznij od zera</string>
     <string name="desc_start_fresh">Ustawienia domyślne.</string>
     <string name="title_restore_backup">Przywróć z kopii</string>
-    <!-- Stage 1d-2: the system camera -->
+    <!-- The system camera -->
     <string name="content_description_locked">Telefon zablokowany</string>
     <string name="label_for_app">Dla aplikacji: %1$s</string>
     <string name="label_point_at_code">Skieruj aparat na kod</string>
@@ -234,7 +234,7 @@
     <string name="label_shortcut_video_long">Nagraj film</string>
     <string name="label_shortcut_qr_short">Kod QR</string>
     <string name="label_shortcut_qr_long">Zeskanuj kod QR</string>
-    <!-- Stage 1d-3: the phone's states -->
+    <!-- The phone's states -->
     <string name="label_phone_hot">Telefon jest gorący</string>
     <string name="label_battery_level">%1$d%%</string>
     <string name="label_minutes_left">%1$d min</string>

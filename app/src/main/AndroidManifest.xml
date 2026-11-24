@@ -2,11 +2,11 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- Privacy: each permission comes with the stage that needs it and is listed in CLAUDE.md. Stage 1a: the camera. -->
+    <!-- Privacy: only what the app needs. The camera. -->
     <uses-permission android:name="android.permission.CAMERA" />
-    <!-- Stage 1b: sound in videos (asked on the first entry into Video) -->
+    <!-- Sound in videos (asked on the first entry into Video) -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
-    <!-- Stage 1c: the place in photos and videos, asked for when turned on; the coarse one is declared next to the fine one (Android 12+), the user may allow only it -->
+    <!-- The place in photos and videos, asked for when turned on; the coarse one is declared next to the fine one (Android 12+), the user may allow only it -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
 

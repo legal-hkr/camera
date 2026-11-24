@@ -167,7 +167,7 @@ private const val IDLE_MS = 120_000L
 
 /**
  * The viewfinder (SPEC §4): built from the bottom up – the mode row above the navigation bar, the shutter row, the zoom row lying over the bottom of the preview
- * canvas – with the picture centred in the canvas in the shot's aspect ratio and `surface` around it. Stage 1a: Photo and Video's preview, zoom, focus and
+ * canvas – with the picture centred in the canvas in the shot's aspect ratio and `surface` around it: Photo and Video's preview, zoom, focus and
  * exposure, photos with the thumbnail.
  */
 @Composable
@@ -1049,7 +1049,7 @@ private fun SolidChip(text: String, primary: Boolean) {
     }
 }
 
-/** What keeps the camera from showing a picture, in the picture's place (SPEC §14; the full set of states comes with stage 1d). */
+/** What keeps the camera from showing a picture, in the picture's place (SPEC §14). */
 @Composable
 private fun CameraProblem(status: CameraStatus, onRetry: () -> Unit, modifier: Modifier) {
     val colors = MaterialTheme.colorScheme

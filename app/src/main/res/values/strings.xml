@@ -37,7 +37,7 @@
         <item quantity="other">Version %1$s, %2$d changes</item>
     </plurals>
     <string name="whats_new_updated_snackbar">Updated to %1$s</string>
-    <!-- Stage 1a: viewfinder -->
+    <!-- The viewfinder -->
     <string name="label_mode_photo">Photo</string>
     <string name="label_mode_video">Video</string>
     <string name="tooltip_quick_settings">Quick settings</string>
@@ -62,7 +62,7 @@
     <string name="title_camera_failed">The camera isn’t working</string>
     <string name="desc_camera_failed">Restart the camera or the phone.</string>
     <string name="button_restart_camera">Restart</string>
-    <!-- Stage 1b: video -->
+    <!-- Video -->
     <string name="tooltip_flashlight">Flashlight</string>
     <string name="tooltip_pause">Pause</string>
     <string name="tooltip_resume">Resume</string>
@@ -71,7 +71,7 @@
     <string name="content_description_recording">Recording</string>
     <string name="label_no_sound">No sound</string>
     <string name="msg_mic_busy">Another app is using the microphone. The video will be recorded without sound.</string>
-    <!-- Stage 1c-1: common controls -->
+    <!-- Common controls -->
     <string name="tooltip_flash">Flash</string>
     <string name="tooltip_timer">Timer</string>
     <string name="tooltip_location">Location in photos</string>
@@ -115,7 +115,7 @@
     <string name="content_description_shutter_cancel_timer">Cancel timer</string>
     <string name="label_panel_location">Location in photos</string>
     <string name="label_panel_ultra_hdr">Ultra HDR</string>
-    <!-- Stage 1c-2: QR codes -->
+    <!-- QR codes -->
     <string name="label_qr_wifi">Wi-Fi: %1$s</string>
     <string name="title_qr_code">QR code</string>
     <string name="title_qr_wifi">Wi-Fi network</string>
@@ -133,7 +133,7 @@
     <string name="button_add_contact">Add to contacts</string>
     <string name="msg_no_contacts_app">No app to save contacts.</string>
     <string name="label_macro">Macro</string>
-    <!-- Stage 1c-2b: motion photos -->
+    <!-- Motion photos -->
     <string name="tooltip_motion_photo">Motion photo</string>
     <string name="desc_state_motion_off">Motion photo – off</string>
     <string name="desc_state_motion_auto">Motion photo – auto</string>
@@ -143,7 +143,7 @@
     <string name="menu_motion_on">On</string>
     <string name="label_panel_motion_photo">Motion photo</string>
     <string name="label_motion">Motion</string>
-    <!-- Stage 1d-1: Settings and the first run -->
+    <!-- Settings and the first run -->
     <string name="title_settings_group_camera">Camera</string>
     <string name="title_settings_photos">Photos</string>
     <string name="desc_settings_photos">Motion photo, QR codes, location</string>
@@ -219,7 +219,7 @@
     <string name="title_start_fresh">Start fresh</string>
     <string name="desc_start_fresh">Default settings.</string>
     <string name="title_restore_backup">Restore from a backup</string>
-    <!-- Stage 1d-2: the system camera -->
+    <!-- The system camera -->
     <string name="content_description_locked">Phone locked</string>
     <string name="label_for_app">For app: %1$s</string>
     <string name="label_point_at_code">Point the camera at the code</string>
@@ -235,7 +235,7 @@
     <string name="label_shortcut_video_long">Record a video</string>
     <string name="label_shortcut_qr_short">QR code</string>
     <string name="label_shortcut_qr_long">Scan a QR code</string>
-    <!-- Stage 1d-3: the phone's states -->
+    <!-- The phone's states -->
     <string name="label_phone_hot">The phone is hot</string>
     <string name="label_battery_level">%1$d%%</string>
     <string name="label_minutes_left">%1$d min</string>

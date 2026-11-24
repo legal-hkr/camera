@@ -51,7 +51,7 @@ import sh.hnet.camera.capabilities.model.Point
 private const val FOCUS_FADE_AFTER_MS = 2_000L
 
 /**
- * FinderMarks of stage 1a (SPEC §5.5) in the picture's box: the focus point with the exposure value next to it and the lock under it, and the face the camera
+ * FinderMarks (SPEC §5.5) in the picture's box: the focus point with the exposure value next to it and the lock under it, and the face the camera
  * focuses on. Lines are double strokes – a core in one role inside an outline in the opposite one – so they read on any picture in both themes (SPEC §4.9).
  */
 @Composable

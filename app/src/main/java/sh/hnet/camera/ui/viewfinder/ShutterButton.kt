@@ -33,7 +33,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import sh.hnet.camera.R
 
-/** The shutter's looks of stage 1 so far (SPEC §5.1); burst, timer and long shot come with their stages. */
+/** The shutter's looks (SPEC §5.1); burst and long shot come with their modes. */
 enum class ShutterLook { PHOTO, VIDEO, RECORDING, TIMER }
 
 /**
