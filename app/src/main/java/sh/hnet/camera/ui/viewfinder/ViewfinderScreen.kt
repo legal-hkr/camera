@@ -94,6 +94,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -101,6 +102,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -131,6 +133,7 @@ import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.roundToInt
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import sh.hnet.camera.FirstRun
 import sh.hnet.camera.Grid
@@ -158,6 +161,9 @@ private const val EXPOSURE_RULER_MS = 3_000L
 
 /** Exposure compensation shown and set in thirds of a stop, ±2 EV (SPEC §7.1). */
 private const val EV_RANGE = 2.0
+
+/** Without use the viewfinder lets the screen sleep after this (the system's own timeout follows). */
+private const val IDLE_MS = 120_000L
 
 /**
  * The viewfinder (SPEC §4): built from the bottom up – the mode row above the navigation bar, the shutter row, the zoom row lying over the bottom of the preview
@@ -232,16 +238,17 @@ private fun ViewfinderContent(
 
 /** While the viewfinder is shown: no status bar (a swipe brings it for a moment), the display's HDR headroom for the preview, the screen kept on. */
 @Composable
-private fun ViewfinderWindow() {
+private fun ViewfinderWindow(keepOn: Boolean) {
     val activity = LocalActivity.current ?: return
     val view = LocalView.current
+    // The screen held on only while the viewfinder is in use (see [Viewfinder]); let go, the system's own timeout turns it off
+    LaunchedEffect(keepOn) { view.keepScreenOn = keepOn }
     DisposableEffect(activity) {
         val window = activity.window
         val controller = WindowCompat.getInsetsController(window, view)
         controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         controller.hide(WindowInsetsCompat.Type.statusBars())
         window.colorMode = ActivityInfo.COLOR_MODE_HDR
-        view.keepScreenOn = true
         onDispose {
             controller.show(WindowInsetsCompat.Type.statusBars())
             window.colorMode = ActivityInfo.COLOR_MODE_DEFAULT
@@ -252,13 +259,37 @@ private fun ViewfinderWindow() {
 
 @Composable
 private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSettings: (() -> Unit)?, onCancel: (() -> Unit)?, onResult: ((Intent) -> Unit)?) {
-    // The screen kept on and HDR only while there is a viewfinder (not over the no-access screen)
-    ViewfinderWindow()
     val context = LocalContext.current
     val haptics = rememberHaptics()
     val numbers = rememberNumbers()
     val ui by viewModel.ui.collectAsStateWithLifecycle()
     val engine by viewModel.engineState.collectAsStateWithLifecycle()
+    // The screen stays on while the viewfinder is used: a touch, a volume key or any change of its state or settings counts (not how the phone is held:
+    // carried in a hand with the camera open, it still goes to sleep); a recording, a countdown, a motion photo's video and Review hold it all the time.
+    // Two minutes after the last use the hold ends and the system's own timeout takes over (owner, 24 Nov 2026)
+    var usedAt by remember { mutableLongStateOf(SystemClock.uptimeMillis()) }
+    val used = { usedAt = SystemClock.uptimeMillis() }
+    val reviewing by viewModel.review.collectAsStateWithLifecycle()
+    val busy = engine.recording != null || ui.countdown != null || ui.motionWaiting > 0 || reviewing != null
+    var keepOn by remember { mutableStateOf(true) }
+    // A tapped focus that ends because the phone turned isn't use either
+    LaunchedEffect(ui.copy(rotation = 0, focus = null), busy) { used() }
+    // Back in front (the screen on again, back from another app): a use, so the hold starts over
+    LifecycleEventEffect(Lifecycle.Event.ON_START) { used() }
+    // The time of the last use read in the effect only: a touch mustn't recompose the whole viewfinder
+    LaunchedEffect(busy) {
+        if (busy) {
+            keepOn = true
+            return@LaunchedEffect
+        }
+        snapshotFlow { usedAt }.collectLatest {
+            keepOn = true
+            delay(IDLE_MS)
+            keepOn = false
+        }
+    }
+    // The screen kept on and HDR only while there is a viewfinder (not over the no-access screen)
+    ViewfinderWindow(keepOn)
     val last by viewModel.lastShot.collectAsStateWithLifecycle()
     val camera = viewModel.camera
     val request = viewModel.request()
@@ -307,7 +338,12 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
     BackHandler(enabled = recording != null || ui.countdown != null) { if (!viewModel.cancelTimer()) viewModel.record() }
     // The volume keys go to the viewfinder while it is shown (SPEC §7.9)
     // Only while this viewfinder is in front, and cleared only when still its own (another activity's may have taken over)
-    val keys = remember(viewModel) { { event: KeyEvent -> viewModel.onVolumeKey(event) } }
+    val keys = remember(viewModel) {
+        { event: KeyEvent ->
+            used()
+            viewModel.onVolumeKey(event)
+        }
+    }
     LifecycleResumeEffect(keys) {
         HardwareKeys.handler = keys
         onPauseOrDispose { if (HardwareKeys.handler === keys) HardwareKeys.handler = null }
@@ -417,7 +453,20 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
     var qrSheet by remember { mutableStateOf<QrContent?>(null) }
     val noApp = stringResource(R.string.msg_no_browser)
 
-    BoxWithConstraints(Modifier.fillMaxSize().background(colors.surface)) {
+    BoxWithConstraints(
+        Modifier
+            .fillMaxSize()
+            .background(colors.surface)
+            // Every touch anywhere on the viewfinder counts as use, seen before the controls take it
+            .pointerInput(Unit) {
+                awaitPointerEventScope {
+                    while (true) {
+                        awaitPointerEvent(PointerEventPass.Initial)
+                        used()
+                    }
+                }
+            },
+    ) {
         val nav = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
         val modeBottom = nav + 2.dp
         val shutterBottom = modeBottom + 36.dp + 14.dp
