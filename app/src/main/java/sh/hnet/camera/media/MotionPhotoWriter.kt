@@ -5,7 +5,8 @@ import java.io.ByteArrayOutputStream
 /**
  * Google's motion photo format (LOGIKA §3.3, a general standard any gallery reads): the short MP4 appended after everything the JPEG holds (an Ultra HDR photo's
  * gain map included), and the photo's XMP saying so – `GCamera:MotionPhoto`, its version, the still's time in the video, and a `MotionPhoto` item with the
- * video's length in the `Container:Directory`, next to the items already there (Primary, GainMap). Pure, so it is tested without Android.
+ * video's length in the `Container:Directory`, next to the items already there (Primary, GainMap). Also Google's burst marks in the same XMP. Pure, so it is
+ * tested without Android.
  */
 object MotionPhotoWriter {
     private const val XMP_ID = "http://ns.adobe.com/xap/1.0/\u0000"
@@ -19,17 +20,34 @@ object MotionPhotoWriter {
     private class Segment(val start: Int, val length: Int, val marker: Int)
 
     /** The photo with [video] appended; [presentationUs] is the still's time in the video. Returns null when the bytes aren't a JPEG it can read. */
-    fun write(jpeg: ByteArray, video: ByteArray, presentationUs: Long): ByteArray? = runCatching { compose(jpeg, video, presentationUs) }.getOrNull()
+    fun write(jpeg: ByteArray, video: ByteArray, presentationUs: Long): ByteArray? = runCatching {
+        // A gain map described only by MPF (no XMP directory) would sit between the photo and the video without an item: no motion photo then
+        rewrite(jpeg, video, needsDirectory = true) { xml -> if (xml != null) addTo(xml, video.size, presentationUs) else fresh(video.size, presentationUs) }
+    }.getOrNull()
 
-    private fun compose(jpeg: ByteArray, video: ByteArray, presentationUs: Long): ByteArray? {
+    /**
+     * A frame of a burst marked as Google's camera marks it (LOGIKA §18, D12): `GCamera:BurstID`, the same for every frame of one burst, and
+     * `GCamera:BurstPrimary` on the cover. Galleries that know it group the frames; the others show plain photos. Null when the bytes aren't a JPEG it can read.
+     */
+    fun markBurst(jpeg: ByteArray, burstId: String, primary: Boolean): ByteArray? = runCatching {
+        val attributes = buildString {
+            append("GCamera:BurstID=\"$burstId\"")
+            if (primary) append(" GCamera:BurstPrimary=\"1\"")
+        }
+        rewrite(jpeg, null, needsDirectory = false) { xml -> if (xml != null) addAttributes(xml, attributes) else plain(attributes) }
+    }.getOrNull()
+
+    /**
+     * The JPEG with its XMP replaced by [newXml] of the old one (null: there was none), the MPF offsets moved as the header grows, and [tail] appended.
+     * [needsDirectory]: a JPEG with MPF but no XMP is refused (what follows the primary image can't be named without the XMP's directory).
+     */
+    private fun rewrite(jpeg: ByteArray, tail: ByteArray?, needsDirectory: Boolean, newXml: (String?) -> String): ByteArray? {
         val segments = segments(jpeg) ?: return null
         val xmp = segments.firstOrNull { it.marker == 0xE1 && startsWith(jpeg, it.start + 4, XMP_ID) }
         val mpf = segments.firstOrNull { it.marker == 0xE2 && startsWith(jpeg, it.start + 4, MPF_ID) }
-        // A gain map described only by MPF (no XMP directory) would sit between the photo and the video without an item: no motion photo then
-        if (xmp == null && mpf != null) return null
+        if (needsDirectory && xmp == null && mpf != null) return null
         val xml = if (xmp != null) String(jpeg, xmp.start + 4 + XMP_ID.length, xmp.length - 4 - XMP_ID.length, Charsets.UTF_8) else null
-        val newXml = if (xml != null) addTo(xml, video.size, presentationUs) else fresh(video.size, presentationUs)
-        val segment = xmpSegment(newXml) ?: return null
+        val segment = xmpSegment(newXml(xml)) ?: return null
         // The new or grown XMP goes where the old one was, else after APP0 (JFIF) and the EXIF block
         val at = xmp?.start ?: segments.filter { it.marker == 0xE0 || (it.marker == 0xE1 && !startsWith(jpeg, it.start + 4, XMP_ID)) }.maxOfOrNull { it.start + it.length } ?: 2
         val removed = xmp?.length ?: 0
@@ -37,11 +55,11 @@ object MotionPhotoWriter {
         val out = jpeg.copyOf()
         // MPF's offsets count from its own header: only a change before the images and after the MPF block moves them
         if (mpf != null && mpf.start < at && delta != 0) shiftMpf(out, mpf, delta)
-        val bytes = ByteArrayOutputStream(out.size + delta + video.size)
+        val bytes = ByteArrayOutputStream(out.size + delta + (tail?.size ?: 0))
         bytes.write(out, 0, at)
         bytes.write(segment)
         bytes.write(out, at + removed, out.size - at - removed)
-        bytes.write(video)
+        tail?.let { bytes.write(it) }
         return bytes.toByteArray()
     }
 
@@ -78,6 +96,18 @@ object MotionPhotoWriter {
 
     /** An XMP of its own for a photo that had none (a plain JPEG): the primary image and the video. */
     private fun fresh(length: Int, presentationUs: Long) = """<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="$RDF"><rdf:Description rdf:about="" xmlns:GCamera="$GCAMERA" xmlns:Container="$CONTAINER" xmlns:Item="$ITEM" ${attributes(presentationUs)}><Container:Directory><rdf:Seq><rdf:li rdf:parseType="Resource"><Container:Item Item:Mime="image/jpeg" Item:Semantic="Primary" Item:Length="0" Item:Padding="0"/></rdf:li>${item(length)}</rdf:Seq></Container:Directory></rdf:Description></rdf:RDF></x:xmpmeta>"""
+
+    /** An XMP of its own with only [attributes] on its description (a plain JPEG's burst frame). */
+    private fun plain(attributes: String) = """<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="$RDF"><rdf:Description rdf:about="" xmlns:GCamera="$GCAMERA" $attributes/></rdf:RDF></x:xmpmeta>"""
+
+    /** The camera's XMP with GCamera [attributes] added to its first `rdf:Description` (and the namespace where it is missing). */
+    internal fun addAttributes(xml: String, attributes: String): String {
+        val open = Regex("<rdf:Description\\b[^>]*?(/?)>").find(xml) ?: return plain(attributes)
+        val selfClosing = open.groupValues[1] == "/"
+        val tag = open.value.removeSuffix("/>").removeSuffix(">")
+        val namespace = if ("xmlns:GCamera=" !in xml) " xmlns:GCamera=\"$GCAMERA\"" else ""
+        return xml.replaceRange(open.range, "$tag$namespace $attributes${if (selfClosing) "/>" else ">"}")
+    }
 
     /**
      * The camera's XMP with the motion photo added: the GCamera attributes and namespaces on the first `rdf:Description`, the video's item at the end of the

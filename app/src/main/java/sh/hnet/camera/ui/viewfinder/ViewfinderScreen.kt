@@ -88,6 +88,7 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.Stable
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
@@ -287,7 +288,12 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
     var usedAt by remember { mutableLongStateOf(SystemClock.uptimeMillis()) }
     val used = { usedAt = SystemClock.uptimeMillis() }
     val reviewing by viewModel.review.collectAsStateWithLifecycle()
-    val busy = engine.recording != null || ui.countdown != null || ui.motionWaiting > 0 || reviewing != null || ui.nightGathering || ui.processing > 0
+    // A burst's count and its frames being saved change many times a second: read as states where they are shown, here only whether there are any
+    val burstCount = viewModel.burstCount.collectAsStateWithLifecycle()
+    val burstsSaving = viewModel.burstsSaving.collectAsStateWithLifecycle()
+    val bursting by remember { derivedStateOf { burstCount.value != null } }
+    val saving by remember { derivedStateOf { burstsSaving.value > 0 } }
+    val busy = engine.recording != null || ui.countdown != null || ui.motionWaiting > 0 || reviewing != null || ui.nightGathering || ui.processing > 0 || bursting || saving
     var keepOn by remember { mutableStateOf(true) }
     // A tapped focus that ends because the phone turned isn't use either
     LaunchedEffect(ui.copy(rotation = 0, focus = null), busy) { used() }
@@ -349,6 +355,8 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
     }
     LaunchedEffect(ui.focus) { if (ui.focus == null) exposureOpen = false }
 
+    // A burst's tick every ten frames, a stronger one at its last possible frame (LOGIKA §18)
+    LaunchedEffect(Unit) { viewModel.burstTick.collect { last -> if (last) haptics.end() else haptics.step() } }
     val blink = remember { Animatable(0f) }
     LaunchedEffect(Unit) {
         viewModel.shutter.collect {
@@ -825,7 +833,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                 if (capture != null) {
                     RowButton(R.drawable.ic_close, stringResource(R.string.button_cancel), turn, Modifier.align(Alignment.CenterStart).padding(start = 34.dp)) { onCancel?.invoke() }
                 } else {
-                    Thumbnail(last, turn, ui.processing, ui.nightProgress, Modifier.align(Alignment.CenterStart).padding(start = 34.dp)) { shot ->
+                    Thumbnail(last, turn, { ui.processing + burstsSaving.value }, ui.nightProgress, Modifier.align(Alignment.CenterStart).padding(start = 34.dp)) { shot ->
                         if (entry.locked) reviewSecure(context, activity, viewModel.sessionShots(), shot) else openInGallery(context, shot)
                     }
                 }
@@ -835,6 +843,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
             val counting = ui.countdown != null
             ShutterButton(
                 look = when {
+                    bursting -> ShutterLook.BURST
                     counting -> ShutterLook.TIMER
                     ui.nightGathering -> ShutterLook.NIGHT
                     recording != null -> ShutterLook.RECORDING
@@ -853,12 +862,16 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                 enabled = engine.status == CameraStatus.Ready && (!video || (engine.video != null && !engine.finishing)) && (!phone.storageFull || recording != null) && !ui.nightGathering && engine.request?.let { it.mode == ui.mode && it.camera.id == camera?.id } == true,
                 progress = if (ui.nightGathering) ui.gatherProgress else ui.countdown?.let { 1f - it.toFloat() / ui.timer.coerceAtLeast(1) },
                 turn = turn,
+                count = { burstCount.value },
                 onClick = {
                     if (video && !counting && ui.timer == 0) {
                         if (recording != null) haptics.photo() else haptics.lock()
                     }
                     viewModel.shutterPressed()
                 },
+                // Held in Photo from the app, without the timer: a burst (LOGIKA §18)
+                onHold = if (ui.mode == Mode.PHOTO && capture == null && ui.timer == 0 && !counting) ({ viewModel.shutterHeld() }) else null,
+                onRelease = viewModel::shutterReleased,
                 modifier = Modifier.align(Alignment.Center),
             )
         }
@@ -1031,7 +1044,7 @@ private fun ExposureRuler(steps: Int, stepEv: Double, stepsPerThird: Int, limits
 
 /** The thumbnail of the newest own shot (SPEC §8.1); a tap hands it to the gallery with the rest to swipe through. */
 @Composable
-private fun Thumbnail(last: LastShot?, turn: Float, processing: Int, progress: Float?, modifier: Modifier, onOpen: (LastShot) -> Unit) {
+private fun Thumbnail(last: LastShot?, turn: Float, processing: () -> Int, progress: Float?, modifier: Modifier, onOpen: (LastShot) -> Unit) {
     val colors = MaterialTheme.colorScheme
     val label = stringResource(R.string.tooltip_last_shot)
     // The alignment goes on a box of our own: TooltipBox doesn't pass it to the row
@@ -1055,8 +1068,21 @@ private fun Thumbnail(last: LastShot?, turn: Float, processing: Int, progress: F
                 else Icon(painterResource(R.drawable.ic_photo_library), contentDescription = null, tint = IconButtonDefaults.iconButtonColors().disabledContentColor, modifier = Modifier.rotate(turn))
             }
         }
+        // The cover of a burst: how many frames it has, at the bottom-end corner (LOGIKA §18)
+        val frames = last?.burst ?: 0
+        if (frames > 1) {
+            Row(
+                Modifier.align(Alignment.BottomEnd).offset(x = 8.dp, y = 6.dp).background(colors.secondaryContainer, CircleShape).padding(horizontal = 5.dp, vertical = 1.dp).rotate(turn),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                Icon(painterResource(R.drawable.ic_burst_mode), contentDescription = null, tint = colors.onSecondaryContainer, modifier = Modifier.size(12.dp))
+                Text("$frames", color = colors.onSecondaryContainer, style = MaterialTheme.typography.labelSmall)
+            }
+        }
         // Photos still being put together (SPEC §8.2): the newest one's progress at the top-end corner, how many at the top-start
-        if (processing > 0) {
+        val waiting = processing()
+        if (waiting > 0) {
             Box(
                 Modifier.align(Alignment.TopEnd).offset(x = 8.dp, y = (-8).dp).size(26.dp).background(colors.surfaceContainerHigh, CircleShape),
                 contentAlignment = Alignment.Center,
@@ -1065,7 +1091,7 @@ private fun Thumbnail(last: LastShot?, turn: Float, processing: Int, progress: F
                 if (value != null) CircularWavyProgressIndicator(progress = { value }, modifier = Modifier.size(20.dp))
                 else CircularWavyProgressIndicator(modifier = Modifier.size(20.dp))
             }
-            Badge(Modifier.align(Alignment.TopStart).offset(x = (-6).dp, y = (-6).dp), containerColor = colors.primary, contentColor = colors.onPrimary) { Text("$processing") }
+            Badge(Modifier.align(Alignment.TopStart).offset(x = (-6).dp, y = (-6).dp), containerColor = colors.primary, contentColor = colors.onPrimary) { Text("$waiting") }
         }
     }
 }

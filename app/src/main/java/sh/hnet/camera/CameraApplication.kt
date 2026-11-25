@@ -6,6 +6,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import sh.hnet.camera.backup.BackupManager
 import sh.hnet.camera.camera.CameraEngine
+import sh.hnet.camera.media.BurstSaver
 import sh.hnet.camera.media.CaptureOutput
 import sh.hnet.camera.media.MediaFiles
 
@@ -21,6 +22,7 @@ class CameraApplication : Application() {
     val media: MediaFiles by lazy { MediaFiles(this) }
 
     val captures: CaptureOutput by lazy { CaptureOutput(this) }
+    val bursts: BurstSaver by lazy { BurstSaver(this, media, appScope) }
 
     /** The Night suggestion closed: hidden until the app starts again (SPEC §9.1). */
     @Volatile
@@ -32,5 +34,6 @@ class CameraApplication : Application() {
         super.onCreate()
         // Only when the process starts: no recording of this process can be pending then
         appScope.launch { media.removeAbandoned() }
+        appScope.launch { bursts.resume() }
     }
 }

@@ -97,4 +97,41 @@ class MotionPhotoWriterTest {
     @Test fun notAJpeg() {
         assertNull(MotionPhotoWriter.write("nope".toByteArray(), video, 0))
     }
+
+    @Test fun burstCoverOfUltraHdr() {
+        val photo = jpeg(segment(0xE1, "Exif\u0000\u0000xx".toByteArray()), xmp(ultraHdrXmp), mpf(1000))
+        val out = MotionPhotoWriter.markBurst(photo, "1234-abcd", primary = true)!!
+        val text = String(out, Charsets.ISO_8859_1)
+        assertTrue("GCamera:BurstID=\"1234-abcd\"" in text)
+        assertTrue("GCamera:BurstPrimary=\"1\"" in text)
+        assertTrue("xmlns:GCamera=" in text)
+        // The gain map's directory and the data after the image stay
+        assertTrue("Item:Semantic=\"GainMap\"" in text)
+        assertTrue(text.endsWith("GAINMAP"))
+        assertEquals(1000, mpfOffset(out))
+    }
+
+    @Test fun burstFrameOfPlainJpegWithMpf() {
+        // A plain JPEG gets an XMP of its own (no directory needed for a burst frame); it goes right after SOI here, before the MPF, whose offsets stay
+        val photo = jpeg(mpf(1000))
+        val out = MotionPhotoWriter.markBurst(photo, "id", primary = false)!!
+        val text = String(out, Charsets.ISO_8859_1)
+        assertTrue("GCamera:BurstID=\"id\"" in text)
+        assertTrue("BurstPrimary" !in text)
+        assertEquals(1000, mpfOffset(out))
+        assertNull(MotionPhotoWriter.markBurst("nope".toByteArray(), "id", primary = false))
+    }
+
+    @Test fun burstXmpAfterMpfShiftsIt() {
+        // The XMP goes after APP0 and the EXIF block; an MPF before that point moves by the XMP's length
+        val photo = jpeg(segment(0xE0, "JFIF\u0000".toByteArray()), mpf(1000), segment(0xE1, "Exif\u0000\u0000xx".toByteArray()))
+        val out = MotionPhotoWriter.markBurst(photo, "id", primary = true)!!
+        val grown = out.size - photo.size
+        assertTrue(grown > 0)
+        assertEquals(1000 + grown, mpfOffset(out))
+    }
+
+    @Test fun motionPhotoRefusesMpfWithoutXmp() {
+        assertNull(MotionPhotoWriter.write(jpeg(mpf(1000)), video, 0))
+    }
 }

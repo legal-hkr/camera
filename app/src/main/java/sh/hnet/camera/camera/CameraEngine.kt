@@ -54,6 +54,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.android.asCoroutineDispatcher
 import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.ReceiveChannel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -147,6 +148,15 @@ data class Controls(
 
 /** A Night photo on its way: its frames gathered (true) or not, the extension's progress (0–100) while it puts the photo together, and the photo. */
 class NightShot(val gathered: Deferred<Boolean>, val photo: Deferred<CapturedPhoto?>, val progress: StateFlow<Int>)
+
+/** A burst's frames: at most this many (LOGIKA §18), about 5 to 10 s. */
+const val MAX_BURST = 150
+
+/** A burst's frame as the camera gave it: the JPEG (Ultra HDR or plain, turned by its EXIF) and its sensor time. */
+class BurstFrame(val bytes: ByteArray, val sensorTimeNs: Long)
+
+/** A burst under way (LOGIKA §18): its frames as they come (the channel ends with the burst) and the crop each needs for the aspect. */
+class BurstShot(val frames: ReceiveChannel<BurstFrame>, val crop: PixelSize?)
 
 /** A still as it came from the camera, with the crop the app still has to make for its aspect ratio. */
 class CapturedPhoto(
@@ -379,6 +389,8 @@ class CameraEngine(context: Context) {
         // A session being built (a mode, a setting, the end of a countdown that put it off) is waited for, not taken as none; before the still is counted
         // as in flight, which the session's close would wait for
         awaitSession()
+        // Not during a burst: the two would take each other's stills
+        if (bursting != null) return@withContext null
         val done = CompletableDeferred<Unit>()
         capture = done
         try {
@@ -451,9 +463,9 @@ class CameraEngine(context: Context) {
             }
         }, handler)
         val image = withTimeoutOrNull(STILL_TIMEOUT_MS) {
-            var found: Image? = null
+            var found: StillImage? = null
             while (found == null) {
-                val next = select<Image?> {
+                val next = select<StillImage?> {
                     output.images.onReceiveCatching { it.getOrNull() }
                     failed.onAwait { null }
                 } ?: break
@@ -464,6 +476,146 @@ class CameraEngine(context: Context) {
         } ?: return null
         val bytes = image.use { it.compressedBytes() }
         return CapturedPhoto(bytes, output.format, cropFor(output.plan.capture, request), takenAt, if (startedAt != 0L) startedAt else image.timestamp, motionSource, orientation)
+    }
+
+    /** The burst under way: its stills' orientation and place, and the stop (touched on the camera thread only). */
+    private class Bursting(val orientation: Int, val location: Location?, val done: CompletableDeferred<Unit>) {
+        var stopping = false
+        /** Wakes the frames' collector, which may be waiting for a still that won't come any more. */
+        val stopped = CompletableDeferred<Unit>()
+
+        fun stop() {
+            stopping = true
+            stopped.complete(Unit)
+        }
+    }
+
+    private var bursting: Bursting? = null
+
+    /**
+     * Starts a burst in Photo (LOGIKA §18, D14, D15): stills at the session's format as fast as the camera gives them, the live picture going on – next to an
+     * HLG preview their requests alternate with the preview's (one request may not hold both: about 15 + 15 fps on the Pixel), next to an SDR one each preview
+     * request takes a still too (up to 30 fps for JPEG). No flash, no buffer (ZSL), no motion photo. The frames come until [stopBurst] or [MAX_BURST]; the
+     * consumer's pace holds the camera back rather than memory growing. Null when there is no Photo session.
+     */
+    suspend fun startBurst(deviceRotation: Int, location: Location?): BurstShot? = withContext(dispatcher) {
+        awaitSession()
+        if (session == null || bursting != null || capture != null) return@withContext null
+        // Stills from before the burst (a single photo's late one) are older than the newest frame seen
+        val after = latestFrameNs
+        val output = still ?: return@withContext null
+        val request = desired.value.request?.takeIf { it.mode == Mode.PHOTO } ?: return@withContext null
+        val done = CompletableDeferred<Unit>()
+        capture = done
+        val state = Bursting(Orientation.jpeg(request.camera.sensorOrientation, deviceRotation, request.camera.front), location, done)
+        bursting = state
+        output.drain()
+        val frames = Channel<BurstFrame>(BURST_HANDOFF)
+        if (!repeatBurst()) {
+            endBurst(state, frames)
+            return@withContext null
+        }
+        scope.launch {
+            var count = 0
+            try {
+                while (count < MAX_BURST) {
+                    // After the stop only the stills already in flight still come; the stop wakes a wait for one that won't
+                    val image = if (state.stopping) {
+                        withTimeoutOrNull(BURST_TAIL_MS) { output.images.receiveCatching().getOrNull() } ?: break
+                    } else {
+                        val (stopped, next) = select<Pair<Boolean, StillImage?>> {
+                            output.images.onReceiveCatching { false to it.getOrNull() }
+                            state.stopped.onAwait { true to null }
+                        }
+                        if (stopped) continue
+                        next ?: break
+                    }
+                    if (image.timestamp <= after) {
+                        image.close()
+                        continue
+                    }
+                    val frame = image.use { BurstFrame(it.compressedBytes(), it.timestamp) }
+                    frames.send(frame)
+                    count++
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "Burst ended: ${e.javaClass.simpleName}")
+            } finally {
+                endBurst(state, frames)
+            }
+        }
+        BurstShot(frames, cropFor(output.plan.capture, request))
+    }
+
+    /** Ends the burst: no more stills asked for; those already in flight still come. */
+    fun stopBurst() = scope.launch { bursting?.let(::stopAsking) }
+
+    /** No more stills asked for: the plain preview again. */
+    private fun stopAsking(state: Bursting) {
+        if (state.stopping) return
+        state.stop()
+        repeat()
+    }
+
+    private fun endBurst(state: Bursting, frames: Channel<BurstFrame>) {
+        if (bursting === state) {
+            // Ended by itself (the last frame): the plain preview again
+            stopAsking(state)
+            bursting = null
+        }
+        frames.close()
+        state.done.complete(Unit)
+        if (capture === state.done) capture = null
+    }
+
+    /** The burst's repeating requests with the current controls (a zoom or a tap during the burst asks again); false when the session refused them. */
+    private fun repeatBurst(): Boolean {
+        val state = bursting ?: return false
+        val session = session ?: return false
+        val device = device ?: return false
+        val surface = previewSurface ?: return false
+        val output = still ?: return false
+        val request = desired.value.request ?: return false
+        return try {
+            fun stillControls(builder: CaptureRequest.Builder) {
+                applyControls(builder, request)
+                // No flash in a burst; no frame from the buffer either
+                builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
+                if (request.camera.flash) builder.set(CaptureRequest.FLASH_MODE, CameraMetadata.FLASH_MODE_OFF)
+                if (request.camera.zsl) builder.set(CaptureRequest.CONTROL_ENABLE_ZSL, false)
+                builder.set(CaptureRequest.JPEG_ORIENTATION, state.orientation)
+                builder.set(CaptureRequest.JPEG_QUALITY, JPEG_QUALITY)
+                state.location?.let { builder.set(CaptureRequest.JPEG_GPS_LOCATION, it) }
+            }
+            if (_state.value.range == PictureRange.HLG) {
+                // The HLG preview and a still of the standard profile can't share a request: they alternate
+                val preview = device.createCaptureRequest(template(request))
+                preview.addTarget(surface)
+                addRecordingTarget(preview)
+                applyControls(preview, request)
+                // The same exposure mode as the stills between them: no flash metering in a burst
+                preview.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
+                if (request.camera.flash) preview.set(CaptureRequest.FLASH_MODE, CameraMetadata.FLASH_MODE_OFF)
+                val stillRequest = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+                stillRequest.addTarget(output.reader.surface)
+                stillControls(stillRequest)
+                session.setRepeatingBurst(listOf(preview.build(), stillRequest.build()), results, handler)
+            } else {
+                // One profile: every preview frame is a still too (the still template, as measured: 30 fps for JPEG)
+                val both = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+                both.addTarget(surface)
+                addRecordingTarget(both)
+                both.addTarget(output.reader.surface)
+                stillControls(both)
+                session.setRepeatingRequest(both.build(), results, handler)
+            }
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "Burst refused: ${e.javaClass.simpleName}")
+            false
+        }
     }
 
     private suspend fun reconcile(want: Desired) {
@@ -518,6 +670,8 @@ class CameraEngine(context: Context) {
 
     /** A still in flight finishes before its session goes (at most the still's timeout), a motion photo's video gets its 1.5 s after the shot, and a recording is ended and saved. */
     private suspend fun awaitCapture() {
+        // A burst ends at once when its session must go; its frames in flight still come (the wait for `capture` below)
+        bursting?.let(::stopAsking)
         capture?.let { inFlight -> withTimeoutOrNull(STILL_TIMEOUT_MS) { inFlight.await() } }
         if (clipping.get() > 0) withTimeoutOrNull(CLIP_WAIT_MS) { while (clipping.get() > 0) delay(SETTLE_POLL_MS) }
         // Night photos the extension is still putting together: the session stays until they are out
@@ -860,6 +1014,11 @@ class CameraEngine(context: Context) {
             repeatNight(it)
             return
         }
+        // A burst asks for its own requests with the new controls (not once it is stopping); refused, it ends
+        bursting?.takeIf { !it.stopping }?.let { state ->
+            if (repeatBurst()) return
+            state.stop()
+        }
         val session = session ?: return
         val device = device ?: return
         val surface = previewSurface ?: return
@@ -1024,7 +1183,11 @@ class CameraEngine(context: Context) {
         return log2(aperture * aperture / (time / 1e9)) - log2(gain / 100) + compensation
     }
 
+    /** The sensor time of the newest frame the session reported (camera thread). */
+    private var latestFrameNs = 0L
+
     private fun onResult(result: TotalCaptureResult) {
+        result.get(CaptureResult.SENSOR_TIMESTAMP)?.let { latestFrameNs = maxOf(latestFrameNs, it) }
         run {
             val request = desired.value.request ?: return
             val afState = result.get(CaptureResult.CONTROL_AF_STATE)
@@ -1305,9 +1468,9 @@ class CameraEngine(context: Context) {
         val photo = scope.async {
             try {
                 val image = withTimeoutOrNull(NIGHT_TIMEOUT_MS) {
-                    var found: Image? = null
+                    var found: StillImage? = null
                     while (found == null) {
-                        val next = select<Image?> {
+                        val next = select<StillImage?> {
                             output.images.onReceiveCatching { it.getOrNull() }
                             failed.onAwait { null }
                         } ?: break
@@ -1355,6 +1518,8 @@ class CameraEngine(context: Context) {
     private fun closeSession() {
         // No picture any more: the viewfinder covers until the next session's first frame (a stale "shown" let a frozen frame go over nothing)
         if ((session != null || nightSession != null) && _state.value.frameShown) _state.update { it.copy(frameShown = false) }
+        // A burst of this session asks for nothing more (a new session's repeat() must not ask for it)
+        bursting?.stop()
         lockJob?.cancel()
         // The prepared encoder goes at once (the next session's may need the hardware); the surface goes when the session has closed
         recorder?.retire()
@@ -1381,16 +1546,52 @@ class CameraEngine(context: Context) {
     }
 
     /** The still's reader and the images it delivers. */
+    /** A still taken from the reader; closing it gives its buffer back and lets the reader hand on the next one waiting. */
+    private class StillImage(private val image: Image, private val released: () -> Unit) : AutoCloseable {
+        private var closed = false
+        val timestamp: Long get() = image.timestamp
+
+        fun compressedBytes() = image.compressedBytes()
+
+        override fun close() {
+            if (closed) return
+            closed = true
+            image.close()
+            released()
+        }
+    }
+
     private inner class StillOutput(val plan: StillPlan, val format: StillFormat, imageFormat: Int) {
         val reader: ImageReader = ImageReader.Builder(plan.capture.width, plan.capture.height).setImageFormat(imageFormat).setMaxImages(STILL_BUFFERS).build()
-        val images = Channel<Image>(Channel.UNLIMITED)
+        // An image the channel can't hand on any more (closed, a receive cancelled) is closed, its buffer back
+        val images = Channel<StillImage>(Channel.UNLIMITED, onUndeliveredElement = { it.close() })
         private var closed = false
+        /** Images taken from the reader and not closed yet (on the camera thread). */
+        private var held = 0
 
         init {
-            // An image beyond maxImages is dropped instead of crashing the callback thread
-            reader.setOnImageAvailableListener({ r -> runCatching { r.acquireNextImage() }.getOrNull()?.let { if (images.trySend(it).isFailure) it.close() } }, handler)
+            reader.setOnImageAvailableListener({ pull() }, handler)
         }
 
+        /**
+         * Takes every image waiting, as far as the reader's buffers allow: past the limit an acquire fails and its image's one callback is spent, so a frame
+         * left in the queue then would only come with the next one's callback – every later still a frame behind (a burst's end left stills like that).
+         */
+        private fun pull() {
+            while (!closed && held < STILL_BUFFERS) {
+                val image = runCatching { reader.acquireNextImage() }.getOrNull() ?: return
+                held++
+                val still = StillImage(image) {
+                    handler.post {
+                        held--
+                        pull()
+                    }
+                }
+                if (images.trySend(still).isFailure) still.close()
+            }
+        }
+
+        /** Closes the stills waiting (the ones still queued in the reader come after, older than what is asked next, and are dropped by their time). */
         fun drain() = generateSequence { images.tryReceive().getOrNull() }.forEach { it.close() }
 
         fun close() {
@@ -1428,6 +1629,10 @@ class CameraEngine(context: Context) {
         const val JPEG_QUALITY: Byte = 95
         const val STILL_BUFFERS = 3
         const val STILL_TIMEOUT_MS = 10_000L
+        /** Frames handed to the saving at once; beyond them the camera waits for the saving (memory stays bounded). */
+        const val BURST_HANDOFF = 4
+        /** After a burst's stop, its stills still in flight are waited for this long. */
+        const val BURST_TAIL_MS = 400L
         /** The Night extension's longest shot (8 s on the Pixel) and a margin. */
         const val NIGHT_TIMEOUT_MS = 15_000L
         const val POSTVIEW_WIDTH = 1920

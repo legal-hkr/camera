@@ -16,11 +16,14 @@ import android.view.Surface
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import java.io.File
+import java.util.UUID
 import kotlin.math.acos
 import kotlin.math.sqrt
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
+import kotlinx.coroutines.channels.ReceiveChannel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -46,12 +49,14 @@ import sh.hnet.camera.Grid
 import sh.hnet.camera.MotionPhoto
 import sh.hnet.camera.VolumeKeys
 import sh.hnet.camera.camera.AnalysisFrame
+import sh.hnet.camera.camera.BurstFrame
 import sh.hnet.camera.camera.CameraRequest
 import sh.hnet.camera.camera.CameraStatus
 import sh.hnet.camera.camera.CapturedPhoto
 import sh.hnet.camera.camera.EngineState
 import sh.hnet.camera.camera.Flash
 import sh.hnet.camera.camera.FrameAnalyzer
+import sh.hnet.camera.camera.MAX_BURST
 import sh.hnet.camera.camera.Mode
 import sh.hnet.camera.camera.PhoneState
 import sh.hnet.camera.camera.PhoneStates
@@ -62,6 +67,7 @@ import sh.hnet.camera.capabilities.model.Point
 import sh.hnet.camera.capabilities.model.SessionLadder
 import sh.hnet.camera.capabilities.model.Sizes
 import sh.hnet.camera.capabilities.model.VideoChoice
+import sh.hnet.camera.media.BurstFiles
 import sh.hnet.camera.media.LastShot
 import sh.hnet.camera.media.LocationTracker
 import sh.hnet.camera.media.MediaFiles
@@ -189,6 +195,23 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     private val _shutter = MutableSharedFlow<Unit>(extraBufferCapacity = 4)
     /** A still's exposure started: the picture blinks and the phone ticks. */
     val shutter: SharedFlow<Unit> = _shutter
+
+    /** A burst under way: its frames so far (the shutter counts them); null when there is none (LOGIKA §18). Apart from [ui]: it changes with every frame. */
+    private val _burstCount = MutableStateFlow<Int?>(null)
+    val burstCount: StateFlow<Int?> = _burstCount.asStateFlow()
+
+    /** A burst's tick every ten frames; true for the last one it may have (LOGIKA §18). */
+    private val _burstTick = MutableSharedFlow<Boolean>(extraBufferCapacity = 4)
+    val burstTick: SharedFlow<Boolean> = _burstTick
+
+    /** A burst's frames put aside and not in the gallery yet: the thumbnail shows them as being processed. */
+    val burstsSaving: StateFlow<Int> = application.bursts.pending
+
+    private var burstJob: Job? = null
+    /** The shutter (or a volume key) is held: a burst starting after it was let go stops at once. */
+    private var held = false
+    /** The volume key held for a burst: its release ends the burst instead of taking a photo. */
+    private var keyBurst = false
 
     private val _countdownTick = MutableSharedFlow<Unit>(extraBufferCapacity = 4)
     /** One of the countdown's last three seconds: a tick of the phone. */
@@ -321,7 +344,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
             engineState.collect { state ->
                 val now = state.recording != null
                 // While recording the storage is read every second; a finished video takes space
-                phone.fast = now
+                phone.fast = now || burstJob != null
                 if (wasRecording && !now) {
                     phone.refreshStorage()
                     if (configureLater) configure()
@@ -523,6 +546,9 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
 
     fun stop() {
         started = false
+        // Leaving ends a burst (its frames taken are saved)
+        keyBurst = false
+        shutterReleased()
         freezing?.cancel()
         _frozen.value = null
         _covering.value = false
@@ -558,7 +584,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     private val recording: Boolean get() = engineState.value.recording != null
 
     fun selectMode(mode: Mode) {
-        if (mode == _ui.value.mode || recording || _entry.value is Entry.Capture || _ui.value.nightGathering) return
+        if (mode == _ui.value.mode || recording || _entry.value is Entry.Capture || _ui.value.nightGathering || burstJob != null) return
         // Night only on a camera with the extension
         if (mode == Mode.NIGHT && camera?.night == null) return
         cancelTimer()
@@ -572,7 +598,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun switchCamera() {
-        if (cameras.size < 2 || recording || _ui.value.nightGathering) return
+        if (cameras.size < 2 || recording || _ui.value.nightGathering || burstJob != null) return
         cancelTimer()
         val next = (_ui.value.cameraIndex + 1) % cameras.size
         // Night stays only where the other camera has it too
@@ -753,9 +779,95 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         engine.setExposure(steps)
     }
 
+    /** A burst may start: in Photo from the app (not another app's photo), without the timer, nothing else under way. */
+    private val burstable: Boolean
+        get() = _ui.value.mode == Mode.PHOTO && _entry.value !is Entry.Capture && _ui.value.timer == 0 && _ui.value.countdown == null && _review.value == null && !_ui.value.nightGathering
+
+    /**
+     * The shutter held (LOGIKA §18, D14, D15): a burst in Photo, in the photo's format (Ultra HDR with HDR on, plain JPEG at up to 30 fps with it off), until it
+     * is let go or has [MAX_BURST] frames. No flash, timer or motion photo in it. Held where no burst may start, it is a plain press (so is a burst without
+     * room for it). Returns false when it did nothing at all (a volume key's release is then a press).
+     */
+    fun shutterHeld(): Boolean {
+        if (_review.value != null) return false
+        held = true
+        // A change waiting for its frozen frame first (the burst would go to the old session); let go meanwhile, nothing starts
+        freezing?.let { job ->
+            viewModelScope.launch {
+                job.join()
+                if (held) shutterHeld()
+            }
+            return true
+        }
+        val free = phone.state.value.freeBytes
+        if (!burstable || (free != null && free < BURST_RESERVE_BYTES)) {
+            shutterPressed()
+            return true
+        }
+        if (!sessionMatches || burstJob != null) return false
+        val ui = _ui.value
+        val place = placeNow()
+        val front = camera?.front == true
+        val clicks = ui.settings.shutterSound || MediaActionSound.mustPlayShutterSound()
+        val startedAt = System.currentTimeMillis()
+        val bursts = application.bursts
+        // In the app's scope, as every photo (the screen going away doesn't cut the frames already taken), on the main thread with the viewfinder's state;
+        // known as the burst under way before it runs
+        val job = application.appScope.launch(Dispatchers.Main.immediate, start = CoroutineStart.LAZY) {
+            phone.fast = true
+            var frames: ReceiveChannel<BurstFrame>? = null
+            var files: BurstFiles? = null
+            try {
+                val shot = engine.startBurst(rotation, place) ?: return@launch
+                frames = shot.frames
+                if (!held) engine.stopBurst()
+                val burst = BurstFiles(startedAt, UUID.randomUUID().toString(), shot.crop, mirror = front && ui.settings.mirror)
+                files = burst
+                var first = -1L
+                var index = 0
+                _burstCount.value = 0
+                for (frame in shot.frames) {
+                    if (first < 0) first = frame.sensorTimeNs
+                    val takenAt = startedAt + (frame.sensorTimeNs - first) / 1_000_000
+                    if (!bursts.stage(burst, index, frame.bytes, takenAt)) {
+                        engine.stopBurst()
+                        continue
+                    }
+                    index++
+                    _burstCount.value = index
+                    if (index == 1) _shutter.tryEmit(Unit)
+                    // The click at the first frame and every tenth (my decision: one per frame would be a rattle at 15–30 fps)
+                    if ((index == 1 || index % BURST_TICK == 0) && clicks && !cleared) sound.play(MediaActionSound.SHUTTER_CLICK)
+                    if (index % BURST_TICK == 0) _burstTick.tryEmit(index >= MAX_BURST)
+                    // Room for the frames put aside and their copies in the gallery: below it the burst ends (SPEC §14.1)
+                    val left = phone.state.value.freeBytes
+                    if (left != null && left < BURST_RESERVE_BYTES) engine.stopBurst()
+                }
+            } finally {
+                // A loop left early doesn't leave the engine's collector waiting to hand on a frame
+                frames?.cancel()
+                files?.let { bursts.ended(it) }
+                _burstCount.value = null
+                phone.fast = recording
+                phone.refreshStorage()
+            }
+        }
+        burstJob = job
+        job.invokeOnCompletion { if (burstJob === job) burstJob = null }
+        job.start()
+        return true
+    }
+
+    /** The shutter let go: a burst under way ends (the stills already in flight still come). */
+    fun shutterReleased() {
+        held = false
+        if (burstJob != null) engine.stopBurst()
+    }
+
     /** The shutter: a recording ends, a running countdown is cancelled, a set timer starts one, else the photo is taken or the recording started. */
     fun shutterPressed() {
-        if (_review.value != null) return
+        // A press during a burst (a volume key while the finger holds the shutter) does nothing: the two would take each other's stills
+        if (_review.value != null || burstJob != null) return
         // A change waiting for its frozen frame isn't told to the engine yet: the shot waits for it (at most the copy's time), not taken on the old session
         freezing?.let { job ->
             viewModelScope.launch {
@@ -991,7 +1103,16 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         when (_ui.value.settings.volumeKeys) {
             VolumeKeys.VOLUME -> return false
             VolumeKeys.SHUTTER -> {
-                if (event.action == KeyEvent.ACTION_UP) shutterPressed()
+                // Held (the key's first repeat) where a burst may start: a burst until it is let go; else a press on release
+                if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 1 && burstable && !keyBurst) keyBurst = shutterHeld()
+                if (event.action == KeyEvent.ACTION_UP) {
+                    if (keyBurst) {
+                        keyBurst = false
+                        shutterReleased()
+                    } else {
+                        shutterPressed()
+                    }
+                }
                 return true
             }
             VolumeKeys.ZOOM -> {
@@ -1050,6 +1171,10 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     private companion object {
         /** A copy of the live picture that takes longer isn't waited for: the live picture fades out instead before the change goes on. */
         const val FREEZE_WAIT_MS = 100L
+        /** A burst ticks (and clicks) every this many frames. */
+        const val BURST_TICK = 10
+        /** A burst needs room for its frames put aside and their copies in the gallery (150 Ultra HDR frames are about 300 MB each way). */
+        const val BURST_RESERVE_BYTES = 400L * 1024 * 1024
         const val FRAME_MS = 17L
         const val FOCUS_HOLD_DEGREES = 10.0
         const val LAST_SECONDS = 3
