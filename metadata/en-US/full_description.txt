@@ -9,6 +9,12 @@ Photos:
 - Night mode using the phone’s own Night processing, with crosshairs that help you hold the phone steady
 - Bursts of up to 150 photos while you hold the shutter, grouped the same way as in Google’s camera
 
+Pro:
+- Manual ISO and shutter speed (up to 16 s), or set one and let the app meter the other
+- Manual focus with focus peaking, white balance in kelvins, a histogram
+- Long exposures with a countdown on the shutter button, and crosshairs that help you hold the phone steady
+- RAW (DNG) saved alongside each photo, from the lens in use and with the photo’s framing, or a 50 MP DNG from the main lens
+
 Video:
 - 4K and 1080p at 24, 30 or 60 fps, HLG HDR up to 30 fps, HEVC or AVC
 - Stereo sound, pause and resume, photos while recording, the flashlight

@@ -1,0 +1,10 @@
+v0.3.0
+
+New:
+- Pro mode: manual ISO and shutter speed up to 16 s (or one of them metered), manual focus with focus peaking, white balance in kelvins and a histogram
+- Long exposures with a countdown on the shutter and crosshairs to help you hold still
+- RAW (DNG) in Pro: alongside the photo from the lens in use, or a 50 MP DNG
+
+Changes:
+- All modes are now in the mode row, which follows your finger
+- Buttons over the viewfinder no longer have a background; active settings are shown in amber

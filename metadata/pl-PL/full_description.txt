@@ -9,6 +9,12 @@ Zdjęcia:
 - Tryb „Noc” korzystający z nocnego przetwarzania telefonu, z celownikami, które pomagają utrzymać telefon nieruchomo
 - Serie do 150 zdjęć przy przytrzymanym spuście, grupowane tak jak w aparacie Google
 
+Pro:
+- Ręczne ISO i czas naświetlania (do 16 s) albo ustawienie jednej wartości i dobór drugiej przez pomiar aplikacji
+- Ręczna ostrość z podświetlaniem ostrych krawędzi, balans bieli w kelwinach, histogram
+- Długie naświetlanie z odliczaniem na spuście i celownikami, które pomagają utrzymać telefon nieruchomo
+- RAW (DNG) zapisywany obok każdego zdjęcia, z aktualnie używanego obiektywu i w kadrze zdjęcia, albo DNG 50 MP z głównego obiektywu
+
 Filmy:
 - 4K i 1080p przy 24, 30 albo 60 kl./s, HDR (HLG) do 30 kl./s, kodek HEVC albo AVC
 - Dźwięk stereo, wstrzymywanie i wznawianie, zdjęcia w trakcie nagrywania, latarka

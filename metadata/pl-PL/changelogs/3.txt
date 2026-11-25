@@ -1,0 +1,10 @@
+v0.3.0
+
+Nowości:
+- Tryb „Pro”: ręczne ISO i czas do 16 s (albo jedno z nich z pomiaru), ręczna ostrość z podświetlaniem krawędzi, balans bieli w kelwinach i histogram
+- Długie naświetlanie z odliczaniem na spuście i celownikami pomagającymi nie poruszyć telefonem
+- RAW (DNG) w trybie „Pro”: obok zdjęcia z używanego obiektywu albo DNG 50 MP
+
+Zmiany:
+- Wszystkie tryby są teraz w jednym rzędzie, który przesuwa się za palcem
+- Przyciski na podglądzie nie mają już tła; włączone opcje są bursztynowe
