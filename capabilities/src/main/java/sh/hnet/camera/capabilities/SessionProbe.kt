@@ -197,6 +197,7 @@ class SessionProbe(private val manager: CameraManager) {
                 fun still(format: Int, size: Size) = Output("still", format, size, useCase = stillUseCase ?: 0)
                 fun analysis(profile: Long) = (if (profile == h) p010Small?.let { Output("analysis", ImageFormat.YCBCR_P010, it, profile = h) } else yuvSmall?.let { Output("analysis", ImageFormat.YUV_420_888, it) })
                 val stills = listOfNotNull(jpegR?.let { "JPEG_R" to still(ImageFormat.JPEG_R, it) }, jpeg?.let { "JPEG" to still(ImageFormat.JPEG, it) })
+                val raw = sizes(ImageFormat.RAW_SENSOR).maxByOrNull { area(it) }?.let { Output("raw", ImageFormat.RAW_SENSOR, it) }
                 val profiles = if (hlg) listOf("HLG" to h, "SDR" to DynamicRangeProfiles.STANDARD) else listOf("SDR" to DynamicRangeProfiles.STANDARD)
                 for ((stillName, stillOutput) in stills) for ((profileName, profile) in profiles.filter { stillName == "JPEG_R" || it.second != h }) {
                     val prefix = "app photo $name: preview $profileName + $stillName"
@@ -207,6 +208,13 @@ class SessionProbe(private val manager: CameraManager) {
                     add(Combination(prefix, listOf(preview(profile), stillOutput), fps30))
                     // The 8-bit analysis stream next to an HLG preview, for when P010 is refused
                     if (profile == h && yuvSmall != null) add(Combination("$prefix + motion + YUV analysis", listOf(preview(profile), motion(profile), stillOutput, Output("analysis", ImageFormat.YUV_420_888, yuvSmall)), fps30))
+                    // Pro and RAW next to the photo (LOGIKA §28): the analysis stream (metering, focus peaking, histogram) with RAW, then RAW alone with the
+                    // photo; with the motion stream too, for RAW in Photo
+                    raw?.let { r ->
+                        if (analysisOutput != null) add(Combination("$prefix + RAW + analysis", listOf(preview(profile), stillOutput, r, analysisOutput), fps30))
+                        if (analysisOutput != null) add(Combination("$prefix + RAW + motion + analysis", listOf(preview(profile), motion(profile), stillOutput, r, analysisOutput), fps30))
+                        add(Combination("$prefix + RAW", listOf(preview(profile), stillOutput, r), fps30))
+                    }
                 }
             }
         }

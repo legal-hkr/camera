@@ -47,4 +47,7 @@
     <string name="title_test_night_queue">Noc: podgląd HDR i drugie zdjęcie</string>
     <string name="title_test_burst_long">Seria 5 s (JPEG, JPEG_R)</string>
     <string name="title_test_burst_hdr_preview">Seria przy podglądzie HDR</string>
+    <string name="title_test_pro_long_exposure">Pro: długie naświetlanie (4 s, 16 s)</string>
+    <string name="title_test_pro_raw_with_jpeg">Pro: RAW ze zdjęciem w jednym ujęciu</string>
+    <string name="title_test_pro_50mp_dng">Pro: DNG 50 Mpx (Bayer i quad)</string>
 </resources>

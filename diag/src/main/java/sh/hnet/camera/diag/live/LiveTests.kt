@@ -28,6 +28,8 @@ import android.util.Range
 import android.util.Size
 import android.view.Surface
 import androidx.annotation.StringRes
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
 import kotlinx.serialization.json.JsonObject
@@ -71,6 +73,9 @@ class LiveTests(context: Context, private val preview: PreviewHost) {
         LiveTest("night_queue", R.string.title_test_night_queue) { nightQueue(it) },
         LiveTest("burst_long", R.string.title_test_burst_long) { burstLong(it) },
         LiveTest("burst_hdr_preview", R.string.title_test_burst_hdr_preview) { burstHdrPreview(it) },
+        LiveTest("pro_long_exposure", R.string.title_test_pro_long_exposure) { proLongExposure(it) },
+        LiveTest("pro_raw_with_jpeg", R.string.title_test_pro_raw_with_jpeg) { proRawWithJpeg(it) },
+        LiveTest("pro_50mp_dng", R.string.title_test_pro_50mp_dng) { pro50mpDng(it) },
         LiveTest("raw", R.string.title_test_raw) { raw(it) },
     )
 
@@ -684,6 +689,233 @@ class LiveTests(context: Context, private val preview: PreviewHost) {
         } finally {
             readers.forEach { it.close() }
         }
+    }
+
+    /** The camera's own answer whether a session of [outputs] can run (Android 15+; nothing is configured). Null when it can't be asked. */
+    private fun supported(id: String, outputs: List<OutputConfiguration>): Boolean? = runCatching {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.VANILLA_ICE_CREAM || !manager.isCameraDeviceSetupSupported(id)) return null
+        manager.getCameraDeviceSetup(id).isSessionConfigurationSupported(SessionConfiguration(SessionConfiguration.SESSION_REGULAR, outputs))
+    }.getOrNull()
+
+    /**
+     * Long exposures as Pro takes them (LOGIKA §26, §30): the preview automatic, then one still with the exposure off, ISO 100 and 4 s, then 16 s (or the
+     * camera's longest): how long until the file, what the result says, and how many preview frames came meanwhile. The files go to DCIM/CameraDiag.
+     */
+    private suspend fun proLongExposure(id: String): JsonObject {
+        val chars = chars(id)
+        val map = map(id)
+        val manual = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)?.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR) == true
+        val range = chars.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+        if (!manual || range == null) return notOffered("manual exposure")
+        val format = if (largest(map, ImageFormat.JPEG_R) != null) ImageFormat.JPEG_R else ImageFormat.JPEG
+        val size = largest(map, format) ?: return notOffered("a still size")
+        val hlg = format == ImageFormat.JPEG_R && chars.get(CameraCharacteristics.REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES)?.supportedProfiles?.contains(DynamicRangeProfiles.HLG10) == true
+        val iso = chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)?.clamp(100) ?: 100
+        val surface = preview.surface(previewSize(map))
+        return manager.withCamera(id) { device, thread ->
+            ImageQueue(imageReader(size.width, size.height, format, 2), thread).use { queue ->
+                val outputs = listOf(OutputConfiguration(surface).apply { if (hlg) dynamicRangeProfile = DynamicRangeProfiles.HLG10 }, OutputConfiguration(queue.reader.surface))
+                val session = device.session(outputs, thread)
+                try {
+                    val previewDone = mutableListOf<Long>()
+                    val watch = object : CameraCaptureSession.CaptureCallback() {
+                        override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+                            previewDone += SystemClock.elapsedRealtime()
+                        }
+                    }
+                    device.repeating(session, thread, listOf(surface), callback = watch)
+                    delay(1500)
+                    buildJsonObject {
+                        put("format", Names.format(format))
+                        put("previewHlg", hlg)
+                        put("iso", iso)
+                        for (seconds in listOf(4L, 16L)) {
+                            val exposure = (seconds * 1_000_000_000L).coerceAtMost(range.upper)
+                            put("${seconds}s", probe {
+                                val request = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                                    addTarget(queue.reader.surface)
+                                    set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
+                                    set(CaptureRequest.SENSOR_SENSITIVITY, iso)
+                                    set(CaptureRequest.SENSOR_EXPOSURE_TIME, exposure)
+                                    set(CaptureRequest.SENSOR_FRAME_DURATION, exposure)
+                                }
+                                val start = SystemClock.elapsedRealtime()
+                                val result = session.captureOnce(request.build(), thread)
+                                val bytes = queue.next(exposure / 1_000_000 + 20_000).use { image -> image.planes[0].buffer.let { b -> ByteArray(b.remaining()).also { b.get(it) } } }
+                                val end = SystemClock.elapsedRealtime()
+                                val uri = Media.saveImage(resolver, "PRO_${Media.stamp()}_${seconds}s_cam$id.jpg", "image/jpeg", bytes)
+                                buildJsonObject {
+                                    put("askedMs", exposure / 1_000_000)
+                                    put("latencyMs", end - start)
+                                    put("resultExposureMs", jsonOf(result.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.div(1_000_000)))
+                                    put("resultIso", jsonOf(result.get(CaptureResult.SENSOR_SENSITIVITY)))
+                                    put("previewFramesMeanwhile", previewDone.count { it in start..end })
+                                    put("file", uri.toString())
+                                }
+                            })
+                        }
+                    }
+                } finally {
+                    session.close()
+                }
+            }
+        }
+    }
+
+    /**
+     * RAW next to the photo in one request (LOGIKA §28): the session asked about first (and with an HLG preview as the app would have it), then one still with
+     * both targets: both images' times (one frame?), the latency, and the DNG written by DngCreator with the JPEG beside it in DCIM/CameraDiag.
+     */
+    private suspend fun proRawWithJpeg(id: String): JsonObject {
+        val chars = chars(id)
+        val map = map(id)
+        val raw = largest(map, ImageFormat.RAW_SENSOR) ?: return notOffered("RAW_SENSOR")
+        val format = if (largest(map, ImageFormat.JPEG_R) != null) ImageFormat.JPEG_R else ImageFormat.JPEG
+        val size = largest(map, format) ?: return notOffered("a still size")
+        val surface = preview.surface(previewSize(map))
+        val hlgOffered = format == ImageFormat.JPEG_R && chars.get(CameraCharacteristics.REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES)?.supportedProfiles?.contains(DynamicRangeProfiles.HLG10) == true
+        return manager.withCamera(id) { device, thread ->
+            ImageQueue(imageReader(size.width, size.height, format, 2), thread).use { stills ->
+                ImageQueue(imageReader(raw.width, raw.height, ImageFormat.RAW_SENSOR, 2), thread).use { raws ->
+                    fun outputs(hlg: Boolean) = listOf(OutputConfiguration(surface).apply { if (hlg) dynamicRangeProfile = DynamicRangeProfiles.HLG10 }, OutputConfiguration(stills.reader.surface), OutputConfiguration(raws.reader.surface))
+                    // Configured only as the camera confirms it: a refused combination may break the camera service
+                    val hlgSupported = if (hlgOffered) supported(id, outputs(true)) else false
+                    val sdrSupported = supported(id, outputs(false))
+                    val hlg = hlgSupported == true
+                    if (!hlg && sdrSupported == false) return@withCamera buildJsonObject { put("hlgPreview", jsonOf(hlgSupported)); put("sdrPreview", false) }
+                    val session = device.session(outputs(hlg), thread)
+                    try {
+                        device.repeating(session, thread, listOf(surface))
+                        delay(1500)
+                        val request = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                            addTarget(stills.reader.surface)
+                            addTarget(raws.reader.surface)
+                            set(CaptureRequest.JPEG_ORIENTATION, orientation(id))
+                        }
+                        val start = SystemClock.elapsedRealtime()
+                        val result = session.captureOnce(request.build(), thread)
+                        val still = stills.next()
+                        val rawImage = raws.next()
+                        val latency = SystemClock.elapsedRealtime() - start
+                        val stamp = Media.stamp()
+                        val dng = Media.newImage(resolver, "PRO_${stamp}_cam$id.dng", "image/x-adobe-dng")
+                        rawImage.use { image ->
+                            DngCreator(chars, result).use { creator ->
+                                creator.setOrientation(exifOrientation(orientation(id)))
+                                resolver.openOutputStream(dng)!!.use { creator.writeImage(it, image) }
+                            }
+                        }
+                        Media.publish(resolver, dng)
+                        val stillTime = still.timestamp
+                        val jpegBytes = still.use { image -> image.planes[0].buffer.let { b -> ByteArray(b.remaining()).also { b.get(it) } } }
+                        val jpeg = Media.saveImage(resolver, "PRO_${stamp}_cam$id.jpg", "image/jpeg", jpegBytes)
+                        buildJsonObject {
+                            put("hlgPreview", jsonOf(hlgSupported))
+                            put("sdrPreview", jsonOf(sdrSupported))
+                            put("used", if (hlg) "HLG preview" else "SDR preview")
+                            put("stillFormat", Names.format(format))
+                            put("rawSize", sizeText(raw))
+                            put("sameFrame", stillTime == result.get(CaptureResult.SENSOR_TIMESTAMP))
+                            put("latencyMs", latency)
+                            put("dng", dng.toString())
+                            put("jpeg", jpeg.toString())
+                        }
+                    } finally {
+                        session.close()
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * 50 MP as Pro would save it (D4, D18): one RAW10 at the sensor's maximum resolution written twice to DCIM/CameraDiag, to compare in a RAW converter: its
+     * quad Bayer (2 × 2 pixels of one colour) rearranged into a plain Bayer by swapping the middle columns and rows of every 4 × 4 block (artefacts of so simple
+     * a remosaic?), and as it is with a 4 × 4 colour pattern (does the converter read it at all?). Written by the app's own DNG writer: DngCreator refuses an
+     * image larger than the sensor's normal pixel array. Only a camera that offers maximum-resolution RAW10 (never the telephoto's, whose mode breaks the
+     * camera service).
+     */
+    private suspend fun pro50mpDng(id: String): JsonObject {
+        val chars = chars(id)
+        val maxMap = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP_MAXIMUM_RESOLUTION) ?: return notOffered("maximum resolution")
+        val size = largest(maxMap, ImageFormat.RAW10) ?: return notOffered("RAW10 at maximum resolution")
+        val surface = preview.surface(previewSize(map(id)))
+        return manager.withCamera(id) { device, thread ->
+            ImageQueue(imageReader(size.width, size.height, ImageFormat.RAW10, 1), thread).use { queue ->
+                val rawOutput = OutputConfiguration(queue.reader.surface).apply { addSensorPixelModeUsed(CameraMetadata.SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION) }
+                val session = device.session(listOf(OutputConfiguration(surface), rawOutput), thread)
+                try {
+                    device.repeating(session, thread, listOf(surface))
+                    delay(1500)
+                    val request = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                        addTarget(queue.reader.surface)
+                        set(CaptureRequest.SENSOR_PIXEL_MODE, CameraMetadata.SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION)
+                    }
+                    val result = session.captureOnce(request.build(), thread)
+                    val cfa = chars.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT) ?: CameraMetadata.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_GBRG
+                    val stamp = Media.stamp()
+                    var remosaicMs = 0L
+                    val files = queue.next().use { image ->
+                        listOf(true, false).map { rearranged ->
+                            val started = SystemClock.elapsedRealtime()
+                            val pixels = unpack(image, rearranged)
+                            if (rearranged) remosaicMs = SystemClock.elapsedRealtime() - started
+                            val dng = Media.newImage(resolver, "PRO50_${stamp}_cam${id}_${if (rearranged) "bayer" else "quad"}.dng", "image/x-adobe-dng")
+                            resolver.openOutputStream(dng)!!.use { TinyDng.write(it, size.width, size.height, pixels, if (rearranged) TinyDng.bayer(cfa) else TinyDng.quad(cfa), chars, result, exifOrientation(orientation(id))) }
+                            Media.publish(resolver, dng)
+                            dng.toString()
+                        }
+                    }
+                    buildJsonObject {
+                        put("size", sizeText(size))
+                        put("cfa", cfa)
+                        put("unpackAndRemosaicMs", remosaicMs)
+                        put("bayerDng", files[0])
+                        put("quadDng", files[1])
+                    }
+                } finally {
+                    session.close()
+                }
+            }
+        }
+    }
+
+    /** A RAW10 image as 16-bit samples (four pixels in five bytes unpacked); [rearranged]: quad Bayer made plain, in each 4 × 4 block columns 1 and 2, and rows 1 and 2, swapped. */
+    private fun unpack(image: Image, rearranged: Boolean): ByteBuffer {
+        val width = image.width
+        val height = image.height
+        val plane = image.planes[0]
+        val source = plane.buffer
+        val stride = plane.rowStride
+        val out = ByteBuffer.allocateDirect(width * height * 2).order(ByteOrder.nativeOrder())
+        val row = ShortArray(width)
+        val packed = ByteArray(width * 5 / 4)
+        for (y in 0 until height) {
+            source.position(y * stride)
+            source.get(packed)
+            for (group in 0 until width / 4) {
+                val at = group * 5
+                val low = packed[at + 4].toInt() and 0xFF
+                for (i in 0 until 4) row[group * 4 + i] = (((packed[at + i].toInt() and 0xFF) shl 2) or ((low shr (2 * i)) and 3)).toShort()
+            }
+            // Columns 1 and 2 of every block swapped
+            if (rearranged) for (x in 0 until width step 4) {
+                val keep = row[x + 1]
+                row[x + 1] = row[x + 2]
+                row[x + 2] = keep
+            }
+            // Rows 1 and 2 of every block swapped: written to the other's place
+            val target = when {
+                !rearranged -> y
+                y % 4 == 1 -> y + 1
+                y % 4 == 2 -> y - 1
+                else -> y
+            }
+            out.position(target * width * 2)
+            out.asShortBuffer().put(row)
+        }
+        out.position(0)
+        return out
     }
 
     // RAW: a DNG at the default (binned) size, then RAW10 at the sensor's full resolution where it is offered only in maximum-resolution mode
