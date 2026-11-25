@@ -187,7 +187,8 @@ class CameraEngine(context: Context) {
             return read
         }
 
-    private data class Desired(val started: Boolean = false, val request: CameraRequest? = null, val surface: Surface? = null, val retry: Int = 0)
+    /** [surfaceSize]: the buffer size the viewfinder gave [surface] (a session is made only on a surface of its request's preview size). */
+    private data class Desired(val started: Boolean = false, val request: CameraRequest? = null, val surface: Surface? = null, val surfaceSize: PixelSize? = null, val retry: Int = 0)
 
     private val desired = MutableStateFlow(Desired())
     private val _state = MutableStateFlow(EngineState())
@@ -238,7 +239,6 @@ class CameraEngine(context: Context) {
         }
     }
 
-    /** The viewfinder is shown. Coming back also tries again a camera that was busy, blocked or failed. */
     /** The viewfinders that want the camera (two activities may hand over in either order): it runs while there is one. */
     private val owners = mutableSetOf<Any>()
 
@@ -270,10 +270,30 @@ class CameraEngine(context: Context) {
 
     fun configure(request: CameraRequest) = desired.update { if (it.request == request) it else it.copy(request = request) }
 
-    fun setPreviewSurface(surface: Surface) = desired.update { it.copy(surface = surface) }
+    /** Whether [a] and [b] are served by the same session: they differ at most in an aspect cut from the same streams (a square cut from 4:3, any aspect in Video). */
+    fun sameSession(a: CameraRequest, b: CameraRequest): Boolean = a.copy(aspect = sessionAspect(a)) == b.copy(aspect = sessionAspect(b))
+
+    /** The aspect the session's streams have: a square cut from the 4:3 still is 4:3 (unless the camera has a full square size of its own), Video is 16:9. */
+    private fun sessionAspect(request: CameraRequest): Aspect = when {
+        request.mode == Mode.VIDEO -> Aspect.SIXTEEN_NINE
+        request.aspect == Aspect.SQUARE && squareIsCut(request) -> Aspect.FOUR_THREE
+        else -> request.aspect
+    }
+
+    private fun squareIsCut(request: CameraRequest): Boolean {
+        val lists = if (request.mode == Mode.NIGHT) request.camera.night?.let { listOf(it.jpegR, it.jpeg) }.orEmpty() else listOf(request.camera.jpegR, request.camera.jpeg)
+        return lists.filter { it.isNotEmpty() }.all { Sizes.still(it, Aspect.SQUARE)?.capture == Sizes.still(it, Aspect.FOUR_THREE)?.capture }
+    }
+
+    private fun Desired.shape(): Desired = copy(request = request?.let { it.copy(aspect = sessionAspect(it)) })
+
+    /** The crop a still of [capture] needs for the aspect asked at the shot: 4:3 and a square share the session, so it is decided here, not with the session. */
+    private fun cropFor(capture: PixelSize, request: CameraRequest): PixelSize? = request.pictureAspect.let { if (Sizes.near(capture, it)) null else Sizes.cropTo(capture, it) }
+
+    fun setPreviewSurface(surface: Surface, size: PixelSize) = desired.update { it.copy(surface = surface, surfaceSize = size) }
 
     /** The viewfinder's surface went away; a newer one set meanwhile (a new size) stays. */
-    fun clearPreviewSurface(surface: Surface) = desired.update { if (it.surface == surface) it.copy(surface = null) else it }
+    fun clearPreviewSurface(surface: Surface) = desired.update { if (it.surface == surface) it.copy(surface = null, surfaceSize = null) else it }
 
     /** Open again (the problem card's button). */
     fun retry() = scope.launch {
@@ -443,7 +463,7 @@ class CameraEngine(context: Context) {
             found
         } ?: return null
         val bytes = image.use { it.compressedBytes() }
-        return CapturedPhoto(bytes, output.format, output.plan.crop, takenAt, if (startedAt != 0L) startedAt else image.timestamp, motionSource, orientation)
+        return CapturedPhoto(bytes, output.format, cropFor(output.plan.capture, request), takenAt, if (startedAt != 0L) startedAt else image.timestamp, motionSource, orientation)
     }
 
     private suspend fun reconcile(want: Desired) {
@@ -466,13 +486,28 @@ class CameraEngine(context: Context) {
             if (!openDevice(request)) return
             deviceRetry = want.retry
         }
-        val surface = want.surface
+        val size = previewSize(request)
+        if (size == null) {
+            // No preview size for this request: an error the viewfinder shows, not a wait for a surface that never comes
+            awaitCapture()
+            closeSession()
+            failed(CameraDevice.StateCallback.ERROR_CAMERA_DEVICE)
+            return
+        }
+        // A request of another preview size waits for the viewfinder's surface of that size: a session on the old one would show for a moment and be made
+        // again when the new surface comes (two blinks per change)
+        val surface = want.surface?.takeIf { want.surfaceSize == size }
         if (surface == null) {
             awaitCapture()
             closeSession()
             return
         }
-        if ((session != null || nightSession != null) && sessionKey == want) return
+        if ((session != null || nightSession != null) && sessionKey?.shape() == want.shape()) {
+            // 4:3 and a square cut from it share the session: only the aspect told (the screen and the next shot's crop follow it)
+            sessionKey = want
+            if (_state.value.request != request) _state.update { it.copy(request = request) }
+            return
+        }
         awaitCapture()
         closeSession()
         if (makeSession(want, request, surface)) {
@@ -668,8 +703,9 @@ class CameraEngine(context: Context) {
                 motion?.release()
                 continue
             }
-            // The world may have moved while the session was being made: the device lost, another request or surface wanted
-            if (this.device !== device || deviceLost || desired.value != want) {
+            // The world may have moved while the session was being made: the device lost, another request or surface wanted (only the aspect of a square cut
+            // from 4:3 keeps it: the next reconcile just tells it)
+            if (this.device !== device || deviceLost || desired.value.shape() != want.shape()) {
                 runCatching { made.close() }
                 return false
             }
@@ -954,17 +990,22 @@ class CameraEngine(context: Context) {
     }
 
     private val results = object : CameraCaptureSession.CaptureCallback() {
-        override fun onCaptureCompleted(session: CameraCaptureSession, captureRequest: CaptureRequest, result: TotalCaptureResult) = onResult(result)
+        // Late results of a session already closed don't speak for the next one (its first frame lifts the cover)
+        override fun onCaptureCompleted(session: CameraCaptureSession, captureRequest: CaptureRequest, result: TotalCaptureResult) {
+            if (session === this@CameraEngine.session) onResult(result)
+        }
     }
 
     /** The Night extension's preview results, read as the regular session's. */
     private val nightResults = object : CameraExtensionSession.ExtensionCaptureCallback() {
         // An extension that reports no results still shows its frames: the cover goes with the first one
         override fun onCaptureStarted(session: CameraExtensionSession, request: CaptureRequest, timestamp: Long) {
-            if (!_state.value.frameShown) _state.update { it.copy(frameShown = true) }
+            if (session === nightSession && !_state.value.frameShown) _state.update { it.copy(frameShown = true) }
         }
 
-        override fun onCaptureResultAvailable(session: CameraExtensionSession, request: CaptureRequest, result: TotalCaptureResult) = onResult(result)
+        override fun onCaptureResultAvailable(session: CameraExtensionSession, request: CaptureRequest, result: TotalCaptureResult) {
+            if (session === nightSession) onResult(result)
+        }
     }
 
     /**
@@ -1156,7 +1197,7 @@ class CameraEngine(context: Context) {
             if (surface.isValid && this.device === device && !deviceLost) failed(CameraDevice.StateCallback.ERROR_CAMERA_DEVICE)
             return false
         }
-        if (this.device !== device || deviceLost || desired.value != want) {
+        if (this.device !== device || deviceLost || desired.value.shape() != want.shape()) {
             runCatching { made.close() }
             return false
         }
@@ -1277,7 +1318,7 @@ class CameraEngine(context: Context) {
                 val bytes = image.use { it.compressedBytes() }
                 // Its frames are in, whether or not the extension said so
                 gathered.complete(true)
-                CapturedPhoto(bytes, output.format, output.plan.crop, takenAt, if (startedAt != 0L) startedAt else image.timestamp, null, orientation)
+                CapturedPhoto(bytes, output.format, cropFor(output.plan.capture, request), takenAt, if (startedAt != 0L) startedAt else image.timestamp, null, orientation)
             } catch (e: Exception) {
                 Log.w(TAG, "Night photo failed: ${e.javaClass.simpleName}")
                 null
@@ -1311,6 +1352,8 @@ class CameraEngine(context: Context) {
 
     /** Closes the session; its still reader closes when the camera has really let go of it ([configure]'s `onClosed`). */
     private fun closeSession() {
+        // No picture any more: the viewfinder covers until the next session's first frame (a stale "shown" let a frozen frame go over nothing)
+        if ((session != null || nightSession != null) && _state.value.frameShown) _state.update { it.copy(frameShown = false) }
         lockJob?.cancel()
         // The prepared encoder goes at once (the next session's may need the hardware); the surface goes when the session has closed
         recorder?.retire()

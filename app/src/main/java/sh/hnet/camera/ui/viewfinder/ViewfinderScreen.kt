@@ -22,10 +22,12 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.DrawableRes
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FiniteAnimationSpec
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.snap
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.AndroidExternalSurface
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -47,7 +49,6 @@ import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.requiredSize
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsIgnoringVisibility
 import androidx.compose.foundation.layout.width
@@ -86,6 +87,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
@@ -102,11 +104,17 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.layout
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
@@ -117,6 +125,7 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
@@ -149,8 +158,10 @@ import sh.hnet.camera.camera.QrContent
 import sh.hnet.camera.camera.Recording
 import sh.hnet.camera.capabilities.model.Aspect
 import sh.hnet.camera.capabilities.model.Orientation
+import sh.hnet.camera.capabilities.model.PixelSize
 import sh.hnet.camera.capabilities.model.Point
 import sh.hnet.camera.capabilities.model.SessionLadder
+import sh.hnet.camera.capabilities.model.Sizes
 import sh.hnet.camera.media.LastShot
 import sh.hnet.camera.media.MediaFiles
 import sh.hnet.camera.ui.components.EmptyState
@@ -169,8 +180,8 @@ private const val IDLE_MS = 120_000L
 
 /**
  * The viewfinder (SPEC §4): built from the bottom up – the mode row above the navigation bar, the shutter row, the zoom row lying over the bottom of the preview
- * canvas – with the picture centred in the canvas in the shot's aspect ratio and `surface` around it: Photo and Video's preview, zoom, focus and
- * exposure, photos with the thumbnail.
+ * area – with the picture placed by [FinderGeometry] (4:3 fitted, 16:9 filling the width, the square as bands over 4:3) and `surface` around it: Photo
+ * and Video's preview, zoom, focus and exposure, photos with the thumbnail.
  */
 @Composable
 fun ViewfinderScreen(
@@ -294,8 +305,9 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
     ViewfinderWindow(keepOn)
     val last by viewModel.lastShot.collectAsStateWithLifecycle()
     val camera = viewModel.camera
-    val request = viewModel.request()
-    val previewSize = viewModel.previewSize()
+    val shown by viewModel.shown.collectAsStateWithLifecycle()
+    val previewSize = remember(shown) { viewModel.previewSize() }
+    val frozen by viewModel.frozen.collectAsStateWithLifecycle()
 
     LifecycleStartEffect(Unit) {
         viewModel.start()
@@ -331,7 +343,12 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
             blink.animateTo(0f, tween(100))
         }
     }
-    val cover by animateFloatAsState(if (engine.frameShown) 0f else 1f, if (engine.frameShown) tween(300) else snap(), label = "cover")
+    // Read only where it is drawn, as the blink: an animation frame doesn't recompose the viewfinder. Under a frozen frame it isn't needed (the frame lies
+    // over the picture until the new session's first frame); under a change without one the live picture fades out to it (the view model waits for that
+    // before the engine is told)
+    val covering by viewModel.covering.collectAsStateWithLifecycle()
+    val uncovered = (engine.frameShown && !covering) || frozen != null
+    val cover = animateFloatAsState(if (uncovered) 0f else 1f, if (uncovered) tween(300) else if (covering) tween(COVER_FADE_MS) else snap(), label = "cover")
 
     val recording = engine.recording
     // A countdown or a recording closes the panel: its values would rebuild the session under them
@@ -477,102 +494,140 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
         val zoomBottom = shutterBottom + 80.dp + 12.dp
         // The status bar's band stays free, hidden or not: icons there sat under the screen's rounded corners and the pulled-down bar (owner, 23 Nov 2026)
         val status = WindowInsets.statusBarsIgnoringVisibility.asPaddingValues().calculateTopPadding()
-        val canvas = maxHeight - status - shutterBottom - 80.dp - 4.dp
-        val aspect = request?.pictureAspect ?: Aspect.FOUR_THREE
-        val portrait = aspect.width.toFloat() / aspect.height
-        var pictureWidth = maxWidth
-        var pictureHeight: Dp = maxWidth * portrait
-        // 16:9 fills the canvas's width, a few pixels cut off its ends in the preview only (owner, 23 Nov 2026); the other ratios fit inside the canvas
-        val fill = aspect == Aspect.SIXTEEN_NINE
-        if (pictureHeight > canvas) {
-            pictureHeight = canvas
-            if (!fill) pictureWidth = canvas / portrait
+        // The area for the picture: from the status bar's band down to the middle of the gap between the shutter and the zoom row (owner, 24 Nov 2026)
+        val areaBottom = maxHeight - shutterBottom - 80.dp - 6.dp
+        val geometry = remember(maxWidth, status, areaBottom) { FinderGeometry(maxWidth.value, status.value, areaBottom.value) }
+        val area = geometry.area
+        // The live picture, the square's bands and the photo's frame follow the session the engine was told (Video is 16:9)
+        val stream = streamOf(previewSize)
+        val sensor = geometry.sensor(stream)
+        val streamBox = geometry.content(sensor, stream)
+        val shownAspect = shown?.pictureAspect ?: Aspect.FOUR_THREE
+        val spatial = MaterialTheme.motionScheme.defaultSpatialSpec<Float>()
+        // The square's bands slide in over the 4:3 picture only when the session stays (4:3 ↔ 1:1, LOGIKA §23.2); with a new session they are set at once,
+        // under the cover (sliding over a fading frame they uncovered or covered its parts – owner, 25 Nov 2026)
+        val shownSquare = shownAspect == Aspect.SQUARE && stream == Aspect.FOUR_THREE
+        val square = remember { Animatable(if (shownSquare) 1f else 0f) }
+        var squareSession by remember { mutableStateOf(shown) }
+        LaunchedEffect(shownSquare, shown) {
+            val to = if (shownSquare) 1f else 0f
+            val before = squareSession
+            val now = shown
+            squareSession = now
+            if (before != null && now != null && viewModel.sameSession(before, now)) square.animateTo(to, spatial) else square.snapTo(to)
         }
-        val pictureTop = (canvas - pictureHeight) / 2
-        val pictureLeft = (maxWidth - pictureWidth) / 2
+        val frame = geometry.photo(sensor, shownAspect)
+        val frozenMotion = remember { FrozenMotion() }
+        val fade = MaterialTheme.motionScheme.defaultEffectsSpec<Float>()
+        LaunchedEffect(frozen) { frozenMotion.follow(frozen, fade) }
+        // The photo's frame: where the fading frozen frame's was while it goes, then the live session's (sliding with the square's bands)
+        val frameNow = {
+            val held = frozenMotion.held ?: frozen
+            when {
+                held != null && !frozenMotion.incoming -> geometry.photo(geometry.sensor(held.stream), held.aspect)
+                stream == Aspect.FOUR_THREE && shownAspect != Aspect.SIXTEEN_NINE -> geometry.photo(sensor, Aspect.FOUR_THREE).lerp(geometry.photo(sensor, Aspect.SQUARE), square.value.coerceIn(0f, 1f))
+                else -> frame
+            }
+        }
 
-        // The picture: the preview's surface, the cover while a session starts, the blink of a shot, the marks and the gestures. A square shot is previewed
-        // in 4:3 with the picture's box cutting it; the surface's box is the one that taps and marks refer to.
-        val surfaceHeight = when {
-            aspect == Aspect.SQUARE -> pictureWidth * 4f / 3f
-            fill -> pictureWidth * portrait
-            else -> pictureHeight
-        }
-        Box(Modifier.offset(pictureLeft, status + pictureTop).size(pictureWidth, pictureHeight).clipToBounds(), contentAlignment = Alignment.Center) {
-          Box(Modifier.requiredSize(pictureWidth, surfaceHeight)) {
-            if (previewSize != null && problem == null) {
-                key(previewSize) {
-                    AndroidExternalSurface(Modifier.fillMaxSize(), surfaceSize = IntSize(previewSize.width, previewSize.height)) {
-                        onSurface { surface, _, _ ->
-                            viewModel.setPreviewSurface(surface)
-                            surface.onDestroyed { viewModel.clearPreviewSurface(surface) }
+        // The picture: the preview's surface, the cover while a session starts, the blink of a shot, the marks and the gestures in the stream's box (which
+        // taps and marks refer to); the square's bands, the frozen frame over a session being rebuilt, and over them what belongs to the photo's frame
+        Box(Modifier.offset(0.dp, status).size(maxWidth, (area.height).dp).clipToBounds()) {
+            Box(Modifier.place(area) { streamBox }) {
+                if (previewSize != null && problem == null) {
+                    key(previewSize) {
+                        AndroidExternalSurface(Modifier.fillMaxSize(), surfaceSize = IntSize(previewSize.width, previewSize.height)) {
+                            onSurface { surface, _, _ ->
+                                viewModel.setPreviewSurface(surface, previewSize)
+                                surface.onDestroyed { viewModel.clearPreviewSurface(surface) }
+                            }
                         }
                     }
                 }
-            }
-            Box(Modifier.fillMaxSize().background(colors.surface.copy(alpha = maxOf(cover, blink.value))))
-            if (problem == null) {
-                FinderMarks(
-                    focus = ui.focus,
-                    focusing = engine.focusing,
-                    locked = ui.locked,
-                    exposure = if (ui.exposure != 0 || exposureOpen) numbers.exposure(ev) else null,
-                    face = engine.face,
-                )
-                qr?.let { if (it.corners.isNotEmpty()) QrMarks(it.corners) }
-                Box(
-                    Modifier
-                        .fillMaxSize()
-                        .pointerInput(Unit) {
-                            detectTapGestures(
-                                onTap = { offset ->
-                                    viewModel.focusAt(Point((offset.x / size.width).toDouble(), (offset.y / size.height).toDouble()))
-                                    // Night's extension has no exposure compensation
-                                    if (ui.mode != Mode.NIGHT) exposureOpen = true
-                                    exposureTouch = System.currentTimeMillis()
-                                },
-                                onLongPress = { offset ->
-                                    haptics.lock()
-                                    viewModel.lockAt(Point((offset.x / size.width).toDouble(), (offset.y / size.height).toDouble()))
-                                    exposureOpen = false
-                                },
-                            )
+                Box(Modifier.fillMaxSize().drawBehind { drawRect(colors.surface.copy(alpha = cover.value)) })
+                // The square's bands are solid (owner, 25 Nov 2026: translucent ones looked poor, being thin), under the marks: a tap there focuses and shows it
+                if (problem == null && stream == Aspect.FOUR_THREE) {
+                    Canvas(Modifier.fillMaxSize()) {
+                        val band = (size.height - size.width).coerceAtLeast(0f) / 2 * square.value.coerceIn(0f, 1f)
+                        if (band > 0f) {
+                            drawRect(colors.surface, size = Size(size.width, band))
+                            drawRect(colors.surface, topLeft = Offset(0f, size.height - band), size = Size(size.width, band))
                         }
-                        .pointerInput(ui.mode, modes) {
-                            // A horizontal swipe on the picture changes the mode by one (the modes of this camera: Night only where it has it)
-                            var travel = 0f
-                            detectHorizontalDragGestures(onDragStart = { travel = 0f }) { change, amount ->
-                                travel += amount
-                                val step = MODE_SWIPE_DP.dp.toPx()
-                                val index = modes.indexOf(ui.mode)
-                                if (abs(travel) >= step) {
-                                    val next = if (travel < 0) index + 1 else index - 1
-                                    travel = 0f
-                                    modes.getOrNull(next)?.let {
-                                        haptics.mode()
-                                        viewModel.selectMode(it)
-                                    }
-                                }
-                                change.consume()
+                    }
+                }
+                if (problem == null) {
+                    FinderMarks(
+                        focus = ui.focus,
+                        focusing = engine.focusing,
+                        locked = ui.locked,
+                        exposure = if (ui.exposure != 0 || exposureOpen) numbers.exposure(ev) else null,
+                        face = engine.face,
+                    )
+                    qr?.let { if (it.corners.isNotEmpty()) QrMarks(it.corners) }
+                    Box(
+                        Modifier
+                            .fillMaxSize()
+                            .pointerInput(Unit) {
+                                detectTapGestures(
+                                    onTap = { offset ->
+                                        viewModel.focusAt(Point((offset.x / size.width).toDouble(), (offset.y / size.height).toDouble()))
+                                        // Night's extension has no exposure compensation
+                                        if (ui.mode != Mode.NIGHT) exposureOpen = true
+                                        exposureTouch = System.currentTimeMillis()
+                                    },
+                                    onLongPress = { offset ->
+                                        haptics.lock()
+                                        viewModel.lockAt(Point((offset.x / size.width).toDouble(), (offset.y / size.height).toDouble()))
+                                        exposureOpen = false
+                                    },
+                                )
                             }
-                        },
-                )
+                            .pointerInput(ui.mode, modes) {
+                                // A horizontal swipe on the picture changes the mode by one (the modes of this camera: Night only where it has it)
+                                var travel = 0f
+                                detectHorizontalDragGestures(onDragStart = { travel = 0f }) { change, amount ->
+                                    travel += amount
+                                    val step = MODE_SWIPE_DP.dp.toPx()
+                                    val index = modes.indexOf(ui.mode)
+                                    if (abs(travel) >= step) {
+                                        val next = if (travel < 0) index + 1 else index - 1
+                                        travel = 0f
+                                        modes.getOrNull(next)?.let {
+                                            haptics.mode()
+                                            viewModel.selectMode(it)
+                                        }
+                                    }
+                                    change.consume()
+                                }
+                            },
+                    )
+                }
             }
-          }
-          if (problem == null) {
-              // The tilt read in here only: it changes many times a second and must not recompose the whole viewfinder
-              // Night's early postview over the picture until its file is out (SPEC §9.2)
-              postview?.takeIf { night }?.let { Image(it.asImageBitmap(), contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize()) }
-              Level(viewModel, ui.settings.grid, ui.settings.level, ui.rotation)
-              // Hold still: the crosshairs while a Night photo gathers its frames
-              if (ui.nightGathering && camera != null) NightCrosshairs(camera.lensView, ui.zoom, if (ui.settings.aspect == Aspect.SIXTEEN_NINE) 9.0 / 16 else 0.75, Modifier.fillMaxSize())
-              ui.countdown?.let { Countdown(it, turn, Modifier.align(Alignment.Center)) }
-              // Storage full: the picture stays, the shutter waits (SPEC §14.1)
-              if (phone.storageFull && recording == null) StorageFull(activity, entry.locked, Modifier.align(Alignment.Center).padding(16.dp))
-          } else {
-              CameraProblem(problem, onRetry = { viewModel.retry() }, modifier = Modifier.align(Alignment.Center).padding(16.dp))
-          }
+            FrozenLayer(frozenMotion, frozen, geometry, colors.surface)
+            // The blink of a shot over everything of the picture (a shot that waited for a new session blinks as it comes in)
+            Box(Modifier.place(area, frameNow).drawBehind { drawRect(colors.surface.copy(alpha = blink.value)) })
+            // What belongs to the photo's frame fades with the picture over a new session (its new place isn't seen jumping)
+            Box(Modifier.place(area, frameNow).graphicsLayer { alpha = minOf(frozenMotion.shown(frozen), 1f - cover.value) }, contentAlignment = Alignment.Center) {
+                if (problem == null) {
+                    // Night's early postview over the photo's frame until its file is out (SPEC §9.2)
+                    postview?.takeIf { night }?.let { Image(it.asImageBitmap(), contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize()) }
+                    // The tilt read in here only: it changes many times a second and must not recompose the whole viewfinder
+                    Level(viewModel, ui.settings.grid, ui.settings.level, ui.rotation)
+                    // Hold still: the crosshairs while a Night photo gathers its frames
+                    if (ui.nightGathering && camera != null) NightCrosshairs(camera.lensView, ui.zoom, if (ui.settings.aspect == Aspect.SIXTEEN_NINE) 9.0 / 16 else 0.75, Modifier.fillMaxSize())
+                }
+            }
+            // Not of the picture: the countdown and the full storage stay seen whatever the picture does
+            Box(Modifier.place(area, frameNow), contentAlignment = Alignment.Center) {
+                if (problem == null) {
+                    ui.countdown?.let { Countdown(it, turn, Modifier.align(Alignment.Center)) }
+                    // Storage full: the picture stays, the shutter waits (SPEC §14.1)
+                    if (phone.storageFull && recording == null) StorageFull(activity, entry.locked, Modifier.align(Alignment.Center).padding(16.dp))
+                }
+            }
+            if (problem != null) CameraProblem(problem, onRetry = { viewModel.retry() }, modifier = Modifier.align(Alignment.Center).padding(16.dp))
         }
+        val pictureTop = (frame.top - area.top).dp
 
         // The top row (SPEC §4.3, §6.3): state icons in two groups beside the camera's cutout; while recording only the flashlight
         if (problem == null && camera != null) {
@@ -658,8 +713,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                 }
             }
         }
-        // The recording's time, centred under the cutout
-        // In line with the top row, in its free middle
+        // The recording's time, in line with the top row, in its free middle
         if (recording != null) RecordingTime(recording, Modifier.align(Alignment.TopCenter).padding(top = status + 10.dp))
         // Indicators at the picture's top-start, one under another (SPEC §4.4): over the lock screen, for another app, a motion photo's video still
         // recording (SPEC §7.6), no sound in Video
@@ -1341,3 +1395,72 @@ private fun Level(viewModel: ViewfinderViewModel, grid: Grid, level: Boolean, ro
     val tilt by viewModel.tilt.collectAsStateWithLifecycle()
     GridAndLevel(grid, if (level) tilt else null, rotation, Modifier.fillMaxSize())
 }
+
+/** The stream a preview's buffer is: 16:9, or 4:3 for everything else (the square is shown over 4:3). */
+private fun streamOf(size: PixelSize?): Aspect = if (size != null && Sizes.near(size, Aspect.SIXTEEN_NINE)) Aspect.SIXTEEN_NINE else Aspect.FOUR_THREE
+
+/**
+ * Lays its content out at [rect] (dp, from the viewfinder's top-left) inside a parent at [area], at its full size even past the parent's edges (the 16:9
+ * stream's ends): the parent clips. The rectangle is read while laying out, so an animated one moves without recomposing.
+ */
+private fun Modifier.place(area: FinderRect, rect: () -> FinderRect) = layout { measurable, constraints ->
+    val r = rect()
+    val placeable = measurable.measure(Constraints.fixed(r.width.dp.roundToPx().coerceAtLeast(0), r.height.dp.roundToPx().coerceAtLeast(0)))
+    layout(constraints.maxWidth, constraints.maxHeight) { placeable.place((r.left - area.left).dp.roundToPx(), (r.top - area.top).dp.roundToPx()) }
+}
+
+/**
+ * A session rebuilt under the picture (LOGIKA §23.3, owner, 25 Nov 2026): the frozen last frame fades out to the background where it lay, the new geometry is
+ * set under the background, and the live picture fades in from it once the new session shows its first frame. Moving the frozen frame into the new geometry
+ * was tried first: a 16:9 frame has nothing for the sides 4:3 needs, and every fill of them showed.
+ */
+@Stable
+private class FrozenMotion {
+    var held by mutableStateOf<FrozenFrame?>(null)
+    /** The live picture is fading in (the frozen frame is gone, the background going). */
+    var incoming by mutableStateOf(false)
+    /** How much of a picture shows: the frozen frame going out (1 → 0), then the live one coming in (0 → 1). */
+    val visible = Animatable(1f)
+
+    /** What belongs to the picture (the grid, the level) shows as much as the picture does. */
+    fun shown(published: FrozenFrame?): Float = if (held == null && published == null) 1f else visible.value
+
+    suspend fun follow(frozen: FrozenFrame?, fade: FiniteAnimationSpec<Float>) {
+        if (frozen != null) {
+            // A new frame during a fade starts as far as the picture had come (it is a copy of the live one, which showed that much)
+            if (held == null) visible.snapTo(1f)
+            held = frozen
+            incoming = false
+            visible.animateTo(0f, fade)
+        } else if (held != null) {
+            // The fade out ends first when the new session was quicker
+            if (!incoming) visible.animateTo(0f, fade)
+            incoming = true
+            visible.animateTo(1f, fade)
+            held = null
+            incoming = false
+        }
+    }
+}
+
+/** The frozen frame where it lay, over the background, both going as [FrozenMotion] says. */
+@Composable
+private fun FrozenLayer(motion: FrozenMotion, published: FrozenFrame?, geometry: FinderGeometry, background: Color) {
+    // From the frame it is published, before the effect that follows it runs: the new surface under it has no picture yet
+    val frame = motion.held ?: published ?: return
+    val place = remember(frame, geometry) { geometry.content(geometry.sensor(frame.stream), frame.stream) }
+    Box(Modifier.fillMaxSize().graphicsLayer { alpha = if (motion.incoming) 1f - motion.visible.value else 1f }.background(background)) {
+        if (!motion.incoming) {
+            FrozenPicture(frame, Modifier.place(geometry.area) { place }.graphicsLayer { alpha = motion.visible.value })
+            // The bands it was seen with stay on it while it fades
+            if (frame.square) {
+                Canvas(Modifier.place(geometry.area) { place }) {
+                    val band = (size.height - size.width).coerceAtLeast(0f) / 2
+                    drawRect(background, size = Size(size.width, band))
+                    drawRect(background, topLeft = Offset(0f, size.height - band), size = Size(size.width, band))
+                }
+            }
+        }
+    }
+}
+

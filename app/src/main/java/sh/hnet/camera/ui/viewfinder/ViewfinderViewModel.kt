@@ -18,6 +18,7 @@ import androidx.lifecycle.viewModelScope
 import java.io.File
 import kotlin.math.acos
 import kotlin.math.sqrt
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
@@ -35,6 +36,7 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
@@ -45,6 +47,7 @@ import sh.hnet.camera.MotionPhoto
 import sh.hnet.camera.VolumeKeys
 import sh.hnet.camera.camera.AnalysisFrame
 import sh.hnet.camera.camera.CameraRequest
+import sh.hnet.camera.camera.CameraStatus
 import sh.hnet.camera.camera.CapturedPhoto
 import sh.hnet.camera.camera.EngineState
 import sh.hnet.camera.camera.Flash
@@ -57,6 +60,7 @@ import sh.hnet.camera.capabilities.model.Aspect
 import sh.hnet.camera.capabilities.model.PixelSize
 import sh.hnet.camera.capabilities.model.Point
 import sh.hnet.camera.capabilities.model.SessionLadder
+import sh.hnet.camera.capabilities.model.Sizes
 import sh.hnet.camera.capabilities.model.VideoChoice
 import sh.hnet.camera.media.LastShot
 import sh.hnet.camera.media.LocationTracker
@@ -234,6 +238,21 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
     }
 
+    /** The request the engine was told last: the live picture, the square's bands and the photo's frame follow it. */
+    private val _shown = MutableStateFlow<CameraRequest?>(null)
+    val shown: StateFlow<CameraRequest?> = _shown.asStateFlow()
+
+    /** The last live picture, fading out over a session being rebuilt (LOGIKA §23.3); null when the new session shows its first frame. */
+    private val _frozen = MutableStateFlow<FrozenFrame?>(null)
+    val frozen: StateFlow<FrozenFrame?> = _frozen.asStateFlow()
+    /** No frozen frame for a change: the live picture fades out to the background, until the new session shows its first frame. */
+    private val _covering = MutableStateFlow(false)
+    val covering: StateFlow<Boolean> = _covering.asStateFlow()
+    private var surface: Surface? = null
+    private var freezing: Job? = null
+    /** Resets of the controls a mode or camera change makes, sent when the change is told (before, the old session's picture would jump in its fade). */
+    private var onTold: (() -> Unit)? = null
+
     init {
         engine.resetControls()
         // The engine outlives this screen: it is told at once what this one wants (back camera, Photo), not only when a setting changes
@@ -295,6 +314,8 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
                     if (camera?.night != null && !application.nightSuggestionClosed && _entry.value !is Entry.Capture) _ui.update { it.copy(nightSuggested = true) }
                 }
         }
+        // The frozen frame goes when the new session shows its first frame, or when the camera has a problem instead
+        viewModelScope.launch { combine(engineState, _shown, _frozen, _covering) { _, _, _, _ -> }.collect { settle() } }
         viewModelScope.launch {
             var wasRecording = false
             engineState.collect { state ->
@@ -377,11 +398,16 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         return camera?.let { CameraRequest(it, ui.mode, settings.aspect, video, settings.ultraHdr, motion = motion, motionFirst = settings.motionPhoto == MotionPhoto.ON) }
     }
 
-    fun previewSize(): PixelSize? = request()?.let { engine.previewSize(it) }
+    /** Whether two requests are served by one session (the square's bands slide only then). */
+    fun sameSession(a: CameraRequest, b: CameraRequest) = engine.sameSession(a, b)
+
+    /** The live picture's buffer size: of the request the engine was told last (a new one is told after the last frame is frozen). */
+    fun previewSize(): PixelSize? = _shown.value?.let { engine.previewSize(it) }
 
     fun retry() = engine.retry()
 
-    private fun configure() {
+    /** [freeze]: the last frame is copied first when the change needs a new session (false: the copy is done or gave up). */
+    private fun configure(freeze: Boolean = true) {
         // The QR shortcut reads codes even with QR codes off in Settings: it was asked for
         analyzer.qrEnabled = _ui.value.mode == Mode.PHOTO && (_ui.value.settings.qrCodes || _ui.value.pointAtCode)
         // A viewfinder not shown doesn't touch the shared engine (another one may have it); start() configures
@@ -389,10 +415,72 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         // Not under a recording or a countdown: a new session would cut the video or lose the timed shot
         if (recording || _ui.value.countdown != null) {
             configureLater = true
+            // A frame frozen for the change would stay over the live picture until it comes
+            _frozen.value = null
+            _covering.value = false
+            told()
             return
         }
         configureLater = false
-        request()?.let { engine.configure(it) }
+        val next = request() ?: return
+        // A copy under way tells the engine the newest request when it is done
+        if (freezing != null) return
+        val before = _shown.value
+        if (freeze && before != null && !engine.sameSession(before, next) && freeze(before)) return
+        _shown.value = next
+        told()
+        engine.configure(next)
+    }
+
+    private fun told() {
+        onTold?.invoke()
+        onTold = null
+    }
+
+    /** Lifts the frozen frame or the cover once the session told shows its first frame, or the camera has a problem instead. */
+    private fun settle() {
+        // Not before the change is told (the old session's frames would count)
+        if ((_frozen.value == null && !_covering.value) || freezing != null) return
+        val state = engineState.value
+        val running = state.request
+        val shown = _shown.value
+        val live = state.status == CameraStatus.Ready && state.frameShown && running != null && shown != null && engine.sameSession(running, shown)
+        val problem = state.status is CameraStatus.Busy || state.status is CameraStatus.Blocked || state.status is CameraStatus.Error
+        if (live || problem) {
+            _frozen.value = null
+            _covering.value = false
+        }
+    }
+
+    /** Copies the live picture before its session goes; the change waits for the copy, at most [FREEZE_WAIT_MS]. False: nothing to copy. */
+    private fun freeze(before: CameraRequest): Boolean {
+        val surface = surface?.takeIf { it.isValid } ?: return false
+        val state = engineState.value
+        if (state.status != CameraStatus.Ready || !state.frameShown || _frozen.value != null) return false
+        val stream = engine.previewSize(before)?.let { if (Sizes.near(it, Aspect.SIXTEEN_NINE)) Aspect.SIXTEEN_NINE else Aspect.FOUR_THREE } ?: Aspect.FOUR_THREE
+        // Started only once it is known as the change under way: a copy refused at once would otherwise run before (the collector would take the old
+        // session's frames for the new one's)
+        val job = viewModelScope.launch(start = CoroutineStart.LAZY) {
+            val picture = withTimeoutOrNull(FREEZE_WAIT_MS) {
+                suspendCancellableCoroutine { cont -> FrozenFrame.copy(surface, application.mainExecutor) { cont.resume(it) { _, bitmap, _ -> bitmap?.recycle() } } }
+            }
+            if (picture != null) {
+                _frozen.value = FrozenFrame(picture, stream, before.pictureAspect, before.camera.sensorOrientation, before.camera.front)
+            } else {
+                // No copy (refused, or late): the live picture, still running, fades out first (a frame more: the fade starts with the next one)
+                _covering.value = true
+                delay(COVER_FADE_MS.toLong() + FRAME_MS)
+            }
+        }
+        freezing = job
+        job.invokeOnCompletion {
+            if (freezing === job) freezing = null
+            configure(freeze = false)
+            // A change undone meanwhile tells the engine nothing new: nothing else would lift the frame or the cover
+            settle()
+        }
+        job.start()
+        return true
     }
 
     private var started = false
@@ -435,6 +523,11 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
 
     fun stop() {
         started = false
+        freezing?.cancel()
+        _frozen.value = null
+        _covering.value = false
+        // start() pushes all the controls again
+        onTold = null
         // Only its own: another viewfinder may have taken the engine already
         if (engine.analyzer === analyze) engine.analyzer = null
         analyzer.reset()
@@ -452,9 +545,15 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         if (started && _ui.value.settings.location && location.allowed()) location.start() else location.stop()
     }
 
-    fun setPreviewSurface(surface: Surface) = engine.setPreviewSurface(surface)
+    fun setPreviewSurface(surface: Surface, size: PixelSize) {
+        this.surface = surface
+        engine.setPreviewSurface(surface, size)
+    }
 
-    fun clearPreviewSurface(surface: Surface) = engine.clearPreviewSurface(surface)
+    fun clearPreviewSurface(surface: Surface) {
+        if (this.surface == surface) this.surface = null
+        engine.clearPreviewSurface(surface)
+    }
 
     private val recording: Boolean get() = engineState.value.recording != null
 
@@ -465,8 +564,10 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         cancelTimer()
         _ui.update { it.copy(mode = mode, focus = null, locked = false, exposure = 0, torch = false, pointAtCode = false) }
         analyzer.reset()
-        engine.setTorch(false)
-        engine.resetFocus(exposure = 0)
+        onTold = {
+            engine.setTorch(false)
+            engine.resetFocus(exposure = 0)
+        }
         configure()
     }
 
@@ -477,10 +578,12 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         // Night stays only where the other camera has it too
         val mode = if (_ui.value.mode == Mode.NIGHT && cameras[next].night == null) Mode.PHOTO else _ui.value.mode
         _ui.update { it.copy(cameraIndex = next, mode = mode, zoom = 1.0, focus = null, locked = false, exposure = 0, torch = false, flashLevel = null) }
-        engine.setTorch(false)
-        engine.setZoom(1.0)
-        engine.resetFocus(exposure = 0)
-        applyLed()
+        onTold = {
+            engine.setTorch(false)
+            engine.setZoom(1.0)
+            engine.resetFocus(exposure = 0)
+            applyLed()
+        }
         analyzer.reset()
         configure()
     }
@@ -653,6 +756,14 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     /** The shutter: a recording ends, a running countdown is cancelled, a set timer starts one, else the photo is taken or the recording started. */
     fun shutterPressed() {
         if (_review.value != null) return
+        // A change waiting for its frozen frame isn't told to the engine yet: the shot waits for it (at most the copy's time), not taken on the old session
+        freezing?.let { job ->
+            viewModelScope.launch {
+                job.join()
+                shutterPressed()
+            }
+            return
+        }
         // The session of another mode still stands (a Night photo being put together keeps it a moment): the shutter waits for this mode's
         if (!sessionMatches) return
         // Nothing more fits: only a recording may still be stopped, a countdown cancelled
@@ -699,8 +810,9 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
             timerJob = null
             _ui.update { it.copy(countdown = null) }
             engine.setTorch(_ui.value.torch && !ledBlocked)
-            // A session put off by the countdown comes first; the engine waits for it before taking the shot or starting the recording
-            if (configureLater) configure()
+            // A session put off by the countdown comes first, told at once (no frozen frame to wait for); the engine waits for it before taking the shot or
+            // starting the recording
+            if (configureLater) configure(freeze = false)
             // Storage may have filled during the countdown
             if (phone.state.value.storageFull) return@launch
             when (_ui.value.mode) {
@@ -936,6 +1048,9 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private companion object {
+        /** A copy of the live picture that takes longer isn't waited for: the live picture fades out instead before the change goes on. */
+        const val FREEZE_WAIT_MS = 100L
+        const val FRAME_MS = 17L
         const val FOCUS_HOLD_DEGREES = 10.0
         const val LAST_SECONDS = 3
         const val BEEP_VOLUME = 60
