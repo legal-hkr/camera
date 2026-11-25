@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Calendar's amber, the dark variant (the app is always dark): the owner's exception to the theme colours – first the automatic flash that will fire
+     (23 Nov 2026), then every control over the picture that is on or set by hand (25 Nov 2026: primaryFixed looked dimmer than white, as if off) -->
+<resources>
+    <color name="overlay_active">#F5BF48</color>
+</resources>

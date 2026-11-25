@@ -686,7 +686,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
             val settings = ui.settings
             Row(Modifier.align(Alignment.TopStart).padding(start = 12.dp, top = topRowTop(status, start = 12.dp, end = 140.dp)), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                 if (video && camera.flash) {
-                    TopButton(if (ui.torch) R.drawable.ic_flashlight_on else R.drawable.ic_flashlight_off, stringResource(R.string.tooltip_flashlight), null, filled = ui.torch, turn = turn, enabled = !ledBlocked, onDisabled = { explain(ledReason) }) { viewModel.toggleTorch() }
+                    TopButton(if (ui.torch) R.drawable.ic_flashlight_on else R.drawable.ic_flashlight_off, stringResource(R.string.tooltip_flashlight), null, on = ui.torch, turn = turn, enabled = !ledBlocked, onDisabled = { explain(ledReason) }) { viewModel.toggleTorch() }
                 }
                 // Night's extension takes no flash
                 // The front camera's screen flash needs the camera's own exposure: not with Pro's set by hand
@@ -694,26 +694,27 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                     // With Pro's exposure set by hand, automatic means nothing: off or on (LOGIKA §25)
                     val shownFlash = if (proManual && ui.flash == Flash.AUTO) Flash.OFF else ui.flash
                     MenuButton(listOf((if (proManual) listOf(Flash.OFF, Flash.ON) else Flash.entries).map { f -> MenuChoice(stringResource(flashName(f)), f == shownFlash) { viewModel.setFlash(f) } })) { open ->
-                        // Automatic: the button's background shows when the flash will fire (the exposure asks for it, or the scene is dark)
+                        // Amber when on, or automatic and about to fire (the exposure asks for it, or the scene is dark); automatic and not about to: white, its "A"
+                        // says it is automatic (owner, 25 Nov 2026)
                         val willFire = ui.flash == Flash.AUTO && if (camera.front) engine.dark else engine.flashNeeded
                         // Heat or a low battery: the flash shows off and says why (SPEC §14.1)
                         if (ledBlocked) {
-                            TopButton(R.drawable.ic_flash_off, stringResource(R.string.tooltip_flash), stringResource(flashState(Flash.OFF)), filled = false, turn = turn, enabled = false, onDisabled = { explain(ledReason) }) {}
+                            TopButton(R.drawable.ic_flash_off, stringResource(R.string.tooltip_flash), stringResource(flashState(Flash.OFF)), on = false, turn = turn, enabled = false, onDisabled = { explain(ledReason) }) {}
                         } else {
-                            TopButton(flashIcon(shownFlash), stringResource(R.string.tooltip_flash), stringResource(flashState(shownFlash)), filled = shownFlash != Flash.OFF, turn = turn, accent = willFire && !proManual, onClick = open)
+                            TopButton(flashIcon(shownFlash), stringResource(R.string.tooltip_flash), stringResource(flashState(shownFlash)), on = shownFlash == Flash.ON, turn = turn, accent = willFire && !proManual, onClick = open)
                         }
                     }
                 }
                 if (recording == null && ui.countdown == null) {
                     MenuButton(listOf(listOf(0, 3, 10).map { t -> MenuChoice(if (t == 0) stringResource(R.string.menu_timer_off) else stringResource(R.string.value_seconds, t), t == ui.timer) { viewModel.setTimer(t) } })) { open ->
-                        TopButton(timerIcon(ui.timer), stringResource(R.string.tooltip_timer), null, filled = ui.timer != 0, turn = turn, onClick = open)
+                        TopButton(timerIcon(ui.timer), stringResource(R.string.tooltip_timer), null, on = ui.timer != 0, turn = turn, onClick = open)
                     }
                     val searching = locationOn && (fix == null || viewModel.location.current() == null)
                     TopButton(
                         if (!locationOn) R.drawable.ic_location_off else if (searching) R.drawable.ic_location_searching else R.drawable.ic_location_on,
                         stringResource(R.string.tooltip_location),
                         stringResource(if (!locationOn) R.string.desc_state_location_off else if (searching) R.string.desc_state_location_searching else R.string.desc_state_location_on),
-                        filled = locationOn,
+                        on = locationOn,
                         turn = turn,
                     ) { toggleLocation() }
                 }
@@ -734,8 +735,8 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                             if (on) R.drawable.ic_hdr_on else R.drawable.ic_hdr_off,
                             stringResource(R.string.tooltip_hdr),
                             stringResource(if (on) R.string.desc_state_hdr_on else R.string.desc_state_hdr_off),
-                            // HDR on is the default; off is the value that stands out
-                            filled = !on,
+                            // Amber while on: it is switched on (owner, 25 Nov 2026), its usual state though it is
+                            on = on,
                             turn = turn,
                             enabled = possible,
                             onDisabled = { explain(if (settings.videoHevc) hdrFps else hdrCodec) },
@@ -745,7 +746,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                     // Not in Pro either (SPEC §6.3)
                     if (!video && !night && !pro && capture == null) {
                         MenuButton(listOf(MotionPhoto.entries.map { m -> MenuChoice(stringResource(motionName(m)), m == settings.motionPhoto) { viewModel.setMotionPhoto(m) } })) { open ->
-                            TopButton(motionIcon(settings.motionPhoto), stringResource(R.string.tooltip_motion_photo), stringResource(motionState(settings.motionPhoto)), filled = settings.motionPhoto != MotionPhoto.AUTO, turn = turn, onClick = open)
+                            TopButton(motionIcon(settings.motionPhoto), stringResource(R.string.tooltip_motion_photo), stringResource(motionState(settings.motionPhoto)), on = settings.motionPhoto == MotionPhoto.ON, turn = turn, onClick = open)
                         }
                     }
                     if (video && capture?.lowQuality != true) {
@@ -763,10 +764,10 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                         // Held sideways the pill is too narrow for "4K 30" turned: "4K" over "30"
                         val sideways = ui.rotation == 90 || ui.rotation == 270
                         val stacked = if (sideways) listOf(stringResource(if (uhd) R.string.menu_resolution_4k else R.string.menu_resolution_1080p), "${recorded?.fps ?: viewModel.videoFps}") else null
-                        MenuButton(groups) { open -> TopTextButton(label, stringResource(R.string.tooltip_video_quality), filled = false, turn = turn, stacked = stacked, onClick = open) }
+                        MenuButton(groups) { open -> TopTextButton(label, stringResource(R.string.tooltip_video_quality), turn = turn, stacked = stacked, onClick = open) }
                     } else {
                         MenuButton(listOf(Aspect.entries.map { a -> MenuChoice(aspectText(a), a == settings.aspect) { viewModel.setAspect(a) } })) { open ->
-                            TopTextButton(aspectText(settings.aspect), stringResource(R.string.tooltip_aspect_ratio), filled = settings.aspect != Aspect.FOUR_THREE, turn = turn, onClick = open)
+                            TopTextButton(aspectText(settings.aspect), stringResource(R.string.tooltip_aspect_ratio), turn = turn, onClick = open)
                         }
                     }
                 }
@@ -954,14 +955,12 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                     },
                 )
             },
+            // The row ticks for itself
             onSelect = {
-                if (it == null) {
-                    moreSheet = true
-                } else {
-                    if (it != ui.mode) haptics.mode()
-                    viewModel.selectMode(it)
-                }
+                if (it == null) moreSheet = true else viewModel.selectMode(it)
             },
+            // "More" opens its sheet only when tapped, never under a sliding row
+            slidable = { it != null },
             modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = modeBottom),
         )
     }

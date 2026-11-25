@@ -4,7 +4,6 @@ package sh.hnet.camera.ui.viewfinder
 
 import androidx.annotation.DrawableRes
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -19,7 +18,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.selection.selectableGroup
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ButtonGroupDefaults
 import androidx.compose.material3.DropdownMenuGroup
@@ -28,7 +26,6 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.ListItemShapes
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.MenuDefaults
@@ -44,6 +41,7 @@ import androidx.compose.material3.TooltipAnchorPosition
 import androidx.compose.material3.TooltipBox
 import androidx.compose.material3.TooltipDefaults
 import androidx.compose.material3.rememberTooltipState
+import androidx.compose.material3.ripple
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -52,7 +50,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.rotate
-import androidx.compose.ui.res.colorResource
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
@@ -84,24 +81,29 @@ fun controlTurn(rotation: Int): Float {
 }
 
 /**
- * A button of the top row (SPEC §4.3): a 40 dp circle of finder glass with a 20 dp icon, filled `secondaryContainer` when its value isn't the mode's default;
- * disabled in the component's disabled colour, a tap then explaining why. Long press shows its name.
+ * A button of the top row (SPEC §4.3): a 20 dp icon over the picture without a surface, with a shadow (owner, 25 Nov 2026) – white, amber when it is [on]
+ * (switched on: the flashlight, the flash, the timer, location, HDR, the motion photo always; owner, 25 Nov 2026 – what is off stays white, its icon
+ * saying so) or [accent]; disabled dimmed, a tap then explaining why. 40 dp to touch; long press shows its name.
  */
 @Composable
 fun TopButton(
     @DrawableRes icon: Int,
     label: String,
     state: String?,
-    filled: Boolean,
+    on: Boolean,
     turn: Float,
     enabled: Boolean = true,
     onDisabled: () -> Unit = {},
-    /** Stands out in amber (the automatic flash that will fire with the next photo; Calendar's amber, the owner's exception to the theme colours). */
+    /** Stands out as on although its value is the default: the automatic flash that will fire with the next photo. */
     accent: Boolean = false,
     onClick: () -> Unit,
 ) {
-    val colors = MaterialTheme.colorScheme
-    val disabled = IconButtonDefaults.iconButtonColors().disabledContentColor
+    val overlay = overlayColors()
+    val tint = when {
+        !enabled -> overlay.content.copy(alpha = DISABLED_ALPHA)
+        accent || on -> overlay.accent
+        else -> overlay.content
+    }
     TooltipBox(
         positionProvider = TooltipDefaults.rememberTooltipPositionProvider(TooltipAnchorPosition.Below),
         tooltip = { PlainTooltip { Text(label) } },
@@ -111,33 +113,23 @@ fun TopButton(
             contentAlignment = Alignment.Center,
             modifier = Modifier
                 .size(40.dp)
-                .then(
-                    when {
-                        accent && enabled -> Modifier.background(colorResource(R.color.flash_ready_fill), CircleShape)
-                        filled && enabled -> Modifier.background(colors.secondaryContainer, CircleShape)
-                        else -> Modifier.controlSurface(CircleShape, controlColor())
-                    },
-                )
-                .clickable(role = Role.Button) { if (enabled) onClick() else onDisabled() }
+                // The ripple round, the shadow not cut by it
+                .clickable(interactionSource = null, indication = ripple(bounded = false, radius = 20.dp), role = Role.Button) { if (enabled) onClick() else onDisabled() }
                 .semantics {
                     contentDescription = label
                     state?.let { stateDescription = it }
                 },
         ) {
-            Icon(
-                painterResource(icon),
-                contentDescription = null,
-                tint = if (!enabled) disabled else if (accent) colorResource(R.color.flash_ready_on) else if (filled) colors.onSecondaryContainer else colors.onSurface,
-                modifier = Modifier.size(20.dp).rotate(turn),
-            )
+            Shadowed(Modifier.rotate(turn), alpha = if (enabled) 1f else DISABLED_ALPHA) { shadow -> Icon(painterResource(icon), contentDescription = null, tint = shadow ?: tint, modifier = Modifier.size(20.dp)) }
         }
     }
 }
 
-/** A text button of the top row ("4:3", "4K 30"): a pill 40 dp high, the text's width plus 22 dp, at least 48. */
+/** A text button of the top row ("4:3", "4K 30"): its text over the picture with a shadow as the icons are, white (a value, not a switch), 40 dp high, at least 48 wide to touch. */
 @Composable
-fun TopTextButton(text: String, label: String, filled: Boolean, turn: Float, stacked: List<String>? = null, onClick: () -> Unit) {
-    val colors = MaterialTheme.colorScheme
+fun TopTextButton(text: String, label: String, turn: Float, stacked: List<String>? = null, onClick: () -> Unit) {
+    val overlay = overlayColors()
+    val color = overlay.content
     TooltipBox(
         positionProvider = TooltipDefaults.rememberTooltipPositionProvider(TooltipAnchorPosition.Below),
         tooltip = { PlainTooltip { Text(label) } },
@@ -148,18 +140,19 @@ fun TopTextButton(text: String, label: String, filled: Boolean, turn: Float, sta
             modifier = Modifier
                 .height(40.dp)
                 .defaultMinSize(minWidth = 48.dp)
-                .then(if (filled) Modifier.background(colors.secondaryContainer, CircleShape) else Modifier.controlSurface(CircleShape, controlColor()))
-                .clickable(role = Role.Button, onClick = onClick)
+                .clickable(interactionSource = null, indication = ripple(bounded = false, radius = 24.dp), role = Role.Button, onClick = onClick)
                 .semantics { contentDescription = label }
                 .padding(horizontal = 11.dp),
         ) {
-            val color = if (filled) colors.onSecondaryContainer else colors.onSurface
-            if (stacked == null) {
-                Text(text, style = MaterialTheme.typography.labelMedium, color = color, modifier = Modifier.rotate(turn))
-            } else {
-                // The parts one over the other, as the phone is held
-                Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.rotate(turn)) {
-                    stacked.forEach { Text(it, style = MaterialTheme.typography.labelMedium, color = color, lineHeight = MaterialTheme.typography.labelMedium.fontSize) }
+            Shadowed(Modifier.rotate(turn)) { shadow ->
+                val ink = shadow ?: color
+                if (stacked == null) {
+                    Text(text, style = MaterialTheme.typography.labelLarge, color = ink)
+                } else {
+                    // The parts one over the other, as the phone is held
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        stacked.forEach { Text(it, style = MaterialTheme.typography.labelLarge, color = ink, lineHeight = MaterialTheme.typography.labelLarge.fontSize) }
+                    }
                 }
             }
         }
@@ -404,3 +397,6 @@ fun gridName(grid: Grid) = when (grid) {
     Grid.THIRDS -> R.string.label_grid_thirds
     Grid.QUARTERS -> R.string.label_grid_quarters
 }
+
+/** A disabled control over the picture: its colour dimmed as the components' own disabled content. */
+private const val DISABLED_ALPHA = 0.38f

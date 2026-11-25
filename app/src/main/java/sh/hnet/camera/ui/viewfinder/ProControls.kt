@@ -3,6 +3,7 @@
 package sh.hnet.camera.ui.viewfinder
 
 import androidx.annotation.DrawableRes
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.Arrangement
@@ -15,6 +16,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.TextAutoSize
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.Icon
@@ -22,6 +24,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.SegmentedListItem
 import androidx.compose.material3.Text
+import androidx.compose.material3.ripple
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -32,7 +35,9 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
@@ -40,6 +45,7 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import kotlin.math.roundToInt
 import sh.hnet.camera.R
 import sh.hnet.camera.ui.components.RowIcon
@@ -49,28 +55,28 @@ import sh.hnet.camera.ui.components.settingsRowColors
 /** Pro's values on its tiles (SPEC §11). */
 enum class ProValue { ISO, SHUTTER, FOCUS, WHITE_BALANCE, EV }
 
-/** How a Pro tile looks: its value automatic (glass), set by hand (`primaryContainer`), or with its ruler open (`primary`). */
+/** How a Pro tile looks: its value automatic (white), set by hand (`primaryFixed`), or with its ruler open (`primaryFixed`, a bar under the value). */
 enum class TileLook { AUTO, MANUAL, SELECTED }
 
 /**
- * Pro's row of value tiles (SPEC §11, board 10): 54 × 48 dp, the key small above the value; then `restart_alt` (everything automatic). A tile without [onClick]
- * only shows its value.
+ * Pro's row of value tiles (SPEC §11, board 10): the key small above the value, over the picture without a surface and with a shadow (owner, 25 Nov 2026),
+ * spread evenly over the width; then `restart_alt` (everything automatic). A tile without [onClick] only shows its value.
  */
 @Composable
 fun ProTiles(tiles: List<ProTile>, onReset: () -> Unit, turn: Float, modifier: Modifier = Modifier) {
     val label = stringResource(R.string.tooltip_all_auto)
-    Row(modifier, horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
-        tiles.forEach { ProTileView(it, turn) }
+    val overlay = overlayColors()
+    Row(modifier.fillMaxWidth().padding(horizontal = 8.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+        // On a narrow screen the tiles give way, the reset button keeps its size
+        tiles.forEach { ProTileView(it, turn, Modifier.weight(1f, fill = false)) }
         Box(
             Modifier
-                .padding(start = 2.dp)
-                .size(40.dp)
-                .controlSurface(CircleShape, controlColor())
-                .clickable(role = Role.Button, onClick = onReset)
+                .size(48.dp)
+                .clickable(interactionSource = null, indication = ripple(bounded = false, radius = 24.dp), role = Role.Button, onClick = onReset)
                 .semantics { contentDescription = label },
             contentAlignment = Alignment.Center,
         ) {
-            Icon(painterResource(R.drawable.ic_restart_alt), contentDescription = null, modifier = Modifier.size(22.dp).rotate(turn))
+            Shadowed(Modifier.rotate(turn)) { shadow -> Icon(painterResource(R.drawable.ic_restart_alt), contentDescription = null, tint = shadow ?: overlay.content, modifier = Modifier.size(22.dp)) }
         }
     }
 }
@@ -79,27 +85,37 @@ fun ProTiles(tiles: List<ProTile>, onReset: () -> Unit, turn: Float, modifier: M
 class ProTile(val key: String, val value: String, val look: TileLook, val onClick: (() -> Unit)?)
 
 @Composable
-private fun ProTileView(tile: ProTile, turn: Float) {
-    val colors = MaterialTheme.colorScheme
-    val (container, content, keyColor) = when (tile.look) {
-        TileLook.AUTO -> Triple(controlColor(), colors.onSurface, colors.onSurfaceVariant)
-        TileLook.MANUAL -> Triple(colors.primaryContainer, colors.onPrimaryContainer, colors.onPrimaryContainer)
-        TileLook.SELECTED -> Triple(colors.primary, colors.onPrimary, colors.onPrimary)
-    }
-    val shape = RoundedCornerShape(14.dp)
-    Column(
-        Modifier
-            .size(54.dp, 48.dp)
-            .controlSurface(shape, container)
-            .then(tile.onClick?.let { Modifier.clickable(role = Role.Button, onClick = it) } ?: Modifier)
-            .rotate(turn),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center,
+private fun ProTileView(tile: ProTile, turn: Float, modifier: Modifier = Modifier) {
+    val overlay = overlayColors()
+    val ink = if (tile.look == TileLook.AUTO) overlay.content else overlay.accent
+    Box(
+        modifier
+            .size(58.dp, 52.dp)
+            // The ripple fills the tile without cutting the text's shadow; the key and value read as one
+            .then(tile.onClick?.let { Modifier.clickable(interactionSource = null, indication = ripple(bounded = false, radius = 30.dp), role = Role.Button, onClick = it) } ?: Modifier.semantics(mergeDescendants = true) {}),
+        contentAlignment = Alignment.Center,
     ) {
-        Text(tile.key, style = MaterialTheme.typography.labelSmall, color = keyColor, maxLines = 1)
-        Text(tile.value, style = MaterialTheme.typography.labelMedium.copy(fontFeatureSettings = "tnum"), color = content, maxLines = 1)
+        Shadowed(Modifier.rotate(turn)) { shadow ->
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text(tile.key, style = MaterialTheme.typography.labelSmall, color = shadow ?: ink.copy(alpha = if (tile.look == TileLook.AUTO) KEY_ALPHA else 1f), maxLines = 1)
+                // A long value ("1/8000 s") shrinks to fit rather than lose its unit
+                Text(
+                    tile.value,
+                    style = MaterialTheme.typography.labelLarge.copy(fontFeatureSettings = "tnum"),
+                    color = shadow ?: ink,
+                    maxLines = 1,
+                    softWrap = false,
+                    autoSize = TextAutoSize.StepBased(minFontSize = 10.sp, maxFontSize = MaterialTheme.typography.labelLarge.fontSize),
+                )
+                // The open one: a bar under its value
+                Box(Modifier.padding(top = 2.dp).size(18.dp, 3.dp).clip(RoundedCornerShape(2.dp)).background(if (tile.look == TileLook.SELECTED) shadow ?: ink else Color.Transparent))
+            }
+        }
     }
 }
+
+/** The key of an automatic tile, a little softer than its value. */
+private const val KEY_ALPHA = 0.85f
 
 /**
  * A Pro ruler (SPEC §5.3): the "A" button (that one value automatic again) and a ruler of [count] steps, dragged directly; [index] the step shown (an automatic
