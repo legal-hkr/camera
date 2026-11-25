@@ -2,7 +2,7 @@
 
 A private camera for Android: Ultra HDR photos, motion photos, HDR video and QR codes, with no Internet access.
 
-**Current version**: v0.1.0
+**Current version**: v0.2.0
 
 Source code and releases: [git.hnet.sh/hkr/camera](https://git.hnet.sh/hkr/camera)
 
@@ -21,6 +21,8 @@ Camera takes photos and videos at the best quality the phone’s hardware allows
 - 4:3, 16:9 and 1:1 aspect ratios, flash with adjustable strength, a screen flash for selfies, and optional mirrored selfies
 - A 3- or 10-second timer, optionally counted down with the flash LED
 - Tap to focus and meter, touch and hold to lock exposure and focus, exposure compensation, face detection
+- Night mode using the phone’s own Night processing, with crosshairs that help you hold the phone steady
+- Bursts of up to 150 photos while you hold the shutter, grouped the same way as in Google’s camera
 
 ### Video
 

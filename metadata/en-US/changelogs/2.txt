@@ -1,0 +1,11 @@
+v0.2.0
+
+New:
+- Night mode using the phone’s own Night processing, with crosshairs to help you hold still and a suggestion when it gets dark
+- Bursts: hold the shutter or a volume key for up to 150 photos
+
+Changes:
+- The screen turns off after two minutes without use
+- Smooth transitions when changing aspect ratio, mode or camera
+- With HDR off, the preview shows the photo exactly as it will be saved
+- Better detection of dark scenes for the automatic flash

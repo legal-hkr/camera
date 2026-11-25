@@ -6,6 +6,8 @@ Zdjęcia:
 - Proporcje 4:3, 16:9 i 1:1, lampa z regulacją mocy, błysk ekranu przy selfie i opcjonalnie selfie jak w lustrze
 - Samowyzwalacz 3 albo 10 s, opcjonalnie z odliczaniem diodą lampy
 - Ostrość i pomiar światła po dotknięciu, blokada ekspozycji i ostrości po przytrzymaniu, korekta ekspozycji, wykrywanie twarzy
+- Tryb „Noc” korzystający z nocnego przetwarzania telefonu, z celownikami, które pomagają utrzymać telefon nieruchomo
+- Serie do 150 zdjęć przy przytrzymanym spuście, grupowane tak jak w aparacie Google
 
 Filmy:
 - 4K i 1080p przy 24, 30 albo 60 kl./s, HDR (HLG) do 30 kl./s, kodek HEVC albo AVC

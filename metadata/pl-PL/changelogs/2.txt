@@ -1,0 +1,11 @@
+v0.2.0
+
+Nowości:
+- Tryb „Noc” z nocnym przetwarzaniem telefonu, celownikami pomagającymi utrzymać telefon nieruchomo i podpowiedzią, gdy robi się ciemno
+- Serie: do 150 zdjęć po przytrzymaniu spustu albo przycisku głośności
+
+Zmiany:
+- Ekran wygasa po dwóch minutach bezczynności
+- Płynne przejścia przy zmianie proporcji, trybu i kamery
+- Przy wyłączonym HDR podgląd pokazuje zdjęcie dokładnie takie, jakie zostanie zapisane
+- Lepsze rozpoznawanie ciemnych scen przy automatycznej lampie

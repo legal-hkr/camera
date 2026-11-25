@@ -6,6 +6,8 @@ Photos:
 - 4:3, 16:9 and 1:1 aspect ratios, flash with adjustable strength, a screen flash for selfies, and optional mirrored selfies
 - A 3- or 10-second timer, optionally counted down with the flash LED
 - Tap to focus and meter, touch and hold to lock exposure and focus, exposure compensation, face detection
+- Night mode using the phone’s own Night processing, with crosshairs that help you hold the phone steady
+- Bursts of up to 150 photos while you hold the shutter, grouped the same way as in Google’s camera
 
 Video:
 - 4K and 1080p at 24, 30 or 60 fps, HLG HDR up to 30 fps, HEVC or AVC
