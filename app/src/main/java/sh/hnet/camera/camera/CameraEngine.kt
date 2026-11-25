@@ -70,18 +70,21 @@ import kotlinx.coroutines.withTimeoutOrNull
 import sh.hnet.camera.capabilities.CameraCatalog
 import sh.hnet.camera.capabilities.CameraSpec
 import sh.hnet.camera.capabilities.model.Aspect
+import sh.hnet.camera.capabilities.model.Exposure
 import sh.hnet.camera.capabilities.model.Orientation
 import sh.hnet.camera.capabilities.model.PictureRange
 import sh.hnet.camera.capabilities.model.PixelRect
 import sh.hnet.camera.capabilities.model.PixelSize
 import sh.hnet.camera.capabilities.model.Point
+import sh.hnet.camera.capabilities.model.ProExposure
 import sh.hnet.camera.capabilities.model.SessionLadder
 import sh.hnet.camera.capabilities.model.Sizes
 import sh.hnet.camera.capabilities.model.StillFormat
 import sh.hnet.camera.capabilities.model.StillPlan
 import sh.hnet.camera.capabilities.model.VideoChoice
 
-enum class Mode { PHOTO, VIDEO, NIGHT }
+/** The engine's modes; [PRO] is Photo's session with the values set by hand (no motion photo). */
+enum class Mode { PHOTO, VIDEO, NIGHT, PRO }
 
 /** What the viewfinder wants: which camera, in which mode and aspect ratio. */
 data class CameraRequest(val camera: CameraSpec, val mode: Mode, val aspect: Aspect, val video: VideoChoice = VideoChoice(), val ultraHdr: Boolean = true, val motion: Boolean = false, val motionFirst: Boolean = false) {
@@ -145,6 +148,8 @@ data class Controls(
     val flash: Flash = Flash.OFF,
     /** The flash's strength level, null for the camera's default. */
     val flashLevel: Int? = null,
+    /** Pro's exposure set by hand (both values), null for the camera's own. */
+    val manual: Exposure? = null,
 )
 
 /** A Night photo on its way: its frames gathered (true) or not, the extension's progress (0–100) while it puts the photo together, and the photo. */
@@ -364,9 +369,35 @@ class CameraEngine(context: Context) {
     }
 
     fun setExposure(steps: Int) = scope.launch {
+        if (controls.exposure == steps) return@launch
         controls = controls.copy(exposure = steps)
         repeat()
     }
+
+    /**
+     * Pro's exposure set by hand (LOGIKA §26): both given, the camera's own exposure is off and they are used – the photo as they are, the preview with the time
+     * held short and the gain it loses added ([ProExposure.preview]); null, the camera's own exposure again. Only in Pro.
+     */
+    fun setManualExposure(exposure: Exposure?) = scope.launch {
+        if (controls.manual == exposure) return@launch
+        controls = controls.copy(manual = exposure)
+        repeat()
+    }
+
+    private val _exposureNow = MutableStateFlow<Exposure?>(null)
+
+    /** The preview's exposure as the camera reports it (the gain after RAW counted in), a few times a second: Pro's automatic values. */
+    val exposureNow: StateFlow<Exposure?> = _exposureNow.asStateFlow()
+    private var exposureNowAt = 0L
+
+    /** A frame's exposure as its result said, and whether the camera's own exposure had settled. */
+    class SeenExposure(val exposure: Exposure, val settled: Boolean)
+
+    /** The last results' exposures by their sensor time: the metering pairs a frame it measured with the exposure it really had. */
+    private val seen = ArrayDeque<Pair<Long, SeenExposure>>()
+
+    /** The exposure of the frame taken at [timestampNs] (the analysis frame's), if its result is still known. */
+    fun exposureAt(timestampNs: Long): SeenExposure? = synchronized(seen) { seen.lastOrNull { it.first == timestampNs }?.second }
 
     /** Focus and meter at a point of the preview. With [lock] the exposure is metered there first and locked once it settles (AE/AF lock), and focus stays. */
     fun focusAt(point: Point, lock: Boolean) = scope.launch {
@@ -428,7 +459,9 @@ class CameraEngine(context: Context) {
         val request = desired.value.request ?: return null
         val device = device ?: return null
         // The flash meters first: always when on, when auto only if the exposure says the flash is needed (daylight shots stay quick, from the buffer)
-        val flashShot = request.mode == Mode.PHOTO && request.camera.flash && !controls.torch && (controls.flash == Flash.ON || (controls.flash == Flash.AUTO && _state.value.flashNeeded))
+        // With the exposure set by hand the flash fires as it is, without metering
+        val manual = manualExposure(request)
+        val flashShot = manual == null && (request.mode == Mode.PHOTO || request.mode == Mode.PRO) && request.camera.flash && !controls.torch && (controls.flash == Flash.ON || (controls.flash == Flash.AUTO && _state.value.flashNeeded))
         val metered = precapture || flashShot
         // A locked exposure stays as it is: metering again would wait in vain
         if (metered && !controls.locked) {
@@ -444,9 +477,10 @@ class CameraEngine(context: Context) {
         builder.addTarget(output.reader.surface)
         // The motion photo's video keeps its frame at the shot where one request may hold both (SDR; HLG streams can't go with the still's), and not when the
         // still may come from an earlier frame (ZSL), whose time would go back in the video
-        val zsl = request.camera.zsl && !video && !metered
+        // Nor with the exposure set by hand: the buffer's frames have the preview's (shorter) one
+        val zsl = request.camera.zsl && !video && !metered && manual == null
         if (_state.value.range == PictureRange.SDR && !zsl) motion?.let { builder.addTarget(it.surface) }
-        applyControls(builder, request)
+        applyControls(builder, request, still = true)
         // Set either way: the still template may turn the buffer on by itself, and a flash photo must not come from it
         if (request.camera.zsl) builder.set(CaptureRequest.CONTROL_ENABLE_ZSL, zsl)
         location?.let { builder.set(CaptureRequest.JPEG_GPS_LOCATION, it) }
@@ -474,7 +508,7 @@ class CameraEngine(context: Context) {
                 if (target == output.reader.surface) failed.complete(Unit)
             }
         }, handler)
-        val image = withTimeoutOrNull(STILL_TIMEOUT_MS) {
+        val image = withTimeoutOrNull(stillTimeoutMs()) {
             var found: StillImage? = null
             while (found == null) {
                 val next = select<StillImage?> {
@@ -700,7 +734,7 @@ class CameraEngine(context: Context) {
         while (true) {
             val before = Triple(capture, clipping.get(), nightInFlight.get())
             if (before.first == null && before.second == 0 && before.third == 0) break
-            capture?.let { inFlight -> withTimeoutOrNull(STILL_TIMEOUT_MS) { inFlight.await() } }
+            capture?.let { inFlight -> withTimeoutOrNull(stillTimeoutMs()) { inFlight.await() } }
             if (clipping.get() > 0) withTimeoutOrNull(CLIP_WAIT_MS) { while (clipping.get() > 0) delay(SETTLE_POLL_MS) }
             val night = nightInFlight.get()
             if (night > 0) withTimeoutOrNull(NIGHT_TIMEOUT_MS) { while (nightInFlight.get() >= night) delay(SETTLE_POLL_MS) }
@@ -808,7 +842,7 @@ class CameraEngine(context: Context) {
     private fun rungs(request: CameraRequest): List<Rung> {
         val spec = request.camera
         return when (request.mode) {
-            Mode.PHOTO -> SessionLadder.photo(spec.hlg, spec.jpegR.isNotEmpty(), wantMotion = request.motion, wantAnalysis = true, wantUltraHdr = request.ultraHdr, motionFirst = request.motionFirst).map { Rung(it.range, it.still, null, it.analysis, it.motion) }
+            Mode.PHOTO, Mode.PRO -> SessionLadder.photo(spec.hlg, spec.jpegR.isNotEmpty(), wantMotion = request.motion, wantAnalysis = true, wantUltraHdr = request.ultraHdr, motionFirst = request.motionFirst).map { Rung(it.range, it.still, null, it.analysis, it.motion) }
             Mode.VIDEO -> {
                 // AVC only where chosen (Settings › Video) or HEVC is missing; HLG is always HEVC
                 val hevc = request.video.hevc && Encoders.hevc()
@@ -1121,7 +1155,8 @@ class CameraEngine(context: Context) {
             builder.addTarget(surface)
             addRecordingTarget(builder)
             applyControls(builder, request)
-            if (!flashMetering) builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
+            // Not with Pro's exposure set by hand: a one-off frame of the camera's own exposure would blink and mislead the metering
+            if (!flashMetering && manualExposure(request) == null) builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
             if (request.camera.autofocus) builder.set(CaptureRequest.CONTROL_AF_TRIGGER, af)
             if (precapture) builder.set(CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER, CameraMetadata.CONTROL_AE_PRECAPTURE_TRIGGER_START)
             session.capture(builder.build(), null, handler)
@@ -1130,7 +1165,14 @@ class CameraEngine(context: Context) {
         }
     }
 
-    private fun applyControls(builder: CaptureRequest.Builder, request: CameraRequest) {
+    /** How long a still is waited for: a long exposure set by hand (up to 16 s) on top of the usual. */
+    private fun stillTimeoutMs() = STILL_TIMEOUT_MS + (controls.manual?.timeNs ?: 0L) / 1_000_000
+
+    /** Pro's exposure set by hand, where it applies (Pro, a camera with the manual sensor). */
+    private fun manualExposure(request: CameraRequest): Exposure? = controls.manual?.takeIf { request.mode == Mode.PRO && request.camera.manualSensor }
+
+    /** [still]: a photo's request (the exposure set by hand as it is, the flash fired); otherwise a preview's. */
+    private fun applyControls(builder: CaptureRequest.Builder, request: CameraRequest, still: Boolean = false) {
         val spec = request.camera
         builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
         builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
@@ -1144,7 +1186,7 @@ class CameraEngine(context: Context) {
         }
         if (spec.flash) {
             // The torch (flashlight, the timer's LED) needs plain auto-exposure; the photo flash is the exposure's mode
-            val photoFlash = request.mode == Mode.PHOTO && !controls.torch
+            val photoFlash = (request.mode == Mode.PHOTO || request.mode == Mode.PRO) && !controls.torch
             builder.set(
                 CaptureRequest.CONTROL_AE_MODE,
                 when {
@@ -1169,6 +1211,16 @@ class CameraEngine(context: Context) {
             val rect = arrayOf(MeteringRectangle(region.left, region.top, region.width, region.height, MeteringRectangle.METERING_WEIGHT_MAX - 1))
             if (spec.afRegions > 0) builder.set(CaptureRequest.CONTROL_AF_REGIONS, rect)
             if (spec.aeRegions > 0) builder.set(CaptureRequest.CONTROL_AE_REGIONS, rect)
+        }
+        manualExposure(request)?.let { manual ->
+            val exposure = if (still) manual else ProExposure.preview(manual, spec.isoRange.last)
+            builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
+            builder.set(CaptureRequest.SENSOR_SENSITIVITY, exposure.iso)
+            builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, exposure.timeNs)
+            // The preview keeps its pace where the time allows; a photo takes as long as its time
+            builder.set(CaptureRequest.SENSOR_FRAME_DURATION, if (still) exposure.timeNs else maxOf(exposure.timeNs, PREVIEW_FRAME_NS))
+            // The flash without the camera's exposure: fired once with the photo when it is on (automatic means nothing when the exposure is the user's)
+            if (spec.flash && !controls.torch) builder.set(CaptureRequest.FLASH_MODE, if (still && controls.flash == Flash.ON) CameraMetadata.FLASH_MODE_SINGLE else CameraMetadata.FLASH_MODE_OFF)
         }
     }
 
@@ -1222,6 +1274,26 @@ class CameraEngine(context: Context) {
 
     private fun onResult(result: TotalCaptureResult) {
         result.get(CaptureResult.SENSOR_TIMESTAMP)?.let { latestFrameNs = maxOf(latestFrameNs, it) }
+        // Pro's values: every frame's kept for the metering, a few a second shown (not with every frame: whoever shows them would redraw each time)
+        val iso = result.get(CaptureResult.SENSOR_SENSITIVITY)
+        val time = result.get(CaptureResult.SENSOR_EXPOSURE_TIME)
+        val stamp = result.get(CaptureResult.SENSOR_TIMESTAMP)
+        if (iso != null && time != null) {
+            val boost = result.get(CaptureResult.CONTROL_POST_RAW_SENSITIVITY_BOOST)?.takeIf { it > 0 } ?: 100
+            val exposure = Exposure(iso * boost / 100, time)
+            if (stamp != null) {
+                val settled = result.get(CaptureResult.CONTROL_AE_STATE) == CameraMetadata.CONTROL_AE_STATE_CONVERGED
+                synchronized(seen) {
+                    seen.addLast(stamp to SeenExposure(exposure, settled))
+                    while (seen.size > SEEN_KEPT) seen.removeFirst()
+                }
+            }
+            val now = SystemClock.uptimeMillis()
+            if (now - exposureNowAt >= EXPOSURE_NOW_MS) {
+                exposureNowAt = now
+                _exposureNow.value = exposure
+            }
+        }
         run {
             val request = desired.value.request ?: return
             val afState = result.get(CaptureResult.CONTROL_AF_STATE)
@@ -1684,6 +1756,12 @@ class CameraEngine(context: Context) {
         const val BURST_HANDOFF = 4
         /** After a burst's stop, its stills still in flight are waited for this long. */
         const val BURST_TAIL_MS = 400L
+        /** The preview's frame time with an exposure set by hand: 30 fps where the time allows. */
+        const val PREVIEW_FRAME_NS = 33_333_333L
+        /** Pro's values are reported this often. */
+        const val EXPOSURE_NOW_MS = 200L
+        /** Results kept to pair with analysis frames: about a second. */
+        const val SEEN_KEPT = 32
         /** A burst's frame waits this long for its consumer, then the burst ends (the consumer is gone). */
         const val BURST_HANDOFF_WAIT_MS = 10_000L
         /** The Night extension's session is waited for this long. */

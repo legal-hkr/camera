@@ -61,7 +61,10 @@ class Numbers(locale: Locale) {
         minimumFractionDigits = 0
     }
 
-    fun zoom(value: Double): String = format.format((value * 10).roundToInt() / 10.0)
+    fun zoom(value: Double): String = decimal(value)
+
+    /** A number with at most one decimal ("0,5", "13"). */
+    fun decimal(value: Double): String = format.format((value * 10).roundToInt() / 10.0)
 
     /** Exposure compensation with its sign ("+0,7", "−1"; zero without one); the minus is the typographic one. */
     fun exposure(ev: Double): String {

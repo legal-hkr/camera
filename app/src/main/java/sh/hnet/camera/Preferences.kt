@@ -5,6 +5,7 @@ import androidx.datastore.preferences.core.Preferences as Store
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
+import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
@@ -48,6 +49,12 @@ data class CameraSettings(
     val videoHevc: Boolean = true,
     /** The "Night mode" suggestion when it gets dark (Settings › Controls). */
     val nightSuggestion: Boolean = true,
+    /** Pro's values set by hand, kept until reset (SPEC §11, D20): ISO and shutter (null: automatic), the compensation in thirds of a stop. */
+    val proIso: Int? = null,
+    val proShutterNs: Long? = null,
+    val proEvThirds: Int = 0,
+    /** The mode last chosen from "More", standing in the mode row before it (SPEC §5.4); its name, null before any. */
+    val moreMode: String? = null,
 )
 
 /** Choices the user made in the UI that outlive the process (app-private, not backed up by the system). */
@@ -71,6 +78,10 @@ class Preferences(private val context: Context) {
         shutterSound = this[SHUTTER_SOUND] ?: true,
         videoHevc = this[VIDEO_HEVC] ?: true,
         nightSuggestion = this[NIGHT_SUGGESTION] ?: true,
+        proIso = this[PRO_ISO]?.takeIf { it > 0 },
+        proShutterNs = this[PRO_SHUTTER]?.takeIf { it > 0 },
+        proEvThirds = this[PRO_EV] ?: 0,
+        moreMode = this[MORE_MODE],
     )
 
     suspend fun setAspect(value: Aspect) = context.settings.edit { it[ASPECT] = value.name }
@@ -89,6 +100,17 @@ class Preferences(private val context: Context) {
     suspend fun setShutterSound(value: Boolean) = context.settings.edit { it[SHUTTER_SOUND] = value }
     suspend fun setVideoHevc(value: Boolean) = context.settings.edit { it[VIDEO_HEVC] = value }
     suspend fun setNightSuggestion(value: Boolean) = context.settings.edit { it[NIGHT_SUGGESTION] = value }
+    suspend fun setProIso(value: Int?) = context.settings.edit { it[PRO_ISO] = value ?: 0 }
+    suspend fun setProShutter(value: Long?) = context.settings.edit { it[PRO_SHUTTER] = value ?: 0L }
+    suspend fun setProEv(thirds: Int) = context.settings.edit { it[PRO_EV] = thirds }
+    suspend fun setMoreMode(name: String) = context.settings.edit { it[MORE_MODE] = name }
+
+    /** Pro's values all at once (its reset, and its undo). */
+    suspend fun setPro(iso: Int?, shutterNs: Long?, evThirds: Int) = context.settings.edit {
+        it[PRO_ISO] = iso ?: 0
+        it[PRO_SHUTTER] = shutterNs ?: 0L
+        it[PRO_EV] = evThirds
+    }
 
     /** Every remembered value as the backup holds it (LOGIKA §12). */
     suspend fun snapshot(): BackupSettings = BackupSettings.of(camera.first())
@@ -114,6 +136,10 @@ class Preferences(private val context: Context) {
             p[SHUTTER_SOUND] = restored.shutterSound
             p[VIDEO_HEVC] = restored.videoHevc
             p[NIGHT_SUGGESTION] = restored.nightSuggestion
+            p[PRO_ISO] = restored.proIso ?: 0
+            p[PRO_SHUTTER] = restored.proShutterNs ?: 0L
+            p[PRO_EV] = restored.proEvThirds
+            restored.moreMode?.let { p[MORE_MODE] = it }
         }
     }
 
@@ -137,5 +163,9 @@ class Preferences(private val context: Context) {
         val SHUTTER_SOUND = booleanPreferencesKey("shutter_sound")
         val VIDEO_HEVC = booleanPreferencesKey("video_hevc")
         val NIGHT_SUGGESTION = booleanPreferencesKey("night_suggestion")
+        val PRO_ISO = intPreferencesKey("pro_iso")
+        val PRO_SHUTTER = longPreferencesKey("pro_shutter")
+        val PRO_EV = intPreferencesKey("pro_ev")
+        val MORE_MODE = stringPreferencesKey("more_mode")
     }
 }

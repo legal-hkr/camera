@@ -19,6 +19,9 @@ import java.io.File
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.acos
+import kotlin.math.ln
+import kotlin.math.pow
+import kotlin.math.roundToInt
 import kotlin.math.sqrt
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -64,8 +67,11 @@ import sh.hnet.camera.camera.PhoneState
 import sh.hnet.camera.camera.PhoneStates
 import sh.hnet.camera.capabilities.CameraSpec
 import sh.hnet.camera.capabilities.model.Aspect
+import sh.hnet.camera.capabilities.model.Exposure
+import sh.hnet.camera.capabilities.model.Metering
 import sh.hnet.camera.capabilities.model.PixelSize
 import sh.hnet.camera.capabilities.model.Point
+import sh.hnet.camera.capabilities.model.ProExposure
 import sh.hnet.camera.capabilities.model.SessionLadder
 import sh.hnet.camera.capabilities.model.Sizes
 import sh.hnet.camera.capabilities.model.VideoChoice
@@ -201,6 +207,17 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     /** A burst under way: its frames so far (the shutter counts them); null when there is none (LOGIKA §18). Apart from [ui]: it changes with every frame. */
     private val _burstCount = MutableStateFlow<Int?>(null)
     val burstCount: StateFlow<Int?> = _burstCount.asStateFlow()
+
+    /** Pro's values as its tiles show them – the automatic ones as the camera or the metering has them – and the meter with both set by hand (LOGIKA §26). */
+    data class ProLive(val iso: Int? = null, val timeNs: Long? = null, val meterEv: Double? = null)
+
+    private val _proLive = MutableStateFlow(ProLive())
+    val proLive: StateFlow<ProLive> = _proLive.asStateFlow()
+    private var proJob: Job? = null
+    /** The exposure Pro last gave the engine (null: the camera's own). */
+    private var proApplied: Exposure? = null
+    /** The metering's targets are learned apart for an HLG and an SDR picture. */
+    private val meterings = mapOf(false to Metering(ProExposure.defaultTarget(hlg = false)), true to Metering(ProExposure.defaultTarget(hlg = true)))
 
     /** A burst's tick every ten frames; true for the last one it may have (LOGIKA §18). */
     private val _burstTick = MutableSharedFlow<Boolean>(extraBufferCapacity = 4)
@@ -400,9 +417,10 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         val point = entry is Entry.App && entry.start == Start.QR
         _ui.update { it.copy(mode = mode, cameraIndex = index, pointAtCode = point, focus = null, locked = false, exposure = 0, torch = false) }
         engine.setTorch(false)
-        engine.resetFocus(exposure = 0)
+        engine.resetFocus(exposure = aeSteps(0))
         analyzer.reset()
         configure()
+        watchPro()
     }
 
     private var pendingEntry: Entry? = null
@@ -540,8 +558,9 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         engine.setZoom(_ui.value.zoom)
         engine.setTorch(_ui.value.torch && !ledBlocked)
         applyLed()
-        engine.resetFocus(exposure = _ui.value.exposure)
+        engine.resetFocus(exposure = aeSteps(_ui.value.exposure))
         engine.start(this)
+        watchPro()
         sensors.getDefaultSensor(Sensor.TYPE_GRAVITY)?.let { sensors.registerListener(gravityListener, it, SensorManager.SENSOR_DELAY_UI) }
         updateLocation()
         viewModelScope.launch { media.refreshLast() }
@@ -549,6 +568,8 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
 
     fun stop() {
         started = false
+        proJob?.cancel()
+        proJob = null
         // Leaving ends a burst (its frames taken are saved)
         keyBurst = false
         shutterReleased()
@@ -588,8 +609,9 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
 
     fun selectMode(mode: Mode) {
         if (mode == _ui.value.mode || recording || _entry.value is Entry.Capture || _ui.value.nightGathering || burstJob != null) return
-        // Night only on a camera with the extension
+        // Night only on a camera with the extension, Pro only on one with the manual sensor
         if (mode == Mode.NIGHT && camera?.night == null) return
+        if (mode == Mode.PRO && camera?.manualSensor != true) return
         cancelTimer()
         _ui.update { it.copy(mode = mode, focus = null, locked = false, exposure = 0, torch = false, pointAtCode = false) }
         analyzer.reset()
@@ -598,17 +620,28 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         onTold = {
             before?.invoke()
             engine.setTorch(false)
-            engine.resetFocus(exposure = 0)
+            engine.resetFocus(exposure = aeSteps(0))
         }
         configure()
+        watchPro()
+    }
+
+    /** A mode chosen from "More" (SPEC §5.4, §6.2): it takes the place before "More" in the mode row, remembered. */
+    fun chooseMore(mode: Mode) {
+        selectMode(mode)
+        if (_ui.value.mode == mode) viewModelScope.launch { preferences.setMoreMode(mode.name) }
     }
 
     fun switchCamera() {
         if (cameras.size < 2 || recording || _ui.value.nightGathering || burstJob != null) return
         cancelTimer()
         val next = (_ui.value.cameraIndex + 1) % cameras.size
-        // Night stays only where the other camera has it too
-        val mode = if (_ui.value.mode == Mode.NIGHT && cameras[next].night == null) Mode.PHOTO else _ui.value.mode
+        // Night stays only where the other camera has it too, Pro where it has the manual sensor
+        val mode = when {
+            _ui.value.mode == Mode.NIGHT && cameras[next].night == null -> Mode.PHOTO
+            _ui.value.mode == Mode.PRO && !cameras[next].manualSensor -> Mode.PHOTO
+            else -> _ui.value.mode
+        }
         // The Night suggestion only where the camera has Night
         _ui.update { it.copy(cameraIndex = next, mode = mode, zoom = 1.0, focus = null, locked = false, exposure = 0, torch = false, flashLevel = null, nightSuggested = it.nightSuggested && cameras[next].night != null) }
         val before = onTold
@@ -616,11 +649,146 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
             before?.invoke()
             engine.setTorch(false)
             engine.setZoom(1.0)
-            engine.resetFocus(exposure = 0)
+            engine.resetFocus(exposure = aeSteps(0))
             applyLed()
         }
         analyzer.reset()
         configure()
+        watchPro()
+    }
+
+    /**
+     * Pro's values while it is shown (LOGIKA §26), ten times a second: both automatic – the camera's own exposure with the compensation, its values shown and
+     * the metering's target learned from it; one set by hand – the other from the metering; both by hand – as they are, with the meter.
+     */
+    private fun watchPro() {
+        proJob?.cancel()
+        proJob = null
+        // Sent again whatever was sent before: another viewfinder may have reset the engine's controls meanwhile
+        proApplied = null
+        if (!started || _ui.value.mode != Mode.PRO) {
+            engine.setManualExposure(null)
+            return
+        }
+        meterings.values.forEach { it.reset() }
+        proJob = viewModelScope.launch {
+            while (true) {
+                proStep()
+                delay(PRO_STEP_MS)
+            }
+        }
+    }
+
+    private fun proStep() {
+        // A mode changed some other way (a new launch): the loop ends
+        if (!started || _ui.value.mode != Mode.PRO) {
+            watchPro()
+            return
+        }
+        // Only the viewfinder whose frames the engine analyses: another one (the lock screen's) may have the camera now
+        if (engine.analyzer !== analyze) return
+        val camera = camera ?: return
+        if (!camera.manualSensor || camera.isoRange.isEmpty() || camera.shutterRange.isEmpty()) return
+        val settings = _ui.value.settings
+        val iso = settings.proIso?.coerceIn(camera.isoRange)
+        val time = settings.proShutterNs?.coerceIn(camera.shutterRange)
+        val ev = settings.proEvThirds
+        // A recent frame's brightness and the exposure that very frame had (no analysis stream in the session: no metering)
+        val measured = analyzer.brightness?.takeIf { engineState.value.analysis }
+        val seen = measured?.let { engine.exposureAt(analyzer.brightnessFrameNs) }
+        val metering = meterings.getValue(analyzer.brightnessHlg)
+        val shown = engine.exposureNow.value
+        _proLive.value = when {
+            iso == null && time == null -> {
+                applyPro(null)
+                engine.setExposure(aeSteps(0))
+                // What the camera's settled exposure brings the picture to, its compensation taken out, is what the metering aims at (not while it meters a
+                // tapped point: the metering is centre-weighted)
+                if (measured != null && seen?.settled == true && _ui.value.focus == null) metering.learn(measured / 2.0.pow(ev / 3.0))
+                ProLive(shown?.iso, shown?.timeNs)
+            }
+            iso != null && time != null -> {
+                val photo = Exposure(iso, time)
+                applyPro(photo)
+                ProLive(iso, time, if (measured != null && seen != null) metering.meter(measured, seen.exposure, photo) else null)
+            }
+            else -> {
+                val photo = if (measured != null && seen != null) {
+                    metering.step(measured, seen.exposure, ev, iso, time, camera.isoRange, camera.shutterRange)
+                } else {
+                    // No metering: the camera's last exposure kept, the value not set by hand taken from it
+                    shown?.let { held(it, iso, time, camera) }
+                }
+                photo?.let { applyPro(it, metered = true) }
+                val now = photo ?: proApplied
+                ProLive(now?.iso ?: iso, now?.timeNs ?: time)
+            }
+        }
+    }
+
+    /** The exposure for a value set by hand that keeps [exposure]'s brightness. */
+    private fun held(exposure: Exposure, iso: Int?, timeNs: Long?, camera: CameraSpec): Exposure? = when {
+        iso != null -> Exposure(iso, (exposure.product / iso * 1e9).toLong().coerceIn(camera.shutterRange.first, minOf(camera.shutterRange.last, ProExposure.AUTO_SHUTTER_MAX_NS)))
+        timeNs != null -> Exposure((exposure.product / (timeNs / 1e9)).toInt().coerceIn(camera.isoRange), timeNs)
+        else -> null
+    }
+
+    /**
+     * Pro's exposure to the engine. A metered one ([metered]) only when it changed enough to matter – a request a tenth of a second for a few per cent would
+     * only churn – and the value set by hand stayed; a value set by hand always.
+     */
+    private fun applyPro(exposure: Exposure?, metered: Boolean = false) {
+        val last = proApplied
+        if (exposure == null) {
+            engine.setManualExposure(null)
+            proApplied = null
+            return
+        }
+        if (metered && last != null) {
+            if (last.iso == exposure.iso && kotlin.math.abs(ln(exposure.timeNs.toDouble() / last.timeNs)) < PRO_SETTLE) return
+            if (last.timeNs == exposure.timeNs && kotlin.math.abs(ln(exposure.iso.toDouble() / last.iso)) < PRO_SETTLE) return
+        }
+        proApplied = exposure
+        engine.setManualExposure(exposure)
+    }
+
+    /** The camera's exposure compensation: Pro's in Pro (thirds of a stop turned into the camera's steps), else [base]. */
+    private fun aeSteps(base: Int): Int {
+        if (_ui.value.mode != Mode.PRO) return base
+        val camera = camera ?: return base
+        return (_ui.value.settings.proEvThirds / 3.0 / camera.exposureStep).roundToInt().coerceIn(camera.exposureSteps)
+    }
+
+    /** Pro with a value set by hand: the camera's own exposure is off. */
+    private val proManual: Boolean
+        get() = _ui.value.mode == Mode.PRO && (_ui.value.settings.proIso != null || _ui.value.settings.proShutterNs != null)
+
+    /** Pro's ISO set by hand, or automatic again (null); kept until reset (D20). */
+    fun setProIso(iso: Int?) {
+        viewModelScope.launch { preferences.setProIso(iso) }
+        meterings.values.forEach { it.reset() }
+    }
+
+    /** Pro's shutter set by hand, or automatic again (null). */
+    fun setProShutter(timeNs: Long?) {
+        viewModelScope.launch { preferences.setProShutter(timeNs) }
+        meterings.values.forEach { it.reset() }
+    }
+
+    fun setProEv(thirds: Int) {
+        viewModelScope.launch { preferences.setProEv(thirds) }
+    }
+
+    /** All of Pro automatic (`restart_alt`); returns what was set, for the snackbar's Undo. */
+    fun resetPro(): Triple<Int?, Long?, Int> {
+        val settings = _ui.value.settings
+        viewModelScope.launch { preferences.setPro(null, null, 0) }
+        return Triple(settings.proIso, settings.proShutterNs, settings.proEvThirds)
+    }
+
+    fun restorePro(values: Triple<Int?, Long?, Int>) {
+        viewModelScope.launch { preferences.setPro(values.first, values.second, values.third) }
+        meterings.values.forEach { it.reset() }
     }
 
     /** A zoom value from the ruler or a stop; a different lens (another stop is the nearest one below) ends the tapped focus and the exposure compensation. */
@@ -632,7 +800,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         engine.setZoom(value)
         if (lensOf(value) != before && (_ui.value.focus != null || _ui.value.exposure != 0)) {
             _ui.update { it.copy(focus = null, locked = false, exposure = 0) }
-            engine.resetFocus(exposure = 0)
+            engine.resetFocus(exposure = aeSteps(0))
         }
     }
 
@@ -647,8 +815,8 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun lockAt(point: Point) {
-        // Night's extension has no exposure lock: a long press focuses there as a tap does
-        if (_ui.value.mode == Mode.NIGHT) {
+        // Night's extension has no exposure lock, nor has an exposure set by hand in Pro: a long press focuses there as a tap does
+        if (_ui.value.mode == Mode.NIGHT || proManual) {
             focusAt(point)
             return
         }
@@ -942,7 +1110,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
             when (_ui.value.mode) {
                 Mode.VIDEO -> record()
                 Mode.NIGHT -> shootNight()
-                Mode.PHOTO -> shoot(timed = true)
+                Mode.PHOTO, Mode.PRO -> shoot(timed = true)
             }
         }
     }
@@ -1046,7 +1214,8 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     fun shoot(timed: Boolean = false) {
         val ui = _ui.value
         val front = camera?.front == true
-        val screenFlash = front && ui.mode == Mode.PHOTO && (ui.flash == Flash.ON || (ui.flash == Flash.AUTO && engineState.value.dark))
+        // The front camera's screen flash in Photo, and in Pro while the camera's exposure is its own (it meters for the lit screen)
+        val screenFlash = front && (ui.mode == Mode.PHOTO || (ui.mode == Mode.PRO && !proManual)) && (ui.flash == Flash.ON || (ui.flash == Flash.AUTO && engineState.value.dark))
         val place = placeNow()
         // In the app's scope: a viewfinder going away right after the shutter (the lock screen's when the screen goes off) doesn't cancel the photo
         application.appScope.launch {
@@ -1186,6 +1355,10 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     private companion object {
         /** A copy of the live picture that takes longer isn't waited for: the live picture fades out instead before the change goes on. */
         const val FREEZE_WAIT_MS = 100L
+        /** Pro's metering steps this often. */
+        const val PRO_STEP_MS = 100L
+        /** A change of Pro's exposure smaller than this (in natural log, about 6 %) isn't sent. */
+        const val PRO_SETTLE = 0.06
         /** A burst ticks (and clicks) every this many frames. */
         const val BURST_TICK = 10
         /** A burst needs room for its frames put aside and their copies in the gallery (150 Ultra HDR frames are about 300 MB each way). */

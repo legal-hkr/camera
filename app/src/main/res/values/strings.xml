@@ -260,4 +260,23 @@
     <string name="label_hold_still">Hold still</string>
     <string name="label_setting_night_suggestion">Night mode suggestion</string>
     <string name="desc_setting_night_suggestion">When it gets dark</string>
+    <!-- Pro -->
+    <string name="label_mode_pro">Pro</string>
+    <string name="label_mode_more">More</string>
+    <string name="title_more_modes">More modes</string>
+    <string name="desc_mode_pro">Manual ISO, shutter speed, focus and white balance</string>
+    <string name="label_pro_iso">ISO</string>
+    <string name="label_pro_shutter">Shutter</string>
+    <string name="label_pro_focus">Focus</string>
+    <string name="label_pro_white_balance">WB</string>
+    <string name="label_pro_ev">EV</string>
+    <string name="label_pro_meter">Meter</string>
+    <string name="value_auto">Auto</string>
+    <string name="button_auto_short">A</string>
+    <string name="tooltip_auto_one">Automatic</string>
+    <string name="tooltip_all_auto">All automatic</string>
+    <string name="msg_pro_reset">Pro – all automatic</string>
+    <string name="button_undo">Undo</string>
+    <string name="value_shutter_fraction">1/%1$d s</string>
+    <string name="value_shutter_seconds">%1$s s</string>
 </resources>

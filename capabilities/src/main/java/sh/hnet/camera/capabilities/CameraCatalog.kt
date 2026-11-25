@@ -60,6 +60,10 @@ data class CameraSpec(
     val night: NightSpec? = null,
     /** A full-size still holds the stream back (a stall duration): a burst can't ride on every preview frame, the requests alternate. */
     val stillStalls: Boolean = false,
+    /** ISO and exposure time set by hand (Pro): the camera has the manual sensor, and its ranges. */
+    val manualSensor: Boolean = false,
+    val isoRange: IntRange = IntRange.EMPTY,
+    val shutterRange: LongRange = LongRange.EMPTY,
 )
 
 /** The Night extension's sizes: the preview, the photo in Ultra HDR and in plain JPEG, and whether it gives an early postview of the photo. */
@@ -126,6 +130,9 @@ object CameraCatalog {
             videoStabilization = chars.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)?.contains(CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON) == true,
             lensView = logical.view,
             night = runCatching { night(manager, id) }.getOrNull(),
+            manualSensor = CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR in (chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: IntArray(0)),
+            isoRange = chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)?.let { it.lower..it.upper } ?: IntRange.EMPTY,
+            shutterRange = chars.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)?.let { it.lower..it.upper } ?: LongRange.EMPTY,
             stillStalls = listOf(ImageFormat.JPEG_R, ImageFormat.JPEG).any { format -> sizes(map, format).maxByOrNull { it.area }?.let { runCatching { map.getOutputStallDuration(format, Size(it.width, it.height)) }.getOrDefault(0L) > 0 } == true },
         )
     }

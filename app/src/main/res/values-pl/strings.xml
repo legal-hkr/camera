@@ -261,4 +261,23 @@
     <string name="label_hold_still">Nie ruszaj telefonem</string>
     <string name="label_setting_night_suggestion">Podpowiedź trybu „Noc”</string>
     <string name="desc_setting_night_suggestion">Gdy robi się ciemno</string>
+    <!-- Pro -->
+    <string name="label_mode_pro">Pro</string>
+    <string name="label_mode_more">Więcej</string>
+    <string name="title_more_modes">Więcej trybów</string>
+    <string name="desc_mode_pro">Ręczne ISO, czas naświetlania, ostrość i balans bieli</string>
+    <string name="label_pro_iso">ISO</string>
+    <string name="label_pro_shutter">Czas</string>
+    <string name="label_pro_focus">Ostrość</string>
+    <string name="label_pro_white_balance">Balans</string>
+    <string name="label_pro_ev">EV</string>
+    <string name="label_pro_meter">Pomiar</string>
+    <string name="value_auto">Auto</string>
+    <string name="button_auto_short">A</string>
+    <string name="tooltip_auto_one">Automatycznie</string>
+    <string name="tooltip_all_auto">Wszystko automatycznie</string>
+    <string name="msg_pro_reset">Pro – wszystko automatycznie</string>
+    <string name="button_undo">Cofnij</string>
+    <string name="value_shutter_fraction">1/%1$d s</string>
+    <string name="value_shutter_seconds">%1$s s</string>
 </resources>

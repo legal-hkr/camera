@@ -12,6 +12,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import sh.hnet.camera.capabilities.model.Orientation
 import sh.hnet.camera.capabilities.model.Point
+import sh.hnet.camera.capabilities.model.ProExposure
 import zxingcpp.BarcodeReader
 
 /** A QR code in the picture: what it holds and its corners as shares of the preview (as the preview shows it, upright). */
@@ -67,6 +68,8 @@ class FrameAnalyzer(private val previewRatio: () -> Double) {
     fun reset() {
         generation++
         _qr.value = null
+        // A new session or camera: the last picture's brightness says nothing about the next
+        brightness = null
     }
 
     fun close() {
@@ -162,6 +165,7 @@ class FrameAnalyzer(private val previewRatio: () -> Double) {
             }
             now[gy * GRID_W + gx] = if (count > 0) sum / count else 0
         }
+        measureBrightness(now, frame.tenBit, time)
         // A gap in the frames (a new session, another camera) starts the comparison over
         val last = grids.lastOrNull()?.first
         if (last != null && (time < last || time - last > GAP_NS)) grids.clear()
@@ -176,6 +180,39 @@ class FrameAnalyzer(private val previewRatio: () -> Double) {
             movement.addLast(time to (changed >= MIN_CHANGED_CELLS))
             while (movement.size > 1 && movement.first().first < time - MOVEMENT_KEEP_NS) movement.removeFirst()
         }
+    }
+
+    /**
+     * The picture's brightness for Pro's metering (LOGIKA §26): the grid's cells made linear (SDR or HLG, as the analysis frame is) and averaged with more
+     * weight to the middle; null before the first frame. [brightnessHlg]: it was measured on an HLG picture (another target).
+     */
+    @Volatile
+    var brightness: Double? = null
+        private set
+
+    @Volatile
+    var brightnessHlg = false
+        private set
+
+    /** The sensor time of the frame [brightness] was measured on (the engine knows that frame's exposure by it). */
+    @Volatile
+    var brightnessFrameNs = 0L
+        private set
+
+    private fun measureBrightness(grid: IntArray, hlg: Boolean, frameNs: Long) {
+        var sum = 0.0
+        var weights = 0.0
+        for (gy in 0 until GRID_H) for (gx in 0 until GRID_W) {
+            // Centre-weighted: a cell at the middle counts about three times one at the edge
+            val dx = (gx + 0.5) / GRID_W - 0.5
+            val dy = (gy + 0.5) / GRID_H - 0.5
+            val weight = 1.0 / (1.0 + 8.0 * (dx * dx + dy * dy))
+            sum += ProExposure.linear(grid[gy * GRID_W + gx] / 255.0, hlg) * weight
+            weights += weight
+        }
+        brightnessHlg = hlg
+        brightnessFrameNs = frameNs
+        brightness = sum / weights
     }
 
     /** Whether something moved in the scene between two of the sensor's times (the automatic motion photo keeps its video then). */

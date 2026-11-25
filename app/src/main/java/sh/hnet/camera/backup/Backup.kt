@@ -14,6 +14,7 @@ import sh.hnet.camera.Grid
 import sh.hnet.camera.MotionPhoto
 import sh.hnet.camera.VolumeKeys
 import sh.hnet.camera.capabilities.model.Aspect
+import sh.hnet.camera.capabilities.model.ProExposure
 
 /** Camera's backup file (LOGIKA §12), shaped as the family's: the settings only, never photos or videos. Pure Kotlin, unit-tested. */
 @Serializable
@@ -59,6 +60,12 @@ data class BackupSettings(
     val shutterSound: Boolean? = null,
     val videoHevc: Boolean? = null,
     val nightSuggestion: Boolean? = null,
+    /** Pro's values set by hand; 0 is automatic. */
+    val proIso: Int? = null,
+    val proShutterNs: Long? = null,
+    val proEvThirds: Int? = null,
+    /** The mode last chosen from "More" (`PRO`). */
+    val moreMode: String? = null,
 ) {
     /** [current] with every value of this backup that this version knows. */
     fun applyTo(current: CameraSettings, locationAllowed: Boolean = true): CameraSettings = current.copy(
@@ -78,11 +85,27 @@ data class BackupSettings(
         shutterSound = shutterSound ?: current.shutterSound,
         videoHevc = videoHevc ?: current.videoHevc,
         nightSuggestion = nightSuggestion ?: current.nightSuggestion,
+        proIso = when (proIso) {
+            null -> current.proIso
+            0 -> null
+            else -> proIso.takeIf { it > 0 }
+        },
+        proShutterNs = when (proShutterNs) {
+            null -> current.proShutterNs
+            0L -> null
+            // Pro's longest is 16 s; a value out of reason is automatic
+            else -> proShutterNs.takeIf { it in 1..ProExposure.SHUTTER_MAX_NS }
+        },
+        proEvThirds = proEvThirds?.coerceIn(-PRO_EV_THIRDS, PRO_EV_THIRDS) ?: current.proEvThirds,
+        moreMode = moreMode ?: current.moreMode,
     )
 
     companion object {
         /** The frame rates a video can be set to (SPEC §17.3). */
         val FRAME_RATES = setOf(24, 30, 60)
+
+        /** Pro's compensation reaches ±2 EV. */
+        const val PRO_EV_THIRDS = 6
 
         fun of(settings: CameraSettings) = BackupSettings(
             aspect = settings.aspect.name,
@@ -101,6 +124,10 @@ data class BackupSettings(
             shutterSound = settings.shutterSound,
             videoHevc = settings.videoHevc,
             nightSuggestion = settings.nightSuggestion,
+            proIso = settings.proIso ?: 0,
+            proShutterNs = settings.proShutterNs ?: 0L,
+            proEvThirds = settings.proEvThirds,
+            moreMode = settings.moreMode,
         )
     }
 }

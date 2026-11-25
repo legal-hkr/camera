@@ -10,6 +10,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
+import android.content.res.Resources
 import android.os.SystemClock
 import android.provider.MediaStore
 import android.provider.Settings
@@ -74,6 +75,7 @@ import androidx.compose.material3.Snackbar
 import androidx.compose.material3.SnackbarDuration
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -118,6 +120,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.layout
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalResources
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.pluralStringResource
@@ -144,9 +147,11 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.roundToInt
+import kotlin.math.roundToLong
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import sh.hnet.camera.CameraSettings
 import sh.hnet.camera.FirstRun
 import sh.hnet.camera.Grid
 import sh.hnet.camera.MotionPhoto
@@ -157,11 +162,13 @@ import sh.hnet.camera.camera.Mode
 import sh.hnet.camera.camera.PhoneState
 import sh.hnet.camera.camera.QrContent
 import sh.hnet.camera.camera.Recording
+import sh.hnet.camera.capabilities.CameraSpec
 import sh.hnet.camera.capabilities.model.Aspect
 import sh.hnet.camera.capabilities.model.Orientation
 import sh.hnet.camera.capabilities.model.PictureRange
 import sh.hnet.camera.capabilities.model.PixelSize
 import sh.hnet.camera.capabilities.model.Point
+import sh.hnet.camera.capabilities.model.ProExposure
 import sh.hnet.camera.capabilities.model.SessionLadder
 import sh.hnet.camera.capabilities.model.Sizes
 import sh.hnet.camera.media.LastShot
@@ -484,7 +491,26 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
     val colors = MaterialTheme.colorScheme
     val problem = engine.status.takeIf { it is CameraStatus.Busy || it is CameraStatus.Blocked || it is CameraStatus.Error }
     // For another app only the mode it asked for (SPEC §15.3)
-    val modes = if (capture != null) listOf(ui.mode) else listOfNotNull(Mode.PHOTO, Mode.VIDEO, Mode.NIGHT.takeIf { camera?.night != null })
+    // The row (SPEC §5.4): Night, Photo, Video, the mode last chosen from "More", then "More" (null in the row); for another app only the mode it asked for
+    val pro = ui.mode == Mode.PRO
+    val moreModes = if (capture != null) emptyList() else listOfNotNull(Mode.PRO.takeIf { camera?.manualSensor == true })
+    val chosenMore = Mode.PRO.takeIf { it in moreModes && (pro || ui.settings.moreMode == it.name) }
+    val modes = if (capture != null) listOf(ui.mode) else listOfNotNull(Mode.NIGHT.takeIf { camera?.night != null }, Mode.PHOTO, Mode.VIDEO, chosenMore)
+    val rowModes: List<Mode?> = if (moreModes.isEmpty()) modes else modes + null
+    var moreSheet by remember { mutableStateOf(false) }
+    // Pro's ruler open (one at a time, SPEC §11); with the exposure set by hand the flash is only off or on
+    var proOpen by remember { mutableStateOf<ProValue?>(null) }
+    if (!pro && proOpen != null) proOpen = null
+    val proManual = pro && (ui.settings.proIso != null || ui.settings.proShutterNs != null)
+    val rulerOpen = exposureOpen || proOpen != null
+    // A Pro ruler closes a while after its last touch, as the exposure ruler does
+    LaunchedEffect(proOpen, exposureTouch) {
+        if (proOpen == null) return@LaunchedEffect
+        delay(EXPOSURE_RULER_MS)
+        proOpen = null
+    }
+    val proReset = stringResource(R.string.msg_pro_reset)
+    val undo = stringResource(R.string.button_undo)
     val night = ui.mode == Mode.NIGHT
     val postview by viewModel.postviewImage.collectAsStateWithLifecycle()
     val stepsPerThird = camera?.let { (1.0 / 3 / it.exposureStep).roundToInt().coerceAtLeast(1) } ?: 1
@@ -597,7 +623,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                                     onTap = { offset ->
                                         viewModel.focusAt(Point((offset.x / size.width).toDouble(), (offset.y / size.height).toDouble()))
                                         // Night's extension has no exposure compensation
-                                        if (ui.mode != Mode.NIGHT) exposureOpen = true
+                                        if (ui.mode != Mode.NIGHT && ui.mode != Mode.PRO) exposureOpen = true
                                         exposureTouch = System.currentTimeMillis()
                                     },
                                     onLongPress = { offset ->
@@ -663,15 +689,18 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                     TopButton(if (ui.torch) R.drawable.ic_flashlight_on else R.drawable.ic_flashlight_off, stringResource(R.string.tooltip_flashlight), null, filled = ui.torch, turn = turn, enabled = !ledBlocked, onDisabled = { explain(ledReason) }) { viewModel.toggleTorch() }
                 }
                 // Night's extension takes no flash
-                if (!video && !night && (camera.flash || camera.front)) {
-                    MenuButton(listOf(Flash.entries.map { f -> MenuChoice(stringResource(flashName(f)), f == ui.flash) { viewModel.setFlash(f) } })) { open ->
+                // The front camera's screen flash needs the camera's own exposure: not with Pro's set by hand
+                if (!video && !night && (camera.flash || (camera.front && !proManual))) {
+                    // With Pro's exposure set by hand, automatic means nothing: off or on (LOGIKA §25)
+                    val shownFlash = if (proManual && ui.flash == Flash.AUTO) Flash.OFF else ui.flash
+                    MenuButton(listOf((if (proManual) listOf(Flash.OFF, Flash.ON) else Flash.entries).map { f -> MenuChoice(stringResource(flashName(f)), f == shownFlash) { viewModel.setFlash(f) } })) { open ->
                         // Automatic: the button's background shows when the flash will fire (the exposure asks for it, or the scene is dark)
                         val willFire = ui.flash == Flash.AUTO && if (camera.front) engine.dark else engine.flashNeeded
                         // Heat or a low battery: the flash shows off and says why (SPEC §14.1)
                         if (ledBlocked) {
                             TopButton(R.drawable.ic_flash_off, stringResource(R.string.tooltip_flash), stringResource(flashState(Flash.OFF)), filled = false, turn = turn, enabled = false, onDisabled = { explain(ledReason) }) {}
                         } else {
-                            TopButton(flashIcon(ui.flash), stringResource(R.string.tooltip_flash), stringResource(flashState(ui.flash)), filled = ui.flash != Flash.OFF, turn = turn, accent = willFire, onClick = open)
+                            TopButton(flashIcon(shownFlash), stringResource(R.string.tooltip_flash), stringResource(flashState(shownFlash)), filled = shownFlash != Flash.OFF, turn = turn, accent = willFire && !proManual, onClick = open)
                         }
                     }
                 }
@@ -713,7 +742,8 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                         ) { viewModel.toggleHdr() }
                     }
                     // Not for another app's photo: it never gets a motion photo (SPEC §15.3)
-                    if (!video && !night && capture == null) {
+                    // Not in Pro either (SPEC §6.3)
+                    if (!video && !night && !pro && capture == null) {
                         MenuButton(listOf(MotionPhoto.entries.map { m -> MenuChoice(stringResource(motionName(m)), m == settings.motionPhoto) { viewModel.setMotionPhoto(m) } })) { open ->
                             TopButton(motionIcon(settings.motionPhoto), stringResource(R.string.tooltip_motion_photo), stringResource(motionState(settings.motionPhoto)), filled = settings.motionPhoto != MotionPhoto.AUTO, turn = turn, onClick = open)
                         }
@@ -757,7 +787,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
             // The phone's states (SPEC §14.1): heat, a low battery, little room left
             if (phone.hot) IndicatorChip(R.drawable.ic_device_thermostat, stringResource(R.string.label_phone_hot)) { explain(ledReason) }
             if (phone.lowBattery) IndicatorChip(R.drawable.ic_battery_alert, stringResource(R.string.label_battery_level, phone.battery ?: 0)) { explain(flashBattery) }
-            roomLeft(phone, ui.mode == Mode.VIDEO, engine.video?.bitrate, ui.settings.motionPhoto != MotionPhoto.OFF)?.let { left ->
+            roomLeft(phone, ui.mode == Mode.VIDEO, engine.video?.bitrate, ui.mode == Mode.PHOTO && ui.settings.motionPhoto != MotionPhoto.OFF)?.let { left ->
                 IndicatorChip(R.drawable.ic_storage, if (left.minutes) stringResource(R.string.label_minutes_left, left.count) else pluralStringResource(R.plurals.label_photos_left, left.count, left.count)) {}
             }
             if (noSound) {
@@ -773,7 +803,10 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
             }
         }
         // Snackbars 8 dp above the suggestion slot (SPEC §14.2)
-        SnackbarHost(snackbars, Modifier.align(Alignment.BottomCenter).padding(bottom = zoomBottom + 44.dp + 36.dp + 32.dp + 8.dp)) { data ->
+        // Pro's tiles stand above the ruler's place (SPEC §11): the snackbars above them there
+        val proShown = pro && camera?.manualSensor == true && problem == null && recording == null && ui.countdown == null
+        val snackbarBottom = if (proShown) zoomBottom + 44.dp + 12.dp + 48.dp + 8.dp + 48.dp + 8.dp else zoomBottom + 44.dp + 36.dp + 32.dp + 8.dp
+        SnackbarHost(snackbars, Modifier.align(Alignment.BottomCenter).padding(bottom = snackbarBottom)) { data ->
             Snackbar(data, shape = MaterialTheme.shapes.extraLarge, modifier = Modifier.padding(horizontal = 12.dp))
         }
 
@@ -782,17 +815,41 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
             when {
                 zoomRulerOpen -> SolidChip(stringResource(R.string.value_zoom, numbers.zoom(ui.zoom)), primary = true)
                 // Macro (SPEC §4.5, above the lock): the camera took the ultrawide by itself; it can't be told not to, so the chip only says so (D8)
-                engine.macro && !exposureOpen -> SuggestionChip(R.drawable.ic_macro_auto, stringResource(R.string.label_macro), onDismiss = null)
-                ui.locked && !exposureOpen -> SuggestionChip(R.drawable.ic_lock, stringResource(R.string.label_ae_af_locked), onDismiss = { viewModel.unlock() })
+                engine.macro && !rulerOpen -> SuggestionChip(R.drawable.ic_macro_auto, stringResource(R.string.label_macro), onDismiss = null)
+                ui.locked && !rulerOpen -> SuggestionChip(R.drawable.ic_lock, stringResource(R.string.label_ae_af_locked), onDismiss = { viewModel.unlock() })
                 // A QR code: its domain, network or first words; a tap opens what it holds (SPEC §7.10)
-                qr != null && !exposureOpen -> SuggestionChip(qrIcon(qr.content), qrChipText(qr.content), onDismiss = null, onClick = { qrSheet = qr.content })
+                qr != null && !rulerOpen -> SuggestionChip(qrIcon(qr.content), qrChipText(qr.content), onDismiss = null, onClick = { qrSheet = qr.content })
                 // From the QR code shortcut, until a code is found (SPEC §15.5)
-                ui.pointAtCode && ui.mode == Mode.PHOTO && !exposureOpen -> SuggestionChip(R.drawable.ic_qr_code_scanner, stringResource(R.string.label_point_at_code), onDismiss = { viewModel.clearPointAtCode() })
+                ui.pointAtCode && ui.mode == Mode.PHOTO && !rulerOpen -> SuggestionChip(R.drawable.ic_qr_code_scanner, stringResource(R.string.label_point_at_code), onDismiss = { viewModel.clearPointAtCode() })
                 // A Night photo gathering its frames (SPEC §9.2)
                 ui.nightGathering -> SuggestionChip(R.drawable.ic_back_hand, stringResource(R.string.label_hold_still), onDismiss = null)
                 // Dark for a while in Photo: Night offered, never switched to by itself (SPEC §9.1)
-                ui.nightSuggested && ui.mode == Mode.PHOTO && camera?.night != null && !exposureOpen -> SuggestionChip(R.drawable.ic_bedtime, stringResource(R.string.label_suggest_night), onDismiss = { viewModel.closeNightSuggestion() }, onClick = { viewModel.selectMode(Mode.NIGHT) })
+                ui.nightSuggested && ui.mode == Mode.PHOTO && camera?.night != null && !rulerOpen -> SuggestionChip(R.drawable.ic_bedtime, stringResource(R.string.label_suggest_night), onDismiss = { viewModel.closeNightSuggestion() }, onClick = { viewModel.selectMode(Mode.NIGHT) })
             }
+        }
+        // Pro (SPEC §11): the tiles above the ruler's place, the open tile's ruler in it
+        camera?.takeIf { proShown }?.let { proCamera ->
+            ProPanel(
+                viewModel = viewModel,
+                camera = proCamera,
+                settings = ui.settings,
+                open = proOpen,
+                onOpen = {
+                    proOpen = if (proOpen == it) null else it
+                    exposureTouch = System.currentTimeMillis()
+                },
+                onTouch = { exposureTouch = System.currentTimeMillis() },
+                onReset = {
+                    proOpen = null
+                    val before = viewModel.resetPro()
+                    scope.launch {
+                        if (snackbars.showSnackbar(proReset, actionLabel = undo, duration = SnackbarDuration.Short) == SnackbarResult.ActionPerformed) viewModel.restorePro(before)
+                    }
+                },
+                turn = turn,
+                modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = zoomBottom + 44.dp + 12.dp + 48.dp + 8.dp),
+                rulerModifier = Modifier.align(Alignment.BottomCenter).padding(start = 16.dp, end = 16.dp, bottom = zoomBottom + 44.dp + 12.dp),
+            )
         }
         // The exposure ruler above the zoom row, in the suggestion slot's place
         if (exposureOpen && camera != null) {
@@ -884,7 +941,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
         }
 
         if (recording == null && ui.countdown == null && !ui.nightGathering && !bursting) ModeRow(
-            modes = modes,
+            modes = rowModes,
             selected = ui.mode,
             label = {
                 stringResource(
@@ -892,14 +949,32 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                         Mode.VIDEO -> R.string.label_mode_video
                         Mode.NIGHT -> R.string.label_mode_night
                         Mode.PHOTO -> R.string.label_mode_photo
+                        Mode.PRO -> R.string.label_mode_pro
+                        null -> R.string.label_mode_more
                     },
                 )
             },
             onSelect = {
-                if (it != ui.mode) haptics.mode()
-                viewModel.selectMode(it)
+                if (it == null) {
+                    moreSheet = true
+                } else {
+                    if (it != ui.mode) haptics.mode()
+                    viewModel.selectMode(it)
+                }
             },
             modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = modeBottom),
+        )
+    }
+
+    if (moreSheet) {
+        MoreModesSheet(
+            listOf(MoreMode(Mode.PRO, R.drawable.ic_shutter_speed, stringResource(R.string.label_mode_pro), stringResource(R.string.desc_mode_pro))).filter { it.mode in moreModes },
+            onChoose = {
+                moreSheet = false
+                if (it != ui.mode) haptics.mode()
+                viewModel.chooseMore(it)
+            },
+            onDismiss = { moreSheet = false },
         )
     }
 
@@ -970,7 +1045,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                     torchAvailable = camera.flash && !ledBlocked,
                     ultraHdrAvailable = camera.jpegR.isNotEmpty(),
                     motionPhoto = settings.motionPhoto,
-                    motionAvailable = capture == null && !night,
+                    motionAvailable = capture == null && !night && !pro,
                     hdrAvailable = camera.hlg && capture?.lowQuality != true,
                     qualityAvailable = capture?.lowQuality != true,
                     ultraHdr = settings.ultraHdr,
@@ -1513,3 +1588,115 @@ private fun FrozenLayer(motion: FrozenMotion, published: FrozenFrame?, geometry:
 }
 
 private const val REVIEW_SECURE_MAX = 300
+
+/**
+ * Pro's tiles and its open ruler (SPEC §11, LOGIKA §25): its own composition, as the automatic values change several times a second. ISO and shutter in the
+ * camera's steps (an automatic value shows the step nearest to it), the compensation while one of them is automatic, the meter while both are set by hand;
+ * focus and white balance show automatic.
+ */
+@Composable
+private fun ProPanel(
+    viewModel: ViewfinderViewModel,
+    camera: CameraSpec,
+    settings: CameraSettings,
+    open: ProValue?,
+    onOpen: (ProValue) -> Unit,
+    onTouch: () -> Unit,
+    onReset: () -> Unit,
+    turn: Float,
+    modifier: Modifier,
+    rulerModifier: Modifier,
+) {
+    val live by viewModel.proLive.collectAsStateWithLifecycle()
+    val numbers = rememberNumbers()
+    val resources = LocalResources.current
+    val isoSteps = remember(camera.id) { ProExposure.isoSteps(camera.isoRange) }
+    val shutterSteps = remember(camera.id) { ProExposure.shutterSteps(camera.shutterRange) }
+    // A stored value this camera can't take (the front camera's shutter ends at 1 s) shows as the step it is taken as
+    val iso = (settings.proIso ?: live.iso)?.let { ProExposure.nearest(isoSteps, it.coerceIn(camera.isoRange).toDouble()) }
+    val shutter = (settings.proShutterNs ?: live.timeNs)?.let { ProExposure.nearest(shutterSteps, it.coerceIn(camera.shutterRange).toDouble()) }
+    val bothManual = settings.proIso != null && settings.proShutterNs != null
+    val auto = stringResource(R.string.value_auto)
+    fun look(value: ProValue, manual: Boolean) = when {
+        open == value -> TileLook.SELECTED
+        manual -> TileLook.MANUAL
+        else -> TileLook.AUTO
+    }
+    val evText = { thirds: Int -> if (thirds == 0) "±0" else numbers.exposure(thirds / 3.0) }
+    val tiles = listOf(
+        ProTile(stringResource(R.string.label_pro_iso), iso?.toString() ?: auto, look(ProValue.ISO, settings.proIso != null)) { onOpen(ProValue.ISO) },
+        ProTile(stringResource(R.string.label_pro_shutter), shutter?.let { shutterText(it, numbers, resources) } ?: auto, look(ProValue.SHUTTER, settings.proShutterNs != null)) { onOpen(ProValue.SHUTTER) },
+        ProTile(stringResource(R.string.label_pro_focus), auto, TileLook.AUTO, null),
+        ProTile(stringResource(R.string.label_pro_white_balance), auto, TileLook.AUTO, null),
+        if (bothManual) {
+            // The meter: how much brighter or darker than the metering the photo comes out (SPEC §11)
+            ProTile(stringResource(R.string.label_pro_meter), live.meterEv?.let { numbers.exposure(it) } ?: "–", TileLook.AUTO, null)
+        } else {
+            ProTile(stringResource(R.string.label_pro_ev), evText(settings.proEvThirds), look(ProValue.EV, settings.proEvThirds != 0)) { onOpen(ProValue.EV) }
+        },
+    )
+    ProTiles(tiles, onReset, turn, modifier)
+    when (open) {
+        ProValue.ISO -> ProRuler(
+            count = isoSteps.size,
+            index = iso?.let { isoSteps.indexOf(it) }?.takeIf { it >= 0 } ?: (isoSteps.size / 2),
+            label = { i -> isoSteps[i].takeIf { it in ISO_LABELS }?.toString() },
+            detent = { false },
+            onIndex = {
+                onTouch()
+                viewModel.setProIso(isoSteps[it])
+            },
+            onAuto = {
+                onTouch()
+                viewModel.setProIso(null)
+            },
+            modifier = rulerModifier,
+        )
+        ProValue.SHUTTER -> ProRuler(
+            count = shutterSteps.size,
+            index = shutter?.let { shutterSteps.indexOf(it) }?.takeIf { it >= 0 } ?: (shutterSteps.size / 2),
+            label = { i -> shutterSteps[i].takeIf { it in SHUTTER_LABELS }?.let { shutterText(it, numbers, resources) } },
+            detent = { false },
+            onIndex = {
+                onTouch()
+                viewModel.setProShutter(shutterSteps[it])
+            },
+            onAuto = {
+                onTouch()
+                viewModel.setProShutter(null)
+            },
+            modifier = rulerModifier,
+        )
+        ProValue.EV -> if (!bothManual) ProRuler(
+            count = PRO_EV_STEPS * 2 + 1,
+            index = settings.proEvThirds + PRO_EV_STEPS,
+            label = { i -> (i - PRO_EV_STEPS).takeIf { it % 3 == 0 }?.let(evText) },
+            detent = { it == PRO_EV_STEPS },
+            onIndex = {
+                onTouch()
+                viewModel.setProEv(it - PRO_EV_STEPS)
+            },
+            onAuto = {
+                onTouch()
+                viewModel.setProEv(0)
+            },
+            modifier = rulerModifier,
+        )
+        else -> Unit
+    }
+}
+
+/** A shutter time as photographers write it: "1/250 s" below a third of a second, "0,5 s", "4 s" from it. */
+private fun shutterText(timeNs: Long, numbers: Numbers, resources: Resources): String =
+    if (timeNs >= 300_000_000L) resources.getString(R.string.value_shutter_seconds, numbers.decimal(timeNs / 1e9))
+    else resources.getString(R.string.value_shutter_fraction, (1e9 / timeNs).roundToInt())
+
+/** The ISO steps labelled on the ruler: the whole stops. */
+private val ISO_LABELS = setOf(25, 50, 100, 200, 400, 800, 1600, 3200, 6400, 12800)
+
+/** The shutter steps labelled on the ruler, two stops apart. */
+private val SHUTTER_LABELS = listOf(1000, 250, 60, 15, 4).map { (1e9 / it).roundToLong() }.toSet() + listOf(1L, 4L, 16L).map { it * 1_000_000_000L }
+
+/** Pro's compensation: ±2 EV in thirds. */
+private const val PRO_EV_STEPS = 6
+
