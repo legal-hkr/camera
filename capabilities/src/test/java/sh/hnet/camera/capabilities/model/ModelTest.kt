@@ -117,6 +117,8 @@ class SessionLadderTest {
         assertEquals(StillFormat.JPEG_R, ladder[4].still)
         assertEquals(PhotoSession(PictureRange.HLG, StillFormat.JPEG_R, motion = true, analysis = false), SessionLadder.photo(hlg = true, jpegR = true, wantMotion = true, wantAnalysis = true, motionFirst = true)[1])
         assertEquals(StillFormat.JPEG, ladder.last().still)
+        // A plain JPEG never comes with the HDR preview: it would show what the photo won't have
+        assertTrue(ladder.filter { it.still == StillFormat.JPEG }.all { it.range == PictureRange.SDR })
         assertEquals(ladder.size, ladder.distinct().size)
     }
 
@@ -126,7 +128,14 @@ class SessionLadderTest {
     }
 
     @Test fun ultraHdrTurnedOff() {
-        assertTrue(SessionLadder.photo(hlg = true, jpegR = true, wantMotion = false, wantAnalysis = false, wantUltraHdr = false).all { it.still == StillFormat.JPEG })
+        val ladder = SessionLadder.photo(hlg = true, jpegR = true, wantMotion = false, wantAnalysis = false, wantUltraHdr = false)
+        assertTrue(ladder.all { it.still == StillFormat.JPEG })
+        // The preview in SDR too, as the photo
+        assertTrue(ladder.all { it.range == PictureRange.SDR })
+    }
+
+    @Test fun noUltraHdrNoHdrPreview() {
+        assertTrue(SessionLadder.photo(hlg = true, jpegR = false, wantMotion = true, wantAnalysis = true).all { it.range == PictureRange.SDR })
     }
 }
 

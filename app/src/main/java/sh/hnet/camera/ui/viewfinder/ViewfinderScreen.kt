@@ -158,6 +158,7 @@ import sh.hnet.camera.camera.QrContent
 import sh.hnet.camera.camera.Recording
 import sh.hnet.camera.capabilities.model.Aspect
 import sh.hnet.camera.capabilities.model.Orientation
+import sh.hnet.camera.capabilities.model.PictureRange
 import sh.hnet.camera.capabilities.model.PixelSize
 import sh.hnet.camera.capabilities.model.Point
 import sh.hnet.camera.capabilities.model.SessionLadder
@@ -249,19 +250,22 @@ private fun ViewfinderContent(
     Viewfinder(viewModel, entry, onOpenSettings, onCancel, onResult)
 }
 
-/** While the viewfinder is shown: no status bar (a swipe brings it for a moment), the display's HDR headroom for the preview, the screen kept on. */
+/**
+ * While the viewfinder is shown: no status bar (a swipe brings it for a moment), the display's HDR headroom while the preview is HDR ([hdr]; an SDR preview
+ * doesn't need the display's brighter mode), the screen kept on.
+ */
 @Composable
-private fun ViewfinderWindow(keepOn: Boolean) {
+private fun ViewfinderWindow(keepOn: Boolean, hdr: Boolean) {
     val activity = LocalActivity.current ?: return
     val view = LocalView.current
     // The screen held on only while the viewfinder is in use (see [Viewfinder]); let go, the system's own timeout turns it off
     LaunchedEffect(keepOn) { view.keepScreenOn = keepOn }
+    LaunchedEffect(hdr) { activity.window.colorMode = if (hdr) ActivityInfo.COLOR_MODE_HDR else ActivityInfo.COLOR_MODE_DEFAULT }
     DisposableEffect(activity) {
         val window = activity.window
         val controller = WindowCompat.getInsetsController(window, view)
         controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         controller.hide(WindowInsetsCompat.Type.statusBars())
-        window.colorMode = ActivityInfo.COLOR_MODE_HDR
         onDispose {
             controller.show(WindowInsetsCompat.Type.statusBars())
             window.colorMode = ActivityInfo.COLOR_MODE_DEFAULT
@@ -302,7 +306,17 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
         }
     }
     // The screen kept on and HDR only while there is a viewfinder (not over the no-access screen)
-    ViewfinderWindow(keepOn)
+    // The last session's range, kept while the next one is made (no switch of the display's mode between two HDR sessions); off while the camera has a
+    // problem instead of a picture. A photo for another app is reviewed with its Ultra HDR whatever the preview was
+    var hdrWindow by remember { mutableStateOf(engine.range == PictureRange.HLG) }
+    LaunchedEffect(engine.range, engine.status) {
+        val status = engine.status
+        when {
+            engine.range != null -> hdrWindow = engine.range == PictureRange.HLG
+            status is CameraStatus.Busy || status is CameraStatus.Blocked || status is CameraStatus.Error -> hdrWindow = false
+        }
+    }
+    ViewfinderWindow(keepOn, hdrWindow || reviewing is Review.Photo)
     val last by viewModel.lastShot.collectAsStateWithLifecycle()
     val camera = viewModel.camera
     val shown by viewModel.shown.collectAsStateWithLifecycle()

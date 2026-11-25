@@ -23,13 +23,13 @@ fun interface EncoderLimits {
 }
 object SessionLadder {
     /**
-     * The photo sessions to try, best first; the first one the camera confirms is used. Analysis goes first (the finder glass falls back to plain translucency,
-     * QR codes stop), then the HDR preview, then Ultra HDR. [wantMotion] and [wantAnalysis] leave out what the current settings don't need at all.
+     * The photo sessions to try, best first; the first one the camera confirms is used. Analysis goes first (QR codes stop without it), then the HDR preview,
+     * then Ultra HDR. The HDR preview comes only with an Ultra HDR photo: with HDR off (or no Ultra HDR at all) the preview shows what the photo will be
+     * (owner, 25 Nov 2026), as in Video. [wantMotion] and [wantAnalysis] leave out what the current settings don't need at all.
      */
     fun photo(hlg: Boolean, jpegR: Boolean, wantMotion: Boolean, wantAnalysis: Boolean, wantUltraHdr: Boolean = true, motionFirst: Boolean = false): List<PhotoSession> = buildList {
-        val ranges = if (hlg) listOf(PictureRange.HLG, PictureRange.SDR) else listOf(PictureRange.SDR)
         val stills = if (jpegR && wantUltraHdr) listOf(StillFormat.JPEG_R, StillFormat.JPEG) else listOf(StillFormat.JPEG)
-        for (still in stills) for (range in ranges) {
+        for (still in stills) for (range in if (hlg && still == StillFormat.JPEG_R) listOf(PictureRange.HLG, PictureRange.SDR) else listOf(PictureRange.SDR)) {
             if (wantAnalysis) add(PhotoSession(range, still, wantMotion, analysis = true))
             // Without room for both: the motion photo's stream when it is always wanted, else the analysis (QR codes, and the automatic motion photo can't decide without it)
             val motionOnly = PhotoSession(range, still, wantMotion, analysis = false)

@@ -173,7 +173,8 @@ class SessionProbe(private val manager: CameraManager) {
 
     /**
      * The camera app's photo sessions (LOGIKA §2.1), best first, for 4:3 and 16:9: preview, the motion photo's video stream in the preview's size, the still and a small analysis stream
-     * (QR codes, the finder glass' blur) – 8-bit YUV or, next to an HLG preview, 10-bit P010, since one request may not mix every profile.
+     * (QR codes) – 8-bit YUV or, next to an HLG preview, 10-bit P010, since one request may not mix every profile. The HLG preview comes only with the Ultra HDR
+     * still, as in the app.
      */
     private fun photoLadders(map: StreamConfigurationMap, hlg: Boolean, previewUsage: Long, videoUsage: Long, previewUseCase: Long?, videoUseCase: Long?, stillUseCase: Long?): List<Combination> {
         fun sizes(format: Int): List<Size> = runCatching { map.getOutputSizes(format)?.toList() }.getOrNull().orEmpty()
@@ -197,7 +198,7 @@ class SessionProbe(private val manager: CameraManager) {
                 fun analysis(profile: Long) = (if (profile == h) p010Small?.let { Output("analysis", ImageFormat.YCBCR_P010, it, profile = h) } else yuvSmall?.let { Output("analysis", ImageFormat.YUV_420_888, it) })
                 val stills = listOfNotNull(jpegR?.let { "JPEG_R" to still(ImageFormat.JPEG_R, it) }, jpeg?.let { "JPEG" to still(ImageFormat.JPEG, it) })
                 val profiles = if (hlg) listOf("HLG" to h, "SDR" to DynamicRangeProfiles.STANDARD) else listOf("SDR" to DynamicRangeProfiles.STANDARD)
-                for ((stillName, stillOutput) in stills) for ((profileName, profile) in profiles) {
+                for ((stillName, stillOutput) in stills) for ((profileName, profile) in profiles.filter { stillName == "JPEG_R" || it.second != h }) {
                     val prefix = "app photo $name: preview $profileName + $stillName"
                     val analysisOutput = analysis(profile)
                     if (analysisOutput != null) add(Combination("$prefix + motion + analysis", listOf(preview(profile), motion(profile), stillOutput, analysisOutput), fps30))

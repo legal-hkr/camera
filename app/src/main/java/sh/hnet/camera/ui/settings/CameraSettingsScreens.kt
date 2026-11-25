@@ -130,7 +130,7 @@ fun PhotosSettingsScreen(onBack: () -> Unit) {
 }
 
 /**
- * Settings › Video (SPEC §17.3): resolution, frame rate, HDR (HLG), codec. Stabilization has no choice in v0.1.0 (D6). What no camera of the phone can do isn't
+ * Settings › Video (SPEC §17.3): resolution, frame rate, HDR (HLG), codec. Stabilization has no choice (D6: always on). What no camera of the phone can do isn't
  * shown; HLG is HEVC only, so with AVC its switch is off and says so.
  */
 @Composable

@@ -628,7 +628,8 @@ class CameraEngine(context: Context) {
             Mode.VIDEO -> {
                 // AVC only where chosen (Settings › Video) or HEVC is missing; HLG is always HEVC
                 val hevc = request.video.hevc && Encoders.hevc()
-                SessionLadder.video(request.video, spec.hlg, spec.jpegR.isNotEmpty(), spec.video, spec.fixedFps, Encoders.limits(hevc))
+                // Photos while recording follow the Ultra HDR setting as every photo does
+                SessionLadder.video(request.video, spec.hlg, spec.jpegR.isNotEmpty() && request.ultraHdr, spec.video, spec.fixedFps, Encoders.limits(hevc))
                     .map { Rung(it.range, it.still, VideoFormat(it.size, it.fps, it.range == PictureRange.HLG, hevc || it.range == PictureRange.HLG)) }
                     // No encoder takes anything the camera offers: the preview alone, nothing to record
                     .ifEmpty { listOf(Rung(PictureRange.SDR, null, null)) }
