@@ -20,10 +20,12 @@ import android.hardware.camera2.CaptureFailure
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
+import android.hardware.camera2.params.ColorSpaceTransform
 import android.hardware.camera2.params.DynamicRangeProfiles
 import android.hardware.camera2.params.ExtensionSessionConfiguration
 import android.hardware.camera2.params.MeteringRectangle
 import android.hardware.camera2.params.OutputConfiguration
+import android.hardware.camera2.params.RggbChannelVector
 import android.hardware.camera2.params.SessionConfiguration
 import android.location.Location
 import android.media.AudioManager
@@ -44,6 +46,7 @@ import java.util.concurrent.Executor
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
 import kotlin.math.log2
+import kotlin.math.roundToInt
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -71,6 +74,7 @@ import sh.hnet.camera.capabilities.CameraCatalog
 import sh.hnet.camera.capabilities.CameraSpec
 import sh.hnet.camera.capabilities.model.Aspect
 import sh.hnet.camera.capabilities.model.Exposure
+import sh.hnet.camera.capabilities.model.ManualWhiteBalance
 import sh.hnet.camera.capabilities.model.Orientation
 import sh.hnet.camera.capabilities.model.PictureRange
 import sh.hnet.camera.capabilities.model.PixelRect
@@ -82,6 +86,7 @@ import sh.hnet.camera.capabilities.model.Sizes
 import sh.hnet.camera.capabilities.model.StillFormat
 import sh.hnet.camera.capabilities.model.StillPlan
 import sh.hnet.camera.capabilities.model.VideoChoice
+import sh.hnet.camera.capabilities.model.WhiteBalance
 
 /** The engine's modes; [PRO] is Photo's session with the values set by hand (no motion photo). */
 enum class Mode { PHOTO, VIDEO, NIGHT, PRO }
@@ -150,6 +155,11 @@ data class Controls(
     val flashLevel: Int? = null,
     /** Pro's exposure set by hand (both values), null for the camera's own. */
     val manual: Exposure? = null,
+    /** Pro's focus set by hand, in diopters (0: infinity); null for the camera's own. */
+    val focusDiopters: Double? = null,
+    /** Pro's white balance set by hand; null for the camera's own. On a camera without its color calibration, one of the camera's own presets instead. */
+    val whiteBalance: ManualWhiteBalance? = null,
+    val whiteBalancePreset: Int? = null,
 )
 
 /** A Night photo on its way: its frames gathered (true) or not, the extension's progress (0–100) while it puts the photo together, and the photo. */
@@ -384,11 +394,39 @@ class CameraEngine(context: Context) {
         repeat()
     }
 
-    private val _exposureNow = MutableStateFlow<Exposure?>(null)
+    /** Pro's focus set by hand (diopters), or the camera's own again (null). Only in Pro, on a lens that focuses. */
+    fun setManualFocus(diopters: Double?) = scope.launch {
+        if (controls.focusDiopters == diopters) return@launch
+        controls = controls.copy(focusDiopters = diopters)
+        lookChangedAt = SystemClock.uptimeMillis()
+        repeat()
+        // Back to automatic with a tapped point: AF_MODE_AUTO only moves the lens on a trigger, which the manual focus ignored – it would stay where it was set
+        if (diopters == null && controls.focus != null) trigger(CameraMetadata.CONTROL_AF_TRIGGER_START, precapture = false, flashMetering = false)
+    }
 
-    /** The preview's exposure as the camera reports it (the gain after RAW counted in), a few times a second: Pro's automatic values. */
-    val exposureNow: StateFlow<Exposure?> = _exposureNow.asStateFlow()
-    private var exposureNowAt = 0L
+    /** Pro's white balance set by hand – gains and matrix, or the camera's own [preset] (`CONTROL_AWB_MODE_*`) –, or the camera's own again (both null). Only in Pro. */
+    fun setManualWhiteBalance(balance: ManualWhiteBalance?, preset: Int? = null) = scope.launch {
+        if (controls.whiteBalance == balance && controls.whiteBalancePreset == preset) return@launch
+        controls = controls.copy(whiteBalance = balance, whiteBalancePreset = preset)
+        lookChangedAt = SystemClock.uptimeMillis()
+        repeat()
+    }
+
+    /** When Pro's focus or white balance last changed: the camera's buffer of frames (ZSL) still holds frames from before for a moment. */
+    @Volatile
+    private var lookChangedAt = 0L
+
+    /**
+     * What the camera reports of a frame for Pro's automatic values: the exposure (the gain after RAW counted in), the focus distance, the white balance's
+     * gains against green, and the physical lens that took it (null: the camera has one).
+     */
+    class LiveNow(val exposure: Exposure, val focusDiopters: Double?, val gainRed: Double?, val gainBlue: Double?, val lens: String?)
+
+    private val _liveNow = MutableStateFlow<LiveNow?>(null)
+
+    /** The preview's values as the camera reports them, a few times a second: Pro's automatic values. */
+    val liveNow: StateFlow<LiveNow?> = _liveNow.asStateFlow()
+    private var liveNowAt = 0L
 
     /** A frame's exposure as its result said, and whether the camera's own exposure had settled. */
     class SeenExposure(val exposure: Exposure, val settled: Boolean)
@@ -478,7 +516,8 @@ class CameraEngine(context: Context) {
         // The motion photo's video keeps its frame at the shot where one request may hold both (SDR; HLG streams can't go with the still's), and not when the
         // still may come from an earlier frame (ZSL), whose time would go back in the video
         // Nor with the exposure set by hand: the buffer's frames have the preview's (shorter) one
-        val zsl = request.camera.zsl && !video && !metered && manual == null
+        // Nor for a moment after Pro's focus or white balance changed: the buffer's frames are from before
+        val zsl = request.camera.zsl && !video && !metered && manual == null && SystemClock.uptimeMillis() - lookChangedAt > LOOK_SETTLE_MS
         if (_state.value.range == PictureRange.SDR && !zsl) motion?.let { builder.addTarget(it.surface) }
         applyControls(builder, request, still = true)
         // Set either way: the still template may turn the buffer on by itself, and a flash photo must not come from it
@@ -1212,6 +1251,22 @@ class CameraEngine(context: Context) {
             if (spec.afRegions > 0) builder.set(CaptureRequest.CONTROL_AF_REGIONS, rect)
             if (spec.aeRegions > 0) builder.set(CaptureRequest.CONTROL_AE_REGIONS, rect)
         }
+        // Pro's focus and white balance set by hand, each on its own
+        if (request.mode == Mode.PRO) {
+            // The view model holds the distance to the active lens' range
+            controls.focusDiopters?.takeIf { spec.autofocus }?.let { diopters ->
+                builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
+                builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, diopters.coerceAtLeast(0.0).toFloat())
+            }
+            controls.whiteBalance?.let { balance ->
+                // The camera's HDR processing shifts red with its own balance off: undone in an HLG session (measured on a Pixel only)
+                val red = if (_state.value.range == PictureRange.HLG && GOOGLE) balance.red * WhiteBalance.hdrRedCorrection(balance.kelvin) else balance.red
+                builder.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_OFF)
+                builder.set(CaptureRequest.COLOR_CORRECTION_MODE, CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
+                builder.set(CaptureRequest.COLOR_CORRECTION_GAINS, RggbChannelVector(red.toFloat(), balance.green.toFloat(), balance.green.toFloat(), balance.blue.toFloat()))
+                builder.set(CaptureRequest.COLOR_CORRECTION_TRANSFORM, ColorSpaceTransform(IntArray(18) { i -> if (i % 2 == 0) (balance.transform.values[i / 2] * TRANSFORM_DENOMINATOR).roundToInt() else TRANSFORM_DENOMINATOR }))
+            } ?: controls.whiteBalancePreset?.takeIf { it in spec.awbModes }?.let { builder.set(CaptureRequest.CONTROL_AWB_MODE, it) }
+        }
         manualExposure(request)?.let { manual ->
             val exposure = if (still) manual else ProExposure.preview(manual, spec.isoRange.last)
             builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
@@ -1289,9 +1344,16 @@ class CameraEngine(context: Context) {
                 }
             }
             val now = SystemClock.uptimeMillis()
-            if (now - exposureNowAt >= EXPOSURE_NOW_MS) {
-                exposureNowAt = now
-                _exposureNow.value = exposure
+            if (now - liveNowAt >= LIVE_NOW_MS) {
+                liveNowAt = now
+                val gains = result.get(CaptureResult.COLOR_CORRECTION_GAINS)?.takeIf { it.greenEven > 0f }
+                _liveNow.value = LiveNow(
+                    exposure,
+                    result.get(CaptureResult.LENS_FOCUS_DISTANCE)?.toDouble(),
+                    gains?.let { it.red.toDouble() / it.greenEven },
+                    gains?.let { it.blue.toDouble() / it.greenEven },
+                    result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID),
+                )
             }
         }
         run {
@@ -1759,7 +1821,14 @@ class CameraEngine(context: Context) {
         /** The preview's frame time with an exposure set by hand: 30 fps where the time allows. */
         const val PREVIEW_FRAME_NS = 33_333_333L
         /** Pro's values are reported this often. */
-        const val EXPOSURE_NOW_MS = 200L
+        const val LIVE_NOW_MS = 200L
+        /** A Google phone (the HDR white balance correction was measured on a Pixel). */
+        private val GOOGLE = Build.MANUFACTURER.equals("Google", ignoreCase = true)
+
+        /** How long after a change of Pro's focus or white balance a photo isn't taken from the buffer. */
+        const val LOOK_SETTLE_MS = 500L
+        /** The color transform's rationals: ten thousandths. */
+        const val TRANSFORM_DENOMINATOR = 10_000
         /** Results kept to pair with analysis frames: about a second. */
         const val SEEN_KEPT = 32
         /** A burst's frame waits this long for its consumer, then the burst ends (the consumer is gone). */

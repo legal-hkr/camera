@@ -276,6 +276,14 @@
     <string name="tooltip_auto_one">Automatic</string>
     <string name="tooltip_all_auto">All automatic</string>
     <string name="msg_pro_reset">Pro – all automatic</string>
+    <string name="tooltip_pro_white_balance">White balance</string>
+    <string name="value_kelvin">%1$d K</string>
+    <string name="value_focus_distance_cm">%1$s cm</string>
+    <string name="value_focus_distance_m">%1$s m</string>
+    <string name="value_infinity">∞</string>
+    <string name="value_focus_manual">Manual</string>
+    <string name="label_panel_histogram">Histogram</string>
+    <string name="tooltip_focus_peaking">Focus peaking</string>
     <string name="button_undo">Undo</string>
     <string name="value_shutter_fraction">1/%1$d s</string>
     <string name="value_shutter_seconds">%1$s s</string>

@@ -25,6 +25,11 @@ class ZoomStopsTest {
         assertEquals(listOf(1.0, 2.0, 5.0), scale.group.map { it.ratio })
         assertEquals(5.0, scale.end, 0.0)
         assertTrue(scale.hasControl)
+        // The lens the zoom chose (manual focus takes its range from it)
+        assertEquals(listOf("3", "2", "5", "4"), scale.stops.map { it.lens })
+        assertEquals("5", scale.lensAt(3.0))
+        assertEquals("4", scale.lensAt(5.0))
+        assertEquals("3", scale.lensAt(0.6))
     }
 
     @Test fun pixel9ProUltrawideLenses() {

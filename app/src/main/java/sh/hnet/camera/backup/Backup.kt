@@ -1,5 +1,6 @@
 package sh.hnet.camera.backup
 
+import kotlin.math.abs
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
@@ -15,6 +16,7 @@ import sh.hnet.camera.MotionPhoto
 import sh.hnet.camera.VolumeKeys
 import sh.hnet.camera.capabilities.model.Aspect
 import sh.hnet.camera.capabilities.model.ProExposure
+import sh.hnet.camera.capabilities.model.WhiteBalance
 
 /** Camera's backup file (LOGIKA §12), shaped as the family's: the settings only, never photos or videos. Pure Kotlin, unit-tested. */
 @Serializable
@@ -64,6 +66,11 @@ data class BackupSettings(
     val proIso: Int? = null,
     val proShutterNs: Long? = null,
     val proEvThirds: Int? = null,
+    /** Diopters, −1 automatic (0 is infinity); kelvins, 0 automatic. */
+    val proFocusDiopters: Double? = null,
+    val proKelvin: Int? = null,
+    val proHistogram: Boolean? = null,
+    val proPeaking: Boolean? = null,
     /** The mode last chosen from "More" (`PRO`). */
     val moreMode: String? = null,
 ) {
@@ -97,6 +104,20 @@ data class BackupSettings(
             else -> proShutterNs.takeIf { it in 1..ProExposure.SHUTTER_MAX_NS }
         },
         proEvThirds = proEvThirds?.coerceIn(-PRO_EV_THIRDS, PRO_EV_THIRDS) ?: current.proEvThirds,
+        proFocusDiopters = when {
+            proFocusDiopters == null -> current.proFocusDiopters
+            // A lens focuses at most a few centimeters away (100 diopters: 1 cm); a value out of reason is automatic
+            proFocusDiopters in 0.0..100.0 -> proFocusDiopters
+            else -> null
+        },
+        proKelvin = when (proKelvin) {
+            null -> current.proKelvin
+            // On the ruler's steps, as set by hand
+            in WhiteBalance.MIN_K..WhiteBalance.MAX_K -> WhiteBalance.STEPS.minBy { abs(it - proKelvin) }
+            else -> null
+        },
+        proHistogram = proHistogram ?: current.proHistogram,
+        proPeaking = proPeaking ?: current.proPeaking,
         moreMode = moreMode ?: current.moreMode,
     )
 
@@ -127,6 +148,10 @@ data class BackupSettings(
             proIso = settings.proIso ?: 0,
             proShutterNs = settings.proShutterNs ?: 0L,
             proEvThirds = settings.proEvThirds,
+            proFocusDiopters = settings.proFocusDiopters ?: -1.0,
+            proKelvin = settings.proKelvin ?: 0,
+            proHistogram = settings.proHistogram,
+            proPeaking = settings.proPeaking,
             moreMode = settings.moreMode,
         )
     }

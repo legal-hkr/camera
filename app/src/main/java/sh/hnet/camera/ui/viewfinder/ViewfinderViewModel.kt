@@ -7,6 +7,7 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.hardware.camera2.CameraMetadata
 import android.media.AudioManager
 import android.media.MediaActionSound
 import android.media.ToneGenerator
@@ -18,6 +19,7 @@ import androidx.lifecycle.viewModelScope
 import java.io.File
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.abs
 import kotlin.math.acos
 import kotlin.math.ln
 import kotlin.math.pow
@@ -52,6 +54,7 @@ import sh.hnet.camera.CameraApplication
 import sh.hnet.camera.CameraSettings
 import sh.hnet.camera.Grid
 import sh.hnet.camera.MotionPhoto
+import sh.hnet.camera.ProValues
 import sh.hnet.camera.VolumeKeys
 import sh.hnet.camera.camera.AnalysisFrame
 import sh.hnet.camera.camera.BurstFrame
@@ -66,7 +69,10 @@ import sh.hnet.camera.camera.Mode
 import sh.hnet.camera.camera.PhoneState
 import sh.hnet.camera.camera.PhoneStates
 import sh.hnet.camera.capabilities.CameraSpec
+import sh.hnet.camera.capabilities.LensLook
+import sh.hnet.camera.capabilities.lookOf
 import sh.hnet.camera.capabilities.model.Aspect
+import sh.hnet.camera.capabilities.model.ColorCalibration
 import sh.hnet.camera.capabilities.model.Exposure
 import sh.hnet.camera.capabilities.model.Metering
 import sh.hnet.camera.capabilities.model.PixelSize
@@ -75,6 +81,7 @@ import sh.hnet.camera.capabilities.model.ProExposure
 import sh.hnet.camera.capabilities.model.SessionLadder
 import sh.hnet.camera.capabilities.model.Sizes
 import sh.hnet.camera.capabilities.model.VideoChoice
+import sh.hnet.camera.capabilities.model.WhiteBalance
 import sh.hnet.camera.media.BurstFiles
 import sh.hnet.camera.media.LastShot
 import sh.hnet.camera.media.LocationTracker
@@ -209,13 +216,39 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     val burstCount: StateFlow<Int?> = _burstCount.asStateFlow()
 
     /** Pro's values as its tiles show them – the automatic ones as the camera or the metering has them – and the meter with both set by hand (LOGIKA §26). */
-    data class ProLive(val iso: Int? = null, val timeNs: Long? = null, val meterEv: Double? = null)
+    data class ProLive(
+        val iso: Int? = null,
+        val timeNs: Long? = null,
+        val meterEv: Double? = null,
+        val focusDiopters: Double? = null,
+        val kelvin: Int? = null,
+        /** The white balance set by hand is in effect (a lens without its calibration nor a fitting preset has the camera's own). */
+        val kelvinHeld: Boolean = false,
+        /** The physical lens the camera reports (the color calibration is its own), and the one the zoom chose (the focus range is its own). */
+        val lens: String? = null,
+        val focusLens: String? = null,
+    )
 
     private val _proLive = MutableStateFlow(ProLive())
     val proLive: StateFlow<ProLive> = _proLive.asStateFlow()
     private var proJob: Job? = null
     /** The exposure Pro last gave the engine (null: the camera's own). */
     private var proApplied: Exposure? = null
+    /** The focus and white balance Pro last gave the engine, with the camera and lens they were for (null: none sent yet); [held]: the white balance took. */
+    private data class ProLook(val cameraId: String, val lens: String?, val focusLens: String?, val focusDiopters: Double?, val kelvin: Int?, val held: Boolean = false)
+    private var proLookSent: ProLook? = null
+    /** Reading the automatic white balance's temperature, per color calibration (its table is worked out once). */
+    private val temperatureReaders = HashMap<ColorCalibration, WhiteBalance.TemperatureReader>()
+    /** Focus peaking shows while the focus ruler is open and for a moment after the focus was changed (LOGIKA §27). */
+    private var focusRulerOpen = false
+    private var peakingUntil = 0L
+    /** A lens switch let happen (the stop and the focus it was for), and until when the camera's own focus runs for it. */
+    private var lensNudgedFor: Pair<Double, Double>? = null
+    private var lensNudgeUntil = 0L
+
+    /** Pro's histogram (luma in bins) and focus peaking's edges, from the analysis stream. */
+    val histogram: StateFlow<IntArray?> get() = analyzer.histogram
+    val edges: StateFlow<FrameAnalyzer.Edges?> get() = analyzer.edges
     /** The metering's targets are learned apart for an HLG and an SDR picture. */
     private val meterings = mapOf(false to Metering(ProExposure.defaultTarget(hlg = false)), true to Metering(ProExposure.defaultTarget(hlg = true)))
 
@@ -666,8 +699,19 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         proJob = null
         // Sent again whatever was sent before: another viewfinder may have reset the engine's controls meanwhile
         proApplied = null
-        if (!started || _ui.value.mode != Mode.PRO) {
+        proLookSent = null
+        if (!started) {
+            // The engine may be another viewfinder's now (its values aren't to be cleared); a start sends everything again
+            analyzer.histogramEnabled = false
+            analyzer.peakingEnabled = false
+            return
+        }
+        if (_ui.value.mode != Mode.PRO) {
             engine.setManualExposure(null)
+            engine.setManualFocus(null)
+            engine.setManualWhiteBalance(null)
+            analyzer.histogramEnabled = false
+            analyzer.peakingEnabled = false
             return
         }
         meterings.values.forEach { it.reset() }
@@ -688,8 +732,37 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         // Only the viewfinder whose frames the engine analyses: another one (the lock screen's) may have the camera now
         if (engine.analyzer !== analyze) return
         val camera = camera ?: return
-        if (!camera.manualSensor || camera.isoRange.isEmpty() || camera.shutterRange.isEmpty()) return
         val settings = _ui.value.settings
+        val now = engine.liveNow.value
+        val lens = now?.lens
+        // The focus range is the lens' taking the picture, but not the ultrawide the camera went to by itself (macro: a manual focus nearer than the main
+        // lens reaches makes the Pixel switch, and its range would then hold it there) – then the zoom's lens
+        val zoom = _ui.value.zoom
+        val ultrawideStop = camera.zoom.ultrawide?.ratio
+        val macro = lens != null && lens in camera.ultrawideIds && (ultrawideStop == null || zoom > ultrawideStop + 1e-6)
+        val focusLens = if (lens == null || macro) camera.zoom.lensAt(zoom) else lens
+        val sent = proLook(camera, settings, lens, focusLens, lensNudge(camera, settings, zoom, lens))
+        val lensLook = camera.lookOf(lens)
+        analyzer.histogramEnabled = settings.proHistogram
+        // The histogram counts only the photo's part of the frame
+        analyzer.histogramAspect = settings.aspect.ratio
+        analyzer.peakingEnabled = settings.proPeaking && focusable(camera, camera.lookOf(focusLens)) && (focusRulerOpen || SystemClock.uptimeMillis() < peakingUntil)
+        val look = { live: ProLive ->
+            live.copy(
+                focusDiopters = sent.focusDiopters ?: now?.focusDiopters,
+                kelvin = sent.kelvin?.takeIf { sent.held } ?: lensLook.colorCalibration?.let { c ->
+                    now?.gainRed?.let { r -> now.gainBlue?.let { b -> temperatureReaders.getOrPut(c) { WhiteBalance.TemperatureReader(c) }.read(r, b) } }
+                },
+                kelvinHeld = sent.held,
+                lens = lens,
+                focusLens = focusLens,
+            )
+        }
+        if (!camera.manualSensor || camera.isoRange.isEmpty() || camera.shutterRange.isEmpty()) {
+            // Focus and white balance still show (the exposure tiles aren't offered)
+            _proLive.value = look(ProLive())
+            return
+        }
         val iso = settings.proIso?.coerceIn(camera.isoRange)
         val time = settings.proShutterNs?.coerceIn(camera.shutterRange)
         val ev = settings.proEvThirds
@@ -697,8 +770,8 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         val measured = analyzer.brightness?.takeIf { engineState.value.analysis }
         val seen = measured?.let { engine.exposureAt(analyzer.brightnessFrameNs) }
         val metering = meterings.getValue(analyzer.brightnessHlg)
-        val shown = engine.exposureNow.value
-        _proLive.value = when {
+        val shown = now?.exposure
+        _proLive.value = look(when {
             iso == null && time == null -> {
                 applyPro(null)
                 engine.setExposure(aeSteps(0))
@@ -720,11 +793,68 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
                     shown?.let { held(it, iso, time, camera) }
                 }
                 photo?.let { applyPro(it, metered = true) }
-                val now = photo ?: proApplied
-                ProLive(now?.iso ?: iso, now?.timeNs ?: time)
+                val applied = photo ?: proApplied
+                ProLive(applied?.iso ?: iso, applied?.timeNs ?: time)
             }
-        }
+        })
     }
+
+    private fun focusable(camera: CameraSpec, look: LensLook) = camera.autofocus && look.minimumFocusDiopters > 0
+
+    /**
+     * Whether the camera's own focus runs for a moment now, to let it switch lenses: with the focus set by hand the Pixel keeps its lens while the zoom
+     * slides onto another lens' stop (it switches only with its own focus running, or on a jump – the owner, 25 Nov 2026). Once per stop and focus, only
+     * when that lens reaches the focus set, until it is the lens reported or [LENS_NUDGE_MS] pass; then the focus set by hand is sent again.
+     */
+    private fun lensNudge(camera: CameraSpec, settings: CameraSettings, zoom: Double, lens: String?): Boolean {
+        val focus = settings.proFocusDiopters
+        val stop = camera.zoom.stops.firstOrNull { abs(it.ratio - zoom) < 1e-6 }
+        val target = stop?.lens
+        if (focus == null || stop == null || target == null || lens == null) {
+            if (stop == null) lensNudgedFor = null
+            lensNudgeUntil = 0L
+            return false
+        }
+        val now = SystemClock.uptimeMillis()
+        if (lens == target) {
+            lensNudgeUntil = 0L
+            return false
+        }
+        val key = stop.ratio to focus
+        if (lensNudgedFor != key && focus <= camera.lookOf(target).minimumFocusDiopters) {
+            lensNudgedFor = key
+            lensNudgeUntil = now + LENS_NUDGE_MS
+        }
+        return now < lensNudgeUntil
+    }
+
+    /**
+     * Pro's focus and white balance to the engine when they changed – the setting, the camera, or a lens – and what was sent. The focus range is
+     * [focusLens]'s, the color calibration the reported lens' ([lens]: the one taking the picture; the gains and matrix are worked out once per change). Without its color calibration the temperature picks the camera's nearest preset it has; without
+     * one, the camera's own balance stays.
+     */
+    private fun proLook(camera: CameraSpec, settings: CameraSettings, lens: String?, focusLens: String?, nudging: Boolean = false): ProLook {
+        val lensLook = camera.lookOf(lens)
+        val focusLook = camera.lookOf(focusLens)
+        val focus = settings.proFocusDiopters?.takeIf { focusable(camera, focusLook) && !nudging }?.coerceIn(0.0, focusLook.minimumFocusDiopters)
+        val kelvin = settings.proKelvin
+        val wanted = ProLook(camera.id, lens, focusLens, focus, kelvin)
+        proLookSent?.let { if (it.copy(held = false) == wanted) return it }
+        engine.setManualFocus(focus)
+        val balance = kelvin?.let { k -> lensLook.colorCalibration?.let { WhiteBalance.of(k.toDouble(), it) } }
+        val preset = if (kelvin != null && balance == null) awbPreset(kelvin, camera.awbModes) else null
+        engine.setManualWhiteBalance(balance, preset)
+        return wanted.copy(held = balance != null || preset != null).also { proLookSent = it }
+    }
+
+    /** The camera's own white balance preset nearest to a temperature, of those it has (a lens without its color calibration); null: none. */
+    private fun awbPreset(kelvin: Int, available: Set<Int>): Int? = listOf(
+        2800 to CameraMetadata.CONTROL_AWB_MODE_INCANDESCENT,
+        4000 to CameraMetadata.CONTROL_AWB_MODE_FLUORESCENT,
+        5500 to CameraMetadata.CONTROL_AWB_MODE_DAYLIGHT,
+        6500 to CameraMetadata.CONTROL_AWB_MODE_CLOUDY_DAYLIGHT,
+        7500 to CameraMetadata.CONTROL_AWB_MODE_SHADE,
+    ).filter { it.second in available }.minByOrNull { abs(it.first - kelvin) }?.second
 
     /** The exposure for a value set by hand that keeps [exposure]'s brightness. */
     private fun held(exposure: Exposure, iso: Int?, timeNs: Long?, camera: CameraSpec): Exposure? = when {
@@ -745,8 +875,8 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
         if (metered && last != null) {
-            if (last.iso == exposure.iso && kotlin.math.abs(ln(exposure.timeNs.toDouble() / last.timeNs)) < PRO_SETTLE) return
-            if (last.timeNs == exposure.timeNs && kotlin.math.abs(ln(exposure.iso.toDouble() / last.iso)) < PRO_SETTLE) return
+            if (last.iso == exposure.iso && abs(ln(exposure.timeNs.toDouble() / last.timeNs)) < PRO_SETTLE) return
+            if (last.timeNs == exposure.timeNs && abs(ln(exposure.iso.toDouble() / last.iso)) < PRO_SETTLE) return
         }
         proApplied = exposure
         engine.setManualExposure(exposure)
@@ -779,15 +909,41 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch { preferences.setProEv(thirds) }
     }
 
-    /** All of Pro automatic (`restart_alt`); returns what was set, for the snackbar's Undo. */
-    fun resetPro(): Triple<Int?, Long?, Int> {
-        val settings = _ui.value.settings
-        viewModelScope.launch { preferences.setPro(null, null, 0) }
-        return Triple(settings.proIso, settings.proShutterNs, settings.proEvThirds)
+    /** Pro's focus set by hand in diopters (0: infinity), or automatic again (null); the peaking shows a moment after. */
+    fun setProFocus(diopters: Double?) {
+        viewModelScope.launch { preferences.setProFocus(diopters) }
+        peakingUntil = SystemClock.uptimeMillis() + PEAKING_AFTER_MS
     }
 
-    fun restorePro(values: Triple<Int?, Long?, Int>) {
-        viewModelScope.launch { preferences.setPro(values.first, values.second, values.third) }
+    /** Pro's white balance in kelvins, or automatic again (null). */
+    fun setProKelvin(kelvin: Int?) {
+        viewModelScope.launch { preferences.setProKelvin(kelvin) }
+    }
+
+    /** Focus peaking on or off (the switch at the focus ruler's end); kept. */
+    fun setProPeaking(on: Boolean) {
+        viewModelScope.launch { preferences.setProPeaking(on) }
+    }
+
+    fun setProHistogram(on: Boolean) {
+        viewModelScope.launch { preferences.setProHistogram(on) }
+    }
+
+    /** The focus ruler opened or closed: the peaking shows while it is open, and a moment after. */
+    fun focusRuler(open: Boolean) {
+        if (focusRulerOpen && !open) peakingUntil = SystemClock.uptimeMillis() + PEAKING_AFTER_MS
+        focusRulerOpen = open
+    }
+
+    /** All of Pro automatic (`restart_alt`); returns what was set, for the snackbar's Undo. */
+    fun resetPro(): ProValues {
+        val settings = _ui.value.settings
+        viewModelScope.launch { preferences.setPro(ProValues.AUTO) }
+        return ProValues(settings.proIso, settings.proShutterNs, settings.proEvThirds, settings.proFocusDiopters, settings.proKelvin)
+    }
+
+    fun restorePro(values: ProValues) {
+        viewModelScope.launch { preferences.setPro(values) }
         meterings.values.forEach { it.reset() }
     }
 
@@ -1365,6 +1521,10 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         const val BURST_RESERVE_BYTES = 400L * 1024 * 1024
         const val FRAME_MS = 17L
         const val FOCUS_HOLD_DEGREES = 10.0
+        /** How long the camera's own focus may run to let it switch lenses at a stop (the focus set by hand then comes back). */
+        const val LENS_NUDGE_MS = 1_500L
+        /** Focus peaking stays this long after the focus changed or its ruler closed (SPEC §11). */
+        const val PEAKING_AFTER_MS = 2_000L
         const val LAST_SECONDS = 3
         const val BEEP_VOLUME = 60
         const val BEEP_MS = 80

@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.datastore.preferences.core.Preferences as Store
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
@@ -53,9 +54,22 @@ data class CameraSettings(
     val proIso: Int? = null,
     val proShutterNs: Long? = null,
     val proEvThirds: Int = 0,
+    /** Pro's focus set by hand in diopters (0: infinity) and white balance in kelvins; null: automatic. Kept until reset as the exposure. */
+    val proFocusDiopters: Double? = null,
+    val proKelvin: Int? = null,
+    /** Pro's histogram plate (SPEC §11, the panel), and focus peaking (the switch at the focus ruler's end). */
+    val proHistogram: Boolean = true,
+    val proPeaking: Boolean = true,
     /** The mode last chosen from "More", standing in the mode row before it (SPEC §5.4); its name, null before any. */
     val moreMode: String? = null,
 )
+
+/** Pro's values set by hand, together (its reset and the reset's undo); null: automatic. */
+data class ProValues(val iso: Int?, val shutterNs: Long?, val evThirds: Int, val focusDiopters: Double?, val kelvin: Int?) {
+    companion object {
+        val AUTO = ProValues(null, null, 0, null, null)
+    }
+}
 
 /** Choices the user made in the UI that outlive the process (app-private, not backed up by the system). */
 class Preferences(private val context: Context) {
@@ -81,6 +95,10 @@ class Preferences(private val context: Context) {
         proIso = this[PRO_ISO]?.takeIf { it > 0 },
         proShutterNs = this[PRO_SHUTTER]?.takeIf { it > 0 },
         proEvThirds = this[PRO_EV] ?: 0,
+        proFocusDiopters = this[PRO_FOCUS]?.takeIf { it >= 0 }?.toDouble(),
+        proKelvin = this[PRO_KELVIN]?.takeIf { it > 0 },
+        proHistogram = this[PRO_HISTOGRAM] ?: true,
+        proPeaking = this[PRO_PEAKING] ?: true,
         moreMode = this[MORE_MODE],
     )
 
@@ -103,13 +121,19 @@ class Preferences(private val context: Context) {
     suspend fun setProIso(value: Int?) = context.settings.edit { it[PRO_ISO] = value ?: 0 }
     suspend fun setProShutter(value: Long?) = context.settings.edit { it[PRO_SHUTTER] = value ?: 0L }
     suspend fun setProEv(thirds: Int) = context.settings.edit { it[PRO_EV] = thirds }
+    suspend fun setProFocus(diopters: Double?) = context.settings.edit { it[PRO_FOCUS] = diopters?.toFloat() ?: -1f }
+    suspend fun setProKelvin(kelvin: Int?) = context.settings.edit { it[PRO_KELVIN] = kelvin ?: 0 }
+    suspend fun setProHistogram(value: Boolean) = context.settings.edit { it[PRO_HISTOGRAM] = value }
+    suspend fun setProPeaking(value: Boolean) = context.settings.edit { it[PRO_PEAKING] = value }
     suspend fun setMoreMode(name: String) = context.settings.edit { it[MORE_MODE] = name }
 
     /** Pro's values all at once (its reset, and its undo). */
-    suspend fun setPro(iso: Int?, shutterNs: Long?, evThirds: Int) = context.settings.edit {
-        it[PRO_ISO] = iso ?: 0
-        it[PRO_SHUTTER] = shutterNs ?: 0L
-        it[PRO_EV] = evThirds
+    suspend fun setPro(values: ProValues) = context.settings.edit {
+        it[PRO_ISO] = values.iso ?: 0
+        it[PRO_SHUTTER] = values.shutterNs ?: 0L
+        it[PRO_EV] = values.evThirds
+        it[PRO_FOCUS] = values.focusDiopters?.toFloat() ?: -1f
+        it[PRO_KELVIN] = values.kelvin ?: 0
     }
 
     /** Every remembered value as the backup holds it (LOGIKA §12). */
@@ -139,6 +163,10 @@ class Preferences(private val context: Context) {
             p[PRO_ISO] = restored.proIso ?: 0
             p[PRO_SHUTTER] = restored.proShutterNs ?: 0L
             p[PRO_EV] = restored.proEvThirds
+            p[PRO_FOCUS] = restored.proFocusDiopters?.toFloat() ?: -1f
+            p[PRO_KELVIN] = restored.proKelvin ?: 0
+            p[PRO_HISTOGRAM] = restored.proHistogram
+            p[PRO_PEAKING] = restored.proPeaking
             restored.moreMode?.let { p[MORE_MODE] = it }
         }
     }
@@ -166,6 +194,10 @@ class Preferences(private val context: Context) {
         val PRO_ISO = intPreferencesKey("pro_iso")
         val PRO_SHUTTER = longPreferencesKey("pro_shutter")
         val PRO_EV = intPreferencesKey("pro_ev")
+        val PRO_FOCUS = floatPreferencesKey("pro_focus")
+        val PRO_KELVIN = intPreferencesKey("pro_kelvin")
+        val PRO_HISTOGRAM = booleanPreferencesKey("pro_histogram")
+        val PRO_PEAKING = booleanPreferencesKey("pro_peaking")
         val MORE_MODE = stringPreferencesKey("more_mode")
     }
 }

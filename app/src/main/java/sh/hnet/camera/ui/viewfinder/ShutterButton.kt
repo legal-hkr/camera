@@ -48,7 +48,7 @@ enum class ShutterLook { PHOTO, VIDEO, RECORDING, TIMER, NIGHT, BURST }
 /**
  * ShutterButton (SPEC §5.1): 80 dp in `primary`, its shape carrying the state. Photo: a ring inside a circle, both turning to rounded squares while the finger is
  * down; video: a dot; a burst: a rounded square counting its frames [count] (read where it is drawn: it changes with every frame). Disabled in the component's
- * own disabled colours.
+ * own disabled colors.
  *
  * [onHold]: held past the long-press time, the shutter calls it and [onRelease] when let go (a burst, LOGIKA §18); a shorter touch is [onClick]. Without
  * [onHold] any touch is a click on release, as before.

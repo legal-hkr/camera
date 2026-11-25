@@ -163,7 +163,9 @@ import sh.hnet.camera.camera.PhoneState
 import sh.hnet.camera.camera.QrContent
 import sh.hnet.camera.camera.Recording
 import sh.hnet.camera.capabilities.CameraSpec
+import sh.hnet.camera.capabilities.lookOf
 import sh.hnet.camera.capabilities.model.Aspect
+import sh.hnet.camera.capabilities.model.FocusScale
 import sh.hnet.camera.capabilities.model.Orientation
 import sh.hnet.camera.capabilities.model.PictureRange
 import sh.hnet.camera.capabilities.model.PixelSize
@@ -171,6 +173,7 @@ import sh.hnet.camera.capabilities.model.Point
 import sh.hnet.camera.capabilities.model.ProExposure
 import sh.hnet.camera.capabilities.model.SessionLadder
 import sh.hnet.camera.capabilities.model.Sizes
+import sh.hnet.camera.capabilities.model.WhiteBalance
 import sh.hnet.camera.media.LastShot
 import sh.hnet.camera.media.MediaFiles
 import sh.hnet.camera.ui.components.EmptyState
@@ -503,6 +506,8 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
     if (!pro && proOpen != null) proOpen = null
     val proManual = pro && (ui.settings.proIso != null || ui.settings.proShutterNs != null)
     val rulerOpen = exposureOpen || proOpen != null
+    // Focus peaking shows while the focus ruler is open, and a moment after
+    LaunchedEffect(proOpen == ProValue.FOCUS) { viewModel.focusRuler(proOpen == ProValue.FOCUS) }
     // A Pro ruler closes a while after its last touch, as the exposure ruler does
     LaunchedEffect(proOpen, exposureTouch) {
         if (proOpen == null) return@LaunchedEffect
@@ -596,6 +601,8 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                     }
                 }
                 Box(Modifier.fillMaxSize().drawBehind { drawRect(colors.surface.copy(alpha = cover.value)) })
+                // Focus peaking under the square's bands: the part they cover isn't the photo's
+                if (pro && problem == null) FocusPeaking(viewModel.edges, { x, y, e -> viewModel.analyzer.viewOf(x, y, e.sensorOrientation, e.front, e.frameRatio) })
                 // The square's bands are solid (owner, 25 Nov 2026: translucent ones looked poor, being thin), under the marks: a tap there focuses and shows it
                 if (problem == null && stream == Aspect.FOUR_THREE) {
                     Canvas(Modifier.fillMaxSize()) {
@@ -828,6 +835,8 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                 ui.nightSuggested && ui.mode == Mode.PHOTO && camera?.night != null && !rulerOpen -> SuggestionChip(R.drawable.ic_bedtime, stringResource(R.string.label_suggest_night), onDismiss = { viewModel.closeNightSuggestion() }, onClick = { viewModel.selectMode(Mode.NIGHT) })
             }
         }
+        // Pro's histogram at the picture's top-end, level with the indicators at its top-start (SPEC §11)
+        if (proShown && ui.settings.proHistogram && engine.analysis) HistogramPlate(viewModel.histogram, Modifier.align(Alignment.TopEnd).padding(end = 12.dp, top = status + maxOf(52.dp, pictureTop) + 8.dp))
         // Pro (SPEC §11): the tiles above the ruler's place, the open tile's ruler in it
         camera?.takeIf { proShown }?.let { proCamera ->
             ProPanel(
@@ -1049,6 +1058,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                     qualityAvailable = capture?.lowQuality != true,
                     ultraHdr = settings.ultraHdr,
                     location = locationOn,
+                    histogram = settings.proHistogram.takeIf { pro },
                 ),
                 PanelActions(
                     onFlash = viewModel::setFlash,
@@ -1068,6 +1078,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                     },
                     onUltraHdr = { viewModel.toggleHdr() },
                     onMotionPhoto = { viewModel.setMotionPhoto(it) },
+                    onHistogram = { viewModel.setProHistogram(it) },
                     onLocation = {
                         if (!ui.settings.location && !viewModel.location.allowed()) quickSettings = false
                         toggleLocation()
@@ -1591,7 +1602,8 @@ private const val REVIEW_SECURE_MAX = 300
 /**
  * Pro's tiles and its open ruler (SPEC §11, LOGIKA §25): its own composition, as the automatic values change several times a second. ISO and shutter in the
  * camera's steps (an automatic value shows the step nearest to it), the compensation while one of them is automatic, the meter while both are set by hand;
- * focus and white balance show automatic.
+ * focus in distances (LOGIKA §27: dense near, infinity last; a lens without calibrated distances only "Manual") and white balance in kelvins, the camera's
+ * own values shown while automatic. A lens with a fixed focus has its tile only to show.
  */
 @Composable
 private fun ProPanel(
@@ -1616,6 +1628,17 @@ private fun ProPanel(
     val shutter = (settings.proShutterNs ?: live.timeNs)?.let { ProExposure.nearest(shutterSteps, it.coerceIn(camera.shutterRange).toDouble()) }
     val bothManual = settings.proIso != null && settings.proShutterNs != null
     val auto = stringResource(R.string.value_auto)
+    // The focus range is the lens' the zoom chose, the color calibration the one the camera reports taking the picture
+    val lens = camera.lookOf(live.lens)
+    val focusLens = camera.lookOf(live.focusLens)
+    val focusable = camera.autofocus && focusLens.minimumFocusDiopters > 0
+    val focusSteps = remember(camera.id, focusLens) { if (focusLens.focusCalibrated) FocusScale.steps(focusLens.minimumFocusDiopters) else FocusScale.evenSteps(focusLens.minimumFocusDiopters) }
+    val focusIndex = live.focusDiopters?.let { d -> focusSteps.indices.minByOrNull { abs(focusSteps[it] - d) } }
+    val focusText = { diopters: Double -> focusText(diopters, focusLens.focusCalibrated, numbers, resources) }
+    // Without the lens' color calibration only the camera's own presets
+    val kelvinSteps = if (lens.colorCalibration != null) WhiteBalance.STEPS else WhiteBalance.PRESETS
+    val kelvin = live.kelvin?.let { k -> kelvinSteps.minByOrNull { abs(it - k) } }
+    val kelvinManual = settings.proKelvin != null && live.kelvinHeld
     fun look(value: ProValue, manual: Boolean) = when {
         open == value -> TileLook.SELECTED
         manual -> TileLook.MANUAL
@@ -1625,11 +1648,22 @@ private fun ProPanel(
     val tiles = listOf(
         ProTile(stringResource(R.string.label_pro_iso), iso?.toString() ?: auto, look(ProValue.ISO, settings.proIso != null)) { onOpen(ProValue.ISO) },
         ProTile(stringResource(R.string.label_pro_shutter), shutter?.let { shutterText(it, numbers, resources) } ?: auto, look(ProValue.SHUTTER, settings.proShutterNs != null)) { onOpen(ProValue.SHUTTER) },
-        ProTile(stringResource(R.string.label_pro_focus), auto, TileLook.AUTO, null),
-        ProTile(stringResource(R.string.label_pro_white_balance), auto, TileLook.AUTO, null),
+        ProTile(
+            stringResource(R.string.label_pro_focus),
+            when {
+                !focusable -> auto
+                settings.proFocusDiopters != null || focusLens.focusCalibrated -> live.focusDiopters?.let(focusText) ?: auto
+                else -> auto
+            },
+            look(ProValue.FOCUS, settings.proFocusDiopters != null && focusable),
+            onClick = if (focusable) ({ onOpen(ProValue.FOCUS) }) else null,
+        ),
+        ProTile(stringResource(R.string.label_pro_white_balance), kelvin?.let { stringResource(R.string.value_kelvin, it) } ?: auto, look(ProValue.WHITE_BALANCE, kelvinManual), stringResource(R.string.tooltip_pro_white_balance)) {
+            onOpen(ProValue.WHITE_BALANCE)
+        },
         if (bothManual) {
             // The meter: how much brighter or darker than the metering the photo comes out (SPEC §11)
-            ProTile(stringResource(R.string.label_pro_meter), live.meterEv?.let { numbers.exposure(it) } ?: "–", TileLook.AUTO, null)
+            ProTile(stringResource(R.string.label_pro_meter), live.meterEv?.let { numbers.exposure(it) } ?: "–", TileLook.AUTO, onClick = null)
         } else {
             ProTile(stringResource(R.string.label_pro_ev), evText(settings.proEvThirds), look(ProValue.EV, settings.proEvThirds != 0)) { onOpen(ProValue.EV) }
         },
@@ -1666,6 +1700,50 @@ private fun ProPanel(
             },
             modifier = rulerModifier,
         )
+        ProValue.FOCUS -> if (focusable) ProRuler(
+            count = focusSteps.size,
+            index = focusIndex ?: focusSteps.lastIndex,
+            label = { i ->
+                val d = focusSteps[i]
+                when {
+                    i == focusSteps.lastIndex -> resources.getString(R.string.value_infinity)
+                    focusLens.focusCalibrated && FocusScale.centimeters(d)?.let { cm -> FocusScale.LABELED_CM.any { abs(it - cm) < 0.01 } } == true -> focusText(d)
+                    else -> null
+                }
+            },
+            detent = { it == focusSteps.lastIndex },
+            onIndex = {
+                onTouch()
+                viewModel.setProFocus(focusSteps[it])
+            },
+            onAuto = {
+                onTouch()
+                viewModel.setProFocus(null)
+            },
+            modifier = rulerModifier,
+            trailing = {
+                PeakingSwitch(settings.proPeaking) {
+                    onTouch()
+                    viewModel.setProPeaking(it)
+                }
+            },
+        )
+        ProValue.WHITE_BALANCE -> ProRuler(
+            count = kelvinSteps.size,
+            index = kelvin?.let { kelvinSteps.indexOf(it) }?.takeIf { it >= 0 } ?: kelvinSteps.indexOfFirst { it >= 5500 }.coerceAtLeast(0),
+            label = { i -> kelvinSteps[i].takeIf { it in KELVIN_LABELS || lens.colorCalibration == null }?.toString() },
+            // The presets are felt (owner, 23 Nov 2026: detents on the ruler, as the zoom's lenses)
+            detent = { kelvinSteps[it] in WhiteBalance.PRESETS },
+            onIndex = {
+                onTouch()
+                viewModel.setProKelvin(kelvinSteps[it])
+            },
+            onAuto = {
+                onTouch()
+                viewModel.setProKelvin(null)
+            },
+            modifier = rulerModifier,
+        )
         ProValue.EV -> if (!bothManual) ProRuler(
             count = PRO_EV_STEPS * 2 + 1,
             index = settings.proEvThirds + PRO_EV_STEPS,
@@ -1690,10 +1768,25 @@ private fun shutterText(timeNs: Long, numbers: Numbers, resources: Resources): S
     if (timeNs >= 300_000_000L) resources.getString(R.string.value_shutter_seconds, numbers.decimal(timeNs / 1e9))
     else resources.getString(R.string.value_shutter_fraction, (1e9 / timeNs).roundToInt())
 
-/** The ISO steps labelled on the ruler: the whole stops. */
+/** A focus distance as the tile and the ruler write it: "4,5 cm" near, whole centimeters to a meter, "1,5 m" beyond, "∞"; "Manual" on a lens without calibrated distances. */
+private fun focusText(diopters: Double, calibrated: Boolean, numbers: Numbers, resources: Resources): String {
+    val cm = FocusScale.centimeters(diopters) ?: return resources.getString(R.string.value_infinity)
+    return when {
+        !calibrated -> resources.getString(R.string.value_focus_manual)
+        cm < 10 -> resources.getString(R.string.value_focus_distance_cm, numbers.decimal((cm * 2).roundToInt() / 2.0))
+        cm < 100 -> resources.getString(R.string.value_focus_distance_cm, cm.roundToInt().toString())
+        cm < 1000 -> resources.getString(R.string.value_focus_distance_m, numbers.decimal(cm / 100))
+        else -> resources.getString(R.string.value_focus_distance_m, (cm / 100).roundToInt().toString())
+    }
+}
+
+/** The white balance's steps labeled on the ruler. */
+private val KELVIN_LABELS = setOf(2000, 3000, 4000, 5000, 6000, 8000, 10000)
+
+/** The ISO steps labeled on the ruler: the whole stops. */
 private val ISO_LABELS = setOf(25, 50, 100, 200, 400, 800, 1600, 3200, 6400, 12800)
 
-/** The shutter steps labelled on the ruler, two stops apart. */
+/** The shutter steps labeled on the ruler, two stops apart. */
 private val SHUTTER_LABELS = listOf(1000, 250, 60, 15, 4).map { (1e9 / it).roundToLong() }.toSet() + listOf(1L, 4L, 16L).map { it * 1_000_000_000L }
 
 /** Pro's compensation: ±2 EV in thirds. */

@@ -290,6 +290,8 @@ class PanelState(
     val qualityAvailable: Boolean,
     val ultraHdr: Boolean,
     val location: Boolean,
+    /** Pro's histogram; null outside Pro. */
+    val histogram: Boolean?,
 )
 
 class PanelActions(
@@ -305,6 +307,7 @@ class PanelActions(
     val onTorch: () -> Unit,
     val onUltraHdr: () -> Unit,
     val onMotionPhoto: (MotionPhoto) -> Unit,
+    val onHistogram: (Boolean) -> Unit,
     val onLocation: () -> Unit,
     /** None for another app's shot: its Settings are the app's own business. */
     val onSettings: (() -> Unit)?,
@@ -320,6 +323,7 @@ fun QuickSettings(state: PanelState, actions: PanelActions) {
             row { PanelSwitchRow(it, stringResource(R.string.label_panel_location), state.location) { actions.onLocation() } }
             // The grid and the level show in both modes, so both panels set them
             row { PanelSwitchRow(it, stringResource(R.string.label_panel_level), state.level, actions.onLevel) }
+            state.histogram?.let { on -> row { PanelSwitchRow(it, stringResource(R.string.label_panel_histogram), on, actions.onHistogram) } }
             row { shapes ->
                 PanelRow(shapes, stringResource(R.string.label_panel_grid)) {
                     Toggles(Grid.entries, state.grid, { stringResource(gridName(it)) }, actions.onGrid) { Icon(painterResource(gridIcon(it)), contentDescription = null, modifier = Modifier.size(20.dp)) }
@@ -398,5 +402,5 @@ fun gridName(grid: Grid) = when (grid) {
     Grid.QUARTERS -> R.string.label_grid_quarters
 }
 
-/** A disabled control over the picture: its colour dimmed as the components' own disabled content. */
+/** A disabled control over the picture: its color dimmed as the components' own disabled content. */
 private const val DISABLED_ALPHA = 0.38f

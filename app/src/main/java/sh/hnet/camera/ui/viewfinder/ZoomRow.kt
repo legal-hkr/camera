@@ -249,7 +249,7 @@ private fun ZoomPill(label: String, selected: Boolean, description: String, modi
     }
 }
 
-/** Ticks every 0.1× from the first stop to the end, whole numbers longer and labelled ("×" at the native stops), native stops as dots. */
+/** Ticks every 0.1× from the first stop to the end, whole numbers longer and labeled ("×" at the native stops), native stops as dots. */
 private fun zoomTicks(scale: ZoomScale?, numbers: Numbers): List<Tick> {
     scale ?: return emptyList()
     val start = scale.group.firstOrNull()?.ratio ?: return emptyList()

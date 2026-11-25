@@ -50,4 +50,5 @@
     <string name="title_test_pro_long_exposure">Pro: długie naświetlanie (4 s, 16 s)</string>
     <string name="title_test_pro_raw_with_jpeg">Pro: RAW ze zdjęciem w jednym ujęciu</string>
     <string name="title_test_pro_50mp_dng">Pro: DNG 50 Mpx (Bayer i quad)</string>
+    <string name="title_test_pro_white_balance">Pro: balans w kelwinach (HLG i SDR)</string>
 </resources>

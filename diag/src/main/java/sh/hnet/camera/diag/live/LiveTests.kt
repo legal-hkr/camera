@@ -1,6 +1,7 @@
 package sh.hnet.camera.diag.live
 
 import android.content.Context
+import android.graphics.BitmapFactory
 import android.graphics.ImageDecoder
 import android.graphics.ImageFormat
 import android.graphics.SurfaceTexture
@@ -17,8 +18,10 @@ import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.DngCreator
 import android.hardware.camera2.TotalCaptureResult
+import android.hardware.camera2.params.ColorSpaceTransform
 import android.hardware.camera2.params.DynamicRangeProfiles
 import android.hardware.camera2.params.OutputConfiguration
+import android.hardware.camera2.params.RggbChannelVector
 import android.hardware.camera2.params.SessionConfiguration
 import android.hardware.camera2.params.StreamConfigurationMap
 import android.media.Image
@@ -28,17 +31,22 @@ import android.util.Range
 import android.util.Size
 import android.view.Surface
 import androidx.annotation.StringRes
+import androidx.core.graphics.get
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import kotlin.math.roundToInt
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import sh.hnet.camera.capabilities.CameraCatalog
 import sh.hnet.camera.capabilities.Names
 import sh.hnet.camera.capabilities.area
 import sh.hnet.camera.capabilities.jsonOf
+import sh.hnet.camera.capabilities.lookOf
+import sh.hnet.camera.capabilities.model.WhiteBalance
 import sh.hnet.camera.capabilities.probe
 import sh.hnet.camera.capabilities.sizeText
 import sh.hnet.camera.diag.R
@@ -76,6 +84,7 @@ class LiveTests(context: Context, private val preview: PreviewHost) {
         LiveTest("pro_long_exposure", R.string.title_test_pro_long_exposure) { proLongExposure(it) },
         LiveTest("pro_raw_with_jpeg", R.string.title_test_pro_raw_with_jpeg) { proRawWithJpeg(it) },
         LiveTest("pro_50mp_dng", R.string.title_test_pro_50mp_dng) { pro50mpDng(it) },
+        LiveTest("pro_white_balance", R.string.title_test_pro_white_balance) { proWhiteBalance(it) },
         LiveTest("raw", R.string.title_test_raw) { raw(it) },
     )
 
@@ -696,6 +705,124 @@ class LiveTests(context: Context, private val preview: PreviewHost) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.VANILLA_ICE_CREAM || !manager.isCameraDeviceSetupSupported(id)) return null
         manager.getCameraDeviceSetup(id).isSessionConfigurationSupported(SessionConfiguration(SessionConfiguration.SESSION_REGULAR, outputs))
     }.getOrNull()
+
+    /**
+     * White balance in kelvins against the camera's own (Pro): with an HLG preview and with an SDR one, the camera's automatic balance (its gains, its color
+     * transform, the lens), then the same temperature set by hand as the app sets it (our gains and transform), then our gains with the camera's own
+     * transform. A still of each (saved to DCIM/CameraDiag) and the mean color of its middle: where a hand-set balance comes out warmer, which part differs.
+     */
+    private suspend fun proWhiteBalance(id: String): JsonObject {
+        val chars = chars(id)
+        val map = map(id)
+        val spec = CameraCatalog.read(manager).firstOrNull { it.id == id } ?: return notOffered("the camera in the catalog")
+        val surface = preview.surface(previewSize(map))
+        val hlgOffered = largest(map, ImageFormat.JPEG_R) != null && chars.get(CameraCharacteristics.REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES)?.supportedProfiles?.contains(DynamicRangeProfiles.HLG10) == true
+        return buildJsonObject {
+            for (hlg in listOf(true, false)) {
+                if (hlg && !hlgOffered) continue
+                // As the app pairs them: the HLG preview with Ultra HDR, the SDR one with JPEG
+                val format = if (hlg) ImageFormat.JPEG_R else ImageFormat.JPEG
+                val size = largest(map, format) ?: continue
+                put(if (hlg) "hlg" else "sdr", probe {
+                    manager.withCamera(id) { device, thread ->
+                        ImageQueue(imageReader(size.width, size.height, format, 2), thread).use { queue ->
+                            val outputs = listOf(OutputConfiguration(surface).apply { if (hlg) dynamicRangeProfile = DynamicRangeProfiles.HLG10 }, OutputConfiguration(queue.reader.surface))
+                            if (supported(id, outputs) == false) return@withCamera buildJsonObject { put("skipped", "session not supported") }
+                            val session = device.session(outputs, thread)
+                            try {
+                                val watch = ResultWatch()
+                                device.repeating(session, thread, listOf(surface), callback = watch)
+                                delay(2000)
+                                val auto = watch.result ?: error("no preview result")
+                                val gains = auto.get(CaptureResult.COLOR_CORRECTION_GAINS) ?: error("no gains")
+                                val cameraTransform = auto.get(CaptureResult.COLOR_CORRECTION_TRANSFORM) ?: error("no transform")
+                                val lens = auto.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)
+                                val calibration = spec.lookOf(lens).colorCalibration ?: error("no color calibration for lens $lens")
+                                val red = gains.red.toDouble() / gains.greenEven
+                                val blue = gains.blue.toDouble() / gains.greenEven
+                                val kelvin = WhiteBalance.TemperatureReader(calibration).read(red, blue) ?: error("no temperature")
+                                val ours = WhiteBalance.of(kelvin.toDouble(), calibration) ?: error("no balance at $kelvin K")
+                                val ourTransform = ColorSpaceTransform(IntArray(18) { i -> if (i % 2 == 0) (ours.transform.values[i / 2] * 10_000).roundToInt() else 10_000 })
+                                val ourGains = RggbChannelVector(ours.red.toFloat(), 1f, 1f, ours.blue.toFloat())
+                                fun CaptureRequest.Builder.manual(transform: ColorSpaceTransform) {
+                                    set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_OFF)
+                                    set(CaptureRequest.COLOR_CORRECTION_MODE, CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
+                                    set(CaptureRequest.COLOR_CORRECTION_GAINS, ourGains)
+                                    set(CaptureRequest.COLOR_CORRECTION_TRANSFORM, transform)
+                                }
+                                // A still of what the preview has now, and the mean color of its middle half
+                                suspend fun shot(name: String, configure: CaptureRequest.Builder.() -> Unit): JsonObject {
+                                    device.repeating(session, thread, listOf(surface), callback = watch, configure = configure)
+                                    delay(1500)
+                                    // The still alone: one request never mixes the HLG preview with the still's standard range on the Pixel
+                                    val request = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                                        addTarget(queue.reader.surface)
+                                        still(id)
+                                        configure()
+                                    }
+                                    val result = session.captureOnce(request.build(), thread)
+                                    val bytes = queue.next().use { image -> image.planes[0].buffer.let { b -> ByteArray(b.remaining()).also { b.get(it) } } }
+                                    val uri = Media.saveImage(resolver, "WB_${Media.stamp()}_${if (hlg) "hlg" else "sdr"}_${name}_cam$id.jpg", "image/jpeg", bytes)
+                                    return buildJsonObject {
+                                        put("file", uri.toString())
+                                        result.get(CaptureResult.COLOR_CORRECTION_GAINS)?.let { put("resultGains", "${it.red}, ${it.greenEven}, ${it.greenOdd}, ${it.blue}") }
+                                        result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)?.let { put("resultTransform", it.toString()) }
+                                        put("resultAwbMode", jsonOf(result.get(CaptureResult.CONTROL_AWB_MODE)))
+                                        put("resultColorCorrectionMode", jsonOf(result.get(CaptureResult.COLOR_CORRECTION_MODE)))
+                                        meanColor(bytes)?.let { (r, g, b) ->
+                                            put("meanRgb", "${r.roundToInt()}, ${g.roundToInt()}, ${b.roundToInt()}")
+                                            put("redToGreen", r / g)
+                                            put("blueToGreen", b / g)
+                                        }
+                                    }
+                                }
+                                buildJsonObject {
+                                    put("lens", lens ?: "")
+                                    put("cameraGains", "${gains.red}, ${gains.greenEven}, ${gains.greenOdd}, ${gains.blue}")
+                                    put("cameraTransform", cameraTransform.toString())
+                                    put("kelvinRead", kelvin)
+                                    put("ourGains", "${ours.red}, 1, 1, ${ours.blue}")
+                                    put("ourTransform", ourTransform.toString())
+                                    put("auto", shot("auto") {})
+                                    put("ours", shot("ours") { manual(ourTransform) })
+                                    put("oursGainsCameraTransform", shot("camtransform") { manual(cameraTransform) })
+                                    // As the app sets it in an HDR session: red corrected for the camera's HDR processing
+                                    if (hlg) {
+                                        val corrected = RggbChannelVector((ours.red * WhiteBalance.hdrRedCorrection(ours.kelvin)).toFloat(), 1f, 1f, ours.blue.toFloat())
+                                        put("oursHdrCorrected", shot("corrected") {
+                                            manual(ourTransform)
+                                            set(CaptureRequest.COLOR_CORRECTION_GAINS, corrected)
+                                        })
+                                    }
+                                    put("auto2", shot("auto2") {})
+                                }
+                            } finally {
+                                session.close()
+                            }
+                        }
+                    }
+                })
+            }
+        }
+    }
+
+    /** The mean RGB of a photo's middle half (decoded small): the color cast to compare. */
+    private fun meanColor(bytes: ByteArray): Triple<Double, Double, Double>? {
+        val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, BitmapFactory.Options().apply { inSampleSize = 8 }) ?: return null
+        var r = 0.0
+        var g = 0.0
+        var b = 0.0
+        var n = 0
+        for (y in bitmap.height / 4 until bitmap.height * 3 / 4) for (x in bitmap.width / 4 until bitmap.width * 3 / 4) {
+            val c = bitmap[x, y]
+            r += (c shr 16) and 0xFF
+            g += (c shr 8) and 0xFF
+            b += c and 0xFF
+            n++
+        }
+        bitmap.recycle()
+        return if (n == 0) null else Triple(r / n, g / n, b / n)
+    }
 
     /**
      * Long exposures as Pro takes them (LOGIKA §26, §30): the preview automatic, then one still with the exposure off, ISO 100 and 4 s, then 16 s (or the

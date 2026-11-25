@@ -7,15 +7,19 @@ import android.hardware.camera2.CameraExtensionCharacteristics
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.params.ColorSpaceTransform
 import android.hardware.camera2.params.DynamicRangeProfiles
 import android.hardware.camera2.params.StreamConfigurationMap
 import android.media.MediaRecorder
 import android.os.Build
 import android.util.Size
 import android.view.SurfaceHolder
+import sh.hnet.camera.capabilities.model.ColorCalibration
 import sh.hnet.camera.capabilities.model.LensOptics
+import sh.hnet.camera.capabilities.model.Matrix3
 import sh.hnet.camera.capabilities.model.PixelRect
 import sh.hnet.camera.capabilities.model.PixelSize
+import sh.hnet.camera.capabilities.model.WhiteBalance
 import sh.hnet.camera.capabilities.model.ZoomScale
 import sh.hnet.camera.capabilities.model.ZoomStops
 
@@ -64,6 +68,11 @@ data class CameraSpec(
     val manualSensor: Boolean = false,
     val isoRange: IntRange = IntRange.EMPTY,
     val shutterRange: LongRange = LongRange.EMPTY,
+    /** Focus and white balance set by hand (Pro): the logical camera's lens, and each of its physical lenses' own (by id), which the zoom or macro uses. */
+    val look: LensLook = LensLook(),
+    val lenses: Map<String, LensLook> = emptyMap(),
+    /** The camera's own white balance presets (`CONTROL_AWB_MODE_*`), for a lens without its color calibration. */
+    val awbModes: Set<Int> = emptySet(),
 )
 
 /** The Night extension's sizes: the preview, the photo in Ultra HDR and in plain JPEG, and whether it gives an early postview of the photo. */
@@ -77,6 +86,15 @@ data class NightSpec(
     /** The request keys the extension takes, by name (empty: not said, all are set). */
     val requestKeys: Set<String> = emptySet(),
 )
+
+/**
+ * A lens' focus and color for Pro: the nearest it focuses at in diopters (0: a fixed focus), whether its distances are calibrated (in cm and m), and its color
+ * calibration (null without it, or when the camera doesn't take its own color transform).
+ */
+data class LensLook(val minimumFocusDiopters: Double = 0.0, val focusCalibrated: Boolean = false, val colorCalibration: ColorCalibration? = null)
+
+/** The lens look of the physical lens the camera reports as active ([lens]), else the logical camera's. */
+fun CameraSpec.lookOf(lens: String?): LensLook = lens?.let { lenses[it] } ?: look
 
 object CameraCatalog {
     /** The phone's main back and front cameras (the first of each facing in the system's list), back first; external cameras are left out. */
@@ -133,8 +151,38 @@ object CameraCatalog {
             manualSensor = CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR in (chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: IntArray(0)),
             isoRange = chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)?.let { it.lower..it.upper } ?: IntRange.EMPTY,
             shutterRange = chars.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)?.let { it.lower..it.upper } ?: LongRange.EMPTY,
+            look = lensLook(chars, chars),
+            lenses = chars.physicalCameraIds.mapNotNull { lens -> runCatching { manager.getCameraCharacteristics(lens) }.getOrNull()?.let { lens to lensLook(it, chars) } }.toMap(),
+            awbModes = chars.get(CameraCharacteristics.CONTROL_AWB_AVAILABLE_MODES)?.toSet().orEmpty(),
             stillStalls = listOf(ImageFormat.JPEG_R, ImageFormat.JPEG).any { format -> sizes(map, format).maxByOrNull { it.area }?.let { runCatching { map.getOutputStallDuration(format, Size(it.width, it.height)) }.getOrDefault(0L) > 0 } == true },
         )
+    }
+
+    /** A lens' focus range and color calibration; [logical] the camera the requests go to, which must take the color transform and white balance off. */
+    private fun lensLook(chars: CameraCharacteristics, logical: CameraCharacteristics) = LensLook(
+        minimumFocusDiopters = chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE)?.toDouble() ?: 0.0,
+        focusCalibrated = (chars.get(CameraCharacteristics.LENS_INFO_FOCUS_DISTANCE_CALIBRATION) ?: CameraMetadata.LENS_INFO_FOCUS_DISTANCE_CALIBRATION_UNCALIBRATED) != CameraMetadata.LENS_INFO_FOCUS_DISTANCE_CALIBRATION_UNCALIBRATED,
+        colorCalibration = runCatching { colorCalibration(chars, logical) }.getOrNull(),
+    )
+
+    /** The color calibration DNG would carry (for white balance in kelvins), where the camera takes its own color transform (manual post-processing). */
+    private fun colorCalibration(chars: CameraCharacteristics, logical: CameraCharacteristics): ColorCalibration? {
+        val capabilities = logical.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: return null
+        if (CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_POST_PROCESSING !in capabilities) return null
+        if (logical.get(CameraCharacteristics.CONTROL_AWB_AVAILABLE_MODES)?.contains(CameraMetadata.CONTROL_AWB_MODE_OFF) != true) return null
+        fun matrix(key: CameraCharacteristics.Key<ColorSpaceTransform>) = chars.get(key)?.let { t -> Matrix3(DoubleArray(9) { t.getElement(it % 3, it / 3).toDouble() }) }
+        val illuminant1 = chars.get(CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT1) ?: return null
+        val illuminant2 = chars.get(CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT2)?.toInt() ?: illuminant1
+        return ColorCalibration(
+            colorMatrix1 = matrix(CameraCharacteristics.SENSOR_COLOR_TRANSFORM1) ?: return null,
+            colorMatrix2 = matrix(CameraCharacteristics.SENSOR_COLOR_TRANSFORM2) ?: matrix(CameraCharacteristics.SENSOR_COLOR_TRANSFORM1) ?: return null,
+            calibration1 = matrix(CameraCharacteristics.SENSOR_CALIBRATION_TRANSFORM1) ?: Matrix3.IDENTITY,
+            calibration2 = matrix(CameraCharacteristics.SENSOR_CALIBRATION_TRANSFORM2) ?: matrix(CameraCharacteristics.SENSOR_CALIBRATION_TRANSFORM1) ?: Matrix3.IDENTITY,
+            forwardMatrix1 = matrix(CameraCharacteristics.SENSOR_FORWARD_MATRIX1),
+            forwardMatrix2 = matrix(CameraCharacteristics.SENSOR_FORWARD_MATRIX2) ?: matrix(CameraCharacteristics.SENSOR_FORWARD_MATRIX1),
+            temperature1 = WhiteBalance.temperatureOfIlluminant(illuminant1) ?: return null,
+            temperature2 = WhiteBalance.temperatureOfIlluminant(illuminant2) ?: return null,
+        ).takeIf { it.forwardMatrix1 != null }
     }
 
     /** The Night extension where the phone has one for this camera. */

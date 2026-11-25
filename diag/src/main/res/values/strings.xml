@@ -50,4 +50,5 @@
     <string name="title_test_pro_long_exposure">Pro: long exposure (4 s, 16 s)</string>
     <string name="title_test_pro_raw_with_jpeg">Pro: RAW with the photo in one shot</string>
     <string name="title_test_pro_50mp_dng">Pro: 50 MP DNG (Bayer and quad)</string>
+    <string name="title_test_pro_white_balance">Pro: white balance in kelvins (HLG and SDR)</string>
 </resources>

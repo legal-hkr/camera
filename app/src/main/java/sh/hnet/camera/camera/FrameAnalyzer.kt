@@ -58,18 +58,168 @@ class FrameAnalyzer(private val previewRatio: () -> Double) {
     fun analyze(frame: AnalysisFrame) {
         measureMovement(frame)
         val now = SystemClock.uptimeMillis()
+        if (histogramEnabled && now - histogramAt >= HISTOGRAM_EVERY_MS) {
+            histogramAt = now
+            measureHistogram(frame)
+        }
+        if (peakingEnabled && now - peakingAt >= PEAKING_EVERY_MS) {
+            peakingAt = now
+            findEdges(frame)
+        }
         if (qrEnabled && !decoding && now - lastQr >= QR_EVERY_MS) {
             lastQr = now
             startDecode(frame)
         }
     }
 
+    /** Pro's histogram (SPEC §11): the luma in [HISTOGRAM_BINS] bins, a few times a second while [histogramEnabled]. */
+    @Volatile
+    var histogramEnabled = false
+        set(value) {
+            if (field == value) return
+            synchronized(published) {
+                field = value
+                if (!value) _histogram.value = null
+            }
+        }
+
+    /** The photo's aspect (width to height, its long side along the frame's): the histogram counts only that middle part of the frame. */
+    @Volatile
+    var histogramAspect = 4.0 / 3
+    private val _histogram = MutableStateFlow<IntArray?>(null)
+    val histogram: StateFlow<IntArray?> = _histogram.asStateFlow()
+    private var histogramAt = 0L
+
+    /** Held while a histogram or edges are published, a switch turned off or a reset: none of them is published after those. */
+    private val published = Any()
+
+    private fun measureHistogram(frame: AnalysisFrame) {
+        val generation = generation
+        val image = frame.image
+        val plane = image.planes[0]
+        val buffer = plane.buffer
+        val high = if (frame.tenBit) 1 else 0
+        val bins = IntArray(HISTOGRAM_BINS)
+        val frameAspect = image.width.toDouble() / image.height
+        val aspect = histogramAspect
+        val keptW = if (aspect < frameAspect) (image.height * aspect).toInt() else image.width
+        val keptH = if (aspect > frameAspect) (image.width / aspect).toInt() else image.height
+        val xs = (image.width - keptW) / 2 until (image.width + keptW) / 2
+        val ys = (image.height - keptH) / 2 until (image.height + keptH) / 2
+        for (y in ys step HISTOGRAM_STEP) {
+            val row = y * plane.rowStride + high
+            for (x in xs step HISTOGRAM_STEP) bins[(buffer.get(row + x * plane.pixelStride).toInt() and 0xFF) * HISTOGRAM_BINS / 256]++
+        }
+        synchronized(published) { if (histogramEnabled && generation == this.generation) _histogram.value = bins }
+    }
+
+    /** Focus peaking's edges (LOGIKA §27): a mask of the sharp edges at about 640 pixels across, as the sensor sees it, ten times a second while [peakingEnabled]. */
+    class Edges(val mask: Bitmap, val sensorOrientation: Int, val front: Boolean, val frameRatio: Double)
+
+    @Volatile
+    var peakingEnabled = false
+        set(value) {
+            if (field == value) return
+            synchronized(published) {
+                field = value
+                if (!value) _edges.value = null
+            }
+        }
+    private val _edges = MutableStateFlow<Edges?>(null)
+    val edges: StateFlow<Edges?> = _edges.asStateFlow()
+    private var peakingAt = 0L
+
+    /** The edge search's working arrays, kept from frame to frame (the analysis thread's only). */
+    private var edgeLuma = IntArray(0)
+    private var gradientX = IntArray(0)
+    private var gradientY = IntArray(0)
+    private var magnitude = IntArray(0)
+    private var wideMagnitude = IntArray(0)
+
+    /**
+     * The sharp edges as thin lines (LOGIKA §30.3). How sharp an edge is doesn't depend on its contrast: across a sharp edge the brightness changes as much
+     * over 2 pixels as over 4, across a blurred one half as much – so an edge shows where the Sobel operator over ±1 pixel is nearly as strong as the same
+     * operator over ±2 ([SHARP_RATIO]), and strong at all over ±1 ([EDGE_MIN]: a flat picture's noise shows none); of it only the ridge (a pixel stronger than both
+     * its neighbors across the edge). Not a share of the picture: a blurred picture then shows nothing (the owner, 25 Nov 2026: the strongest share of a
+     * blurred picture lit as sharp lines, a sharp one only as dashes). At about 640 pixels across.
+     */
+    private fun findEdges(frame: AnalysisFrame) {
+        val generation = generation
+        val image = frame.image
+        val plane = image.planes[0]
+        val buffer = plane.buffer
+        val high = if (frame.tenBit) 1 else 0
+        val step = (image.width / EDGE_WIDTH).coerceAtLeast(1)
+        val w = image.width / step
+        val h = image.height / step
+        if (edgeLuma.size != w * h) {
+            edgeLuma = IntArray(w * h)
+            gradientX = IntArray(w * h)
+            gradientY = IntArray(w * h)
+            magnitude = IntArray(w * h)
+            wideMagnitude = IntArray(w * h)
+        }
+        val luma = edgeLuma
+        val gxs = gradientX
+        val gys = gradientY
+        val near = magnitude
+        val wide = wideMagnitude
+        near.fill(0)
+        for (y in 0 until h) {
+            val row = step * y * plane.rowStride + high
+            for (x in 0 until w) luma[y * w + x] = buffer.get(row + step * x * plane.pixelStride).toInt() and 0xFF
+        }
+        val w2 = 2 * w
+        for (y in 2 until h - 2) for (x in 2 until w - 2) {
+            val i = y * w + x
+            val gx = luma[i - w + 1] + 2 * luma[i + 1] + luma[i + w + 1] - luma[i - w - 1] - 2 * luma[i - 1] - luma[i + w - 1]
+            val gy = luma[i + w - 1] + 2 * luma[i + w] + luma[i + w + 1] - luma[i - w - 1] - 2 * luma[i - w] - luma[i - w + 1]
+            // The same operator two pixels out
+            val gx2 = luma[i - w2 + 2] + 2 * luma[i + 2] + luma[i + w2 + 2] - luma[i - w2 - 2] - 2 * luma[i - 2] - luma[i + w2 - 2]
+            val gy2 = luma[i + w2 - 2] + 2 * luma[i + w2] + luma[i + w2 + 2] - luma[i - w2 - 2] - 2 * luma[i - w2] - luma[i - w2 + 2]
+            gxs[i] = gx
+            gys[i] = gy
+            near[i] = abs(gx) + abs(gy)
+            wide[i] = abs(gx2) + abs(gy2)
+        }
+        // A new bitmap each time (the one shown is being drawn); its rows may be padded
+        val bitmap = createBitmap(w, h, Bitmap.Config.ALPHA_8)
+        val stride = bitmap.rowBytes
+        val out = ByteArray(stride * h)
+        for (y in 3 until h - 3) for (x in 3 until w - 3) {
+            val i = y * w + x
+            val m = near[i]
+            val m2 = wide[i]
+            // The threshold on the near change: fine detail (a thin line, a texture of a few pixels) cancels out in the wide one
+            if (m < EDGE_MIN || m < m2 * SHARP_RATIO) continue
+            // The ridge: across the edge (the gradient's direction, in four) neither neighbor is stronger
+            val ax = abs(gxs[i])
+            val ay = abs(gys[i])
+            val across = when {
+                ay * 5 < ax * 2 -> 1
+                ax * 5 < ay * 2 -> w
+                (gxs[i] > 0) == (gys[i] > 0) -> w + 1
+                else -> w - 1
+            }
+            if (m >= near[i - across] && m > near[i + across]) out[y * stride + x] = 0xFF.toByte()
+        }
+        bitmap.copyPixelsFromBuffer(ByteBuffer.wrap(out))
+        synchronized(published) { if (peakingEnabled && generation == this.generation) _edges.value = Edges(bitmap, frame.sensorOrientation, frame.front, image.width.toDouble() / image.height) }
+    }
+
+    /** A point of the analysis frame (shares of it, as the sensor sees it) where the upright preview shows it, as shares of the preview. */
+    fun viewOf(x: Double, y: Double, sensorOrientation: Int, front: Boolean, frameRatio: Double): Point = toView(x, y, sensorOrientation, front, frameRatio)
+
     /** Clears what was found when the analysis stops (a new mode, the viewfinder leaving). */
     fun reset() {
         generation++
         _qr.value = null
-        // A new session or camera: the last picture's brightness says nothing about the next
+        // A new session or camera: the last picture's brightness says nothing about the next, nor its histogram or edges (another lens, turned or cut otherwise)
         brightness = null
+        synchronized(published) {
+            _histogram.value = null
+            _edges.value = null
+        }
     }
 
     fun close() {
@@ -235,6 +385,19 @@ class FrameAnalyzer(private val previewRatio: () -> Double) {
 
     companion object {
         private const val QR_EVERY_MS = 200L
+        const val HISTOGRAM_BINS = 64
+        private const val HISTOGRAM_EVERY_MS = 200L
+        /** Every fourth pixel each way: enough for a histogram's shape. */
+        private const val HISTOGRAM_STEP = 4
+        private const val PEAKING_EVERY_MS = 100L
+        /** The edges are looked for at about this many pixels across. */
+        private const val EDGE_WIDTH = 640
+
+        /** How strong the change over ±1 pixel must be against the one over ±2 for a sharp edge (1: a step, 0.5: blurred over 4 pixels or more). */
+        private const val SHARP_RATIO = 0.75f
+
+        /** The least change over ±1 pixel that is an edge at all (the Sobel weights sum to 4: a step of 16 levels of 255). */
+        private const val EDGE_MIN = 64
         private const val QR_KEEP_MS = 2_000L
         private const val MARKS_KEEP_MS = 300L
         /** Corners that moved less than this share of the picture aren't published again. */

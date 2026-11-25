@@ -187,7 +187,7 @@ fun GridAndLevel(grid: Grid, tilt: Tilt?, rotation: Int, modifier: Modifier) {
         for (i in 1 until lines) {
             val x = size.width * i / lines
             val y = size.height * i / lines
-            // A single thin line in the outline's colour: the double stroke made the grid too heavy (owner, 23 Nov 2026); the level keeps it
+            // A single thin line in the outline's color: the double stroke made the grid too heavy (owner, 23 Nov 2026); the level keeps it
             drawLine(colors.onSurface, Offset(x, 0f), Offset(x, size.height), 1.dp.toPx())
             drawLine(colors.onSurface, Offset(0f, y), Offset(size.width, y), 1.dp.toPx())
         }

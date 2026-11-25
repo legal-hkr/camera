@@ -14,7 +14,7 @@ class BackupTest {
     private val changed = CameraSettings(
         aspect = Aspect.SQUARE, ultraHdr = false, hdrVideo = false, location = true, grid = Grid.QUARTERS, level = true, videoUhd = false, videoFps = 60,
         timerFlash = true, volumeKeys = VolumeKeys.ZOOM, qrCodes = false, motionPhoto = MotionPhoto.ON, mirror = true, shutterSound = false, videoHevc = false, nightSuggestion = false,
-        proIso = 400, proShutterNs = 8_000_000_000L, proEvThirds = -2, moreMode = "PRO",
+        proIso = 400, proShutterNs = 8_000_000_000L, proEvThirds = -2, proFocusDiopters = 2.0, proKelvin = 5600, proHistogram = false, proPeaking = false, moreMode = "PRO",
     )
 
     private fun file(settings: BackupSettings) = BackupFile(appVersion = "0.1.0", appVersionCode = 1, createdAt = "2026-11-24T10:00:00Z", settings = settings)
@@ -37,10 +37,14 @@ class BackupTest {
 
     @Test fun proAutomaticInTheFileClearsManualValues() {
         // 0 in the file is automatic: a hand-set value goes; a value missing from the file stays
-        val restored = BackupSettings(proIso = 0, proShutterNs = 0L).applyTo(changed)
+        val restored = BackupSettings(proIso = 0, proShutterNs = 0L, proFocusDiopters = -1.0, proKelvin = 0).applyTo(changed)
         assertEquals(null, restored.proIso)
         assertEquals(null, restored.proShutterNs)
+        assertEquals(null, restored.proFocusDiopters)
+        assertEquals(null, restored.proKelvin)
         assertEquals(-2, restored.proEvThirds)
+        // Infinity is a focus set by hand, not automatic
+        assertEquals(0.0, BackupSettings(proFocusDiopters = 0.0).applyTo(changed).proFocusDiopters)
     }
 
     @Test fun locationOnlyWithAccess() {

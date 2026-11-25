@@ -53,7 +53,7 @@ fun rememberHaptics(): Haptics {
  */
 fun Modifier.controlSurface(shape: Shape, color: Color): Modifier = clip(shape).background(color, shape)
 
-/** The controls' colour over the picture. */
+/** The controls' color over the picture. */
 @Composable
 @ReadOnlyComposable
 fun controlColor(): Color = MaterialTheme.colorScheme.surfaceContainerHigh
@@ -85,9 +85,9 @@ class Numbers(locale: Locale) {
 }
 
 /**
- * The colours of controls drawn over the picture without a surface (owner, 25 Nov 2026): the light scheme's white (as the screen flash's) for plain ones –
+ * The colors of controls drawn over the picture without a surface (owner, 25 Nov 2026): the light scheme's white (as the screen flash's) for plain ones –
  * brighter than the dark scheme's `onSurface`, which matters on a bright sky – and amber for one switched on or set by hand (the owner's exception to the
- * theme colours, as the flash that will fire: `primaryFixed` looked dimmer than the white, as if off).
+ * theme colors, as the flash that will fire: `primaryFixed` looked dimmer than the white, as if off).
  */
 class OverlayColors(val content: Color, val accent: Color, val shadow: Color)
 
@@ -103,7 +103,7 @@ private val LIGHT_WHITE = lightColorScheme().surfaceContainerLowest
 
 /**
  * Content over the picture with the theme's scrim as its shadow (owner, 25 Nov 2026): a tight shadow around it (2.5 dp) and a wider one slightly below (5 dp,
- * 83 %), both blurred copies of the content itself, kept out of the semantics. [content] gets the colour to draw in for a shadow copy, or null for itself;
+ * 83 %), both blurred copies of the content itself, kept out of the semantics. [content] gets the color to draw in for a shadow copy, or null for itself;
  * [alpha] dims the shadow with a dimmed content (a disabled control).
  */
 @Composable
