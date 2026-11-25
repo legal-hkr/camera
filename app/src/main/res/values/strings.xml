@@ -235,6 +235,7 @@
     <string name="msg_photo_lost">The camera didn’t return the photo, so it wasn’t saved. Take it again.</string>
     <string name="msg_raw_unavailable">The camera can’t save a DNG file with the current settings.</string>
     <string name="msg_raw_other_lens">This photo was taken with another lens, so no DNG file was saved.</string>
+    <string name="msg_dng_not_saved">The DNG file couldn’t be saved.</string>
     <string name="msg_hdr_unavailable">HDR isn’t available with this lens.</string>
     <string name="label_shortcut_selfie_short">Selfie</string>
     <string name="label_shortcut_selfie_long">Take a selfie</string>

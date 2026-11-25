@@ -152,7 +152,8 @@ fun ProRuler(
     val ticks = (0 until count).map { Tick(it.toDouble(), major = label(it) != null, label = label(it), detent = detent(it)) }
     var current by remember(count) { mutableIntStateOf(index.coerceIn(0, last)) }
     // An automatic value moving under the ruler moves it too, unless the finger has it or the value it set isn't back yet (no jump back after a drag)
-    var dragging by remember { mutableStateOf(false) }
+    // Keyed as the gesture is: steps that change under a drag (a lens switched by the camera) end it, and with it the finger's hold
+    var dragging by remember(count) { mutableStateOf(false) }
     var set by remember { mutableStateOf<Int?>(null) }
     if (set == index) set = null
     if (!dragging && set == null && current != index) current = index.coerceIn(0, last)

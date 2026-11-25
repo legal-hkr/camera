@@ -203,6 +203,10 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     private val raw50Saves = Semaphore(1)
     private val rawSaves = Semaphore(2)
 
+    private val _dngNotSaved = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+    /** A DNG couldn't be written (storage, memory): the camera did hand it over. */
+    val dngNotSaved: SharedFlow<Unit> = _dngNotSaved
+
     private val _rawOtherLens = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
     /** A photo went without its DNG: the camera took it with another lens than the raw stream's (macro, a near subject at the tele's stop). */
     val rawOtherLens: SharedFlow<Unit> = _rawOtherLens
@@ -537,7 +541,8 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         if (!started) return
         // Not under a recording, a countdown, a Night photo gathering its frames or a burst: a new session would cut the video, lose the timed shot, hold a
         // frozen frame over the gathering, or end the burst
-        if (recording || _ui.value.countdown != null || _ui.value.holdingStill || burstJob != null) {
+        // Nor under a long exposure pressed and waiting for its request (a 50 MP one waits for the previous DNG): it would be taken on the new session
+        if (recording || _ui.value.countdown != null || _ui.value.holdingStill || longShot || burstJob != null) {
             configureLater = true
             // A frame frozen for the change would stay over the live picture until it comes
             _frozen.value = null
@@ -689,7 +694,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     private val recording: Boolean get() = engineState.value.recording != null
 
     fun selectMode(mode: Mode) {
-        if (mode == _ui.value.mode || recording || _entry.value is Entry.Capture || _ui.value.holdingStill || burstJob != null) return
+        if (mode == _ui.value.mode || recording || _entry.value is Entry.Capture || _ui.value.holdingStill || longShot || burstJob != null) return
         // Night only on a camera with the extension, Pro only on one with the manual sensor
         if (mode == Mode.NIGHT && camera?.night == null) return
         if (mode == Mode.PRO && camera?.manualSensor != true) return
@@ -712,7 +717,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun switchCamera() {
-        if (cameras.size < 2 || recording || _ui.value.holdingStill || burstJob != null) return
+        if (cameras.size < 2 || recording || _ui.value.holdingStill || longShot || burstJob != null) return
         cancelTimer()
         val next = (_ui.value.cameraIndex + 1) % cameras.size
         // Night stays only where the other camera has it too, Pro where it has the manual sensor
@@ -744,8 +749,9 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     private fun watchPro() {
         proJob?.cancel()
         proJob = null
-        // Sent again whatever was sent before: another viewfinder may have reset the engine's controls meanwhile
+        // Sent again whatever was sent before: another viewfinder may have reset the engine's controls meanwhile; the last session's readings go
         proApplied = null
+        _proLive.value = ProLive()
         proLookSent = null
         lensNudgedFor = null
         lensNudgeUntil = 0L
@@ -818,10 +824,14 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         val iso = settings.proIso?.coerceIn(camera.isoRange)
         val time = settings.proShutterNs?.coerceIn(camera.shutterRange)
         val ev = settings.proEvThirds
-        // A recent frame's brightness and the exposure that very frame had (no analysis stream in the session: no metering)
-        val measured = analyzer.brightness?.takeIf { engineState.value.analysis }
-        val seen = measured?.let { engine.exposureAt(analyzer.brightnessFrameNs) }
-        val metering = meterings.getValue(analyzer.brightnessHlg)
+        // The newest frame whose exposure the camera has reported, its brightness and that exposure, from one frame (no analysis stream in the session: no
+        // metering)
+        val analysis = engineState.value.analysis
+        val frames = if (analysis) analyzer.recentBrightness() else emptyList()
+        val pair = frames.firstNotNullOfOrNull { b -> engine.exposureAt(b.frameNs)?.let { b to it } }
+        val measured = pair?.first?.value
+        val seen = pair?.second
+        val metering = meterings.getValue(pair?.first?.hlg ?: frames.firstOrNull()?.hlg ?: false)
         val shown = now?.exposure
         _proLive.value = look(when {
             iso == null && time == null -> {
@@ -835,14 +845,18 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
             iso != null && time != null -> {
                 val photo = Exposure(iso, time)
                 applyPro(photo)
-                ProLive(iso, time, if (measured != null && seen != null) metering.meter(measured, seen.exposure, photo) else null)
+                // The meter keeps its last reading while no frame's exposure is in (it doesn't blink empty)
+                val reading = if (measured != null && seen != null) metering.meter(measured, seen.exposure, photo) else _proLive.value.meterEv
+                ProLive(iso, time, reading)
             }
             else -> {
-                val photo = if (measured != null && seen != null) {
-                    metering.step(measured, seen.exposure, ev, iso, time, camera.isoRange, camera.shutterRange)
-                } else {
+                val photo = when {
+                    measured != null && seen != null -> metering.step(measured, seen.exposure, ev, iso, time, camera.isoRange, camera.shutterRange)
+                    // Frames measured but none of their exposures reported yet: the last value stays (the preview's own exposure, held to 1/15 s with gain
+                    // for a long time, would set the photo stops off)
+                    frames.isNotEmpty() -> null
                     // No metering: the camera's last exposure kept, the value not set by hand taken from it
-                    shown?.let { held(it, iso, time, camera) }
+                    else -> shown?.let { held(it, iso, time, camera) }
                 }
                 photo?.let { applyPro(it, metered = true) }
                 val applied = photo ?: proApplied
@@ -954,13 +968,20 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         get() = _ui.value.mode == Mode.PRO && (_ui.value.settings.proIso != null || _ui.value.settings.proShutterNs != null)
 
     /** Pro's ISO set by hand, or automatic again (null); kept until reset (D20). */
+    /** An AE/AF lock made while the exposure was the camera's goes when it is set by hand (the lock's chip would say so under a manual exposure). */
+    private fun unlockForManual() {
+        if (_ui.value.locked) unlock()
+    }
+
     fun setProIso(iso: Int?) {
+        if (iso != null) unlockForManual()
         viewModelScope.launch { preferences.setProIso(iso) }
         meterings.values.forEach { it.reset() }
     }
 
     /** Pro's shutter set by hand, or automatic again (null). */
     fun setProShutter(timeNs: Long?) {
+        if (timeNs != null) unlockForManual()
         viewModelScope.launch { preferences.setProShutter(timeNs) }
         meterings.values.forEach { it.reset() }
     }
@@ -1548,6 +1569,8 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
             proLookSent = null
             proStep()
         }
+        // Pro's newest values reach the camera before the shot (the loop sends them ten times a second)
+        if (ui.mode == Mode.PRO && started && engine.analyzer === analyze) proStep()
         // A long exposure set by hand (LOGIKA §26): further presses wait for it from now (another would queue behind it); its countdown starts with the request
         val long = ui.mode == Mode.PRO && ui.settings.proShutterNs?.let { it >= LONG_EXPOSURE_NS } == true
         if (long) longShot = true
@@ -1625,7 +1648,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
                         } finally {
                             release()
                         }
-                        if (uri == null) _photoLost.tryEmit(Unit) else media.showRaw50(uri, photo.takenAt)
+                        if (uri == null) _dngNotSaved.tryEmit(Unit) else media.showRaw50(uri, photo.takenAt)
                         phone.refreshStorage()
                     }
                     return@withLock
@@ -1657,7 +1680,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
                         val saved = try {
                             media.savePhoto(photo.bytes, photo.takenAt, photo.crop, mirror, photo.longExposureNs)?.also {
                                 // Its DNG beside it, named as the photo (after it: the thumbnail shows the photo at once); none without the photo
-                                photo.raw?.let { raw -> media.saveRaw(raw, photo.takenAt) }
+                                photo.raw?.let { raw -> if (media.saveRaw(raw, photo.takenAt) == null) _dngNotSaved.tryEmit(Unit) }
                             }
                         } finally {
                             photo.raw?.close()

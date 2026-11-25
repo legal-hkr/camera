@@ -215,7 +215,7 @@ class FrameAnalyzer(private val previewRatio: () -> Double) {
         generation++
         _qr.value = null
         // A new session or camera: the last picture's brightness says nothing about the next, nor its histogram or edges (another lens, turned or cut otherwise)
-        brightness = null
+        synchronized(brightnessFrames) { brightnessFrames.clear() }
         synchronized(published) {
             _histogram.value = null
             _edges.value = null
@@ -333,21 +333,15 @@ class FrameAnalyzer(private val previewRatio: () -> Double) {
     }
 
     /**
-     * The picture's brightness for Pro's metering (LOGIKA §26): the grid's cells made linear (SDR or HLG, as the analysis frame is) and averaged with more
-     * weight to the middle; null before the first frame. [brightnessHlg]: it was measured on an HLG picture (another target).
+     * A frame's brightness for Pro's metering (LOGIKA §26): the grid's cells made linear (SDR or HLG, as the analysis frame is) and averaged with more weight
+     * to the middle; [hlg]: measured on an HLG picture (another target); [frameNs]: the frame's sensor time (the engine knows its exposure by it).
      */
-    @Volatile
-    var brightness: Double? = null
-        private set
+    class Brightness(val value: Double, val hlg: Boolean, val frameNs: Long)
 
-    @Volatile
-    var brightnessHlg = false
-        private set
+    /** The last few frames' brightness, newest first: the metering takes the newest whose exposure the camera has reported already (its result may come later). */
+    private val brightnessFrames = ArrayDeque<Brightness>()
 
-    /** The sensor time of the frame [brightness] was measured on (the engine knows that frame's exposure by it). */
-    @Volatile
-    var brightnessFrameNs = 0L
-        private set
+    fun recentBrightness(): List<Brightness> = synchronized(brightnessFrames) { brightnessFrames.toList() }
 
     private fun measureBrightness(grid: IntArray, hlg: Boolean, frameNs: Long) {
         var sum = 0.0
@@ -360,9 +354,10 @@ class FrameAnalyzer(private val previewRatio: () -> Double) {
             sum += ProExposure.linear(grid[gy * GRID_W + gx] / 255.0, hlg) * weight
             weights += weight
         }
-        brightnessHlg = hlg
-        brightnessFrameNs = frameNs
-        brightness = sum / weights
+        synchronized(brightnessFrames) {
+            brightnessFrames.addFirst(Brightness(sum / weights, hlg, frameNs))
+            while (brightnessFrames.size > BRIGHTNESS_KEPT) brightnessFrames.removeLast()
+        }
     }
 
     /** Whether something moved in the scene between two of the sensor's times (the automatic motion photo keeps its video then). */
@@ -385,6 +380,8 @@ class FrameAnalyzer(private val previewRatio: () -> Double) {
 
     companion object {
         private const val QR_EVERY_MS = 200L
+        /** Brightness of this many recent frames kept for the metering (half a second at 15 fps; a frame's result comes a frame or a few later). */
+        private const val BRIGHTNESS_KEPT = 8
         const val HISTOGRAM_BINS = 64
         private const val HISTOGRAM_EVERY_MS = 200L
         /** Every fourth pixel each way: enough for a histogram's shape. */

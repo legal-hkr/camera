@@ -234,6 +234,7 @@
     <string name="msg_photo_lost">Aparat nie przekazał zdjęcia, więc nie zostało zapisane. Zrób je ponownie.</string>
     <string name="msg_raw_unavailable">Przy obecnych ustawieniach aparat nie może zapisać pliku DNG.</string>
     <string name="msg_raw_other_lens">Zdjęcie zostało zrobione innym obiektywem, więc nie zapisano pliku DNG.</string>
+    <string name="msg_dng_not_saved">Nie udało się zapisać pliku DNG.</string>
     <string name="msg_hdr_unavailable">HDR nie jest dostępny dla tego obiektywu.</string>
     <string name="label_shortcut_selfie_short">Selfie</string>
     <string name="label_shortcut_selfie_long">Zrób selfie</string>

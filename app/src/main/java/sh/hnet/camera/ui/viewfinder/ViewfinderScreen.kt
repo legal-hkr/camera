@@ -358,6 +358,8 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
     }
 
     var zoomRulerOpen by remember { mutableStateOf(false) }
+    // The zoom row goes while a long exposure lasts, and its ruler with it (its own fold-back goes too)
+    LaunchedEffect(ui.exposing != null) { if (ui.exposing != null) zoomRulerOpen = false }
     var exposureOpen by remember { mutableStateOf(false) }
     var exposureTouch by remember { mutableLongStateOf(0L) }
     var quickSettings by remember { mutableStateOf(false) }
@@ -482,6 +484,8 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
     LaunchedEffect(Unit) { viewModel.refused.collect { explain(tooHot) } }
     val photoLost = stringResource(R.string.msg_photo_lost)
     LaunchedEffect(Unit) { viewModel.photoLost.collect { explain(photoLost) } }
+    val dngNotSaved = stringResource(R.string.msg_dng_not_saved)
+    LaunchedEffect(Unit) { viewModel.dngNotSaved.collect { explain(dngNotSaved) } }
     val rawOtherLens = stringResource(R.string.msg_raw_other_lens)
     LaunchedEffect(Unit) { viewModel.rawOtherLens.collect { explain(rawOtherLens) } }
     // The DNG asked for, but the camera took the session only without its stream: said once per such session, not left to be found missing
@@ -609,9 +613,9 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                         }
                     }
                 }
-                Box(Modifier.fillMaxSize().drawBehind { drawRect(colors.surface.copy(alpha = cover.value)) })
-                // Focus peaking under the square's bands: the part they cover isn't the photo's
+                // Focus peaking under the square's bands (the part they cover isn't the photo's) and under the cover (a session's change hides it too)
                 if (pro && problem == null) FocusPeaking(viewModel.edges, { x, y, e -> viewModel.analyzer.viewOf(x, y, e.sensorOrientation, e.front, e.frameRatio) })
+                Box(Modifier.fillMaxSize().drawBehind { drawRect(colors.surface.copy(alpha = cover.value)) })
                 // The square's bands are solid (owner, 25 Nov 2026: translucent ones looked poor, being thin), under the marks: a tap there focuses and shows it
                 if (problem == null && stream == Aspect.FOUR_THREE) {
                     Canvas(Modifier.fillMaxSize()) {
@@ -751,7 +755,8 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                     }
                     if (hdrAvailable) {
                         val possible = !video || viewModel.videoHdrPossible
-                        val on = (if (video) settings.hdrVideo else settings.ultraHdr) && possible
+                        // 50 MP is HDR off whatever the setting
+                        val on = (if (video) settings.hdrVideo else settings.ultraHdr) && possible && !fifty
                         TopButton(
                             if (on) R.drawable.ic_hdr_on else R.drawable.ic_hdr_off,
                             stringResource(R.string.tooltip_hdr),
@@ -854,6 +859,8 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
         // The suggestion slot: the zoom value over the ruler's needle, the AE/AF lock
         Box(Modifier.align(Alignment.BottomCenter).padding(bottom = zoomBottom + 44.dp + 36.dp).height(32.dp)) {
             when {
+                // A photo the phone must be held for is first: what it says matters most then
+                ui.holdingStill -> SuggestionChip(R.drawable.ic_back_hand, stringResource(R.string.label_hold_still), onDismiss = null)
                 zoomRulerOpen -> SolidChip(stringResource(R.string.value_zoom, numbers.zoom(ui.zoom)), primary = true)
                 // Macro (SPEC §4.5, above the lock): the camera took the ultrawide by itself; it can't be told not to, so the chip only says so (D8)
                 engine.macro && !rulerOpen -> SuggestionChip(R.drawable.ic_macro_auto, stringResource(R.string.label_macro), onDismiss = null)
@@ -862,8 +869,6 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                 qr != null && !rulerOpen -> SuggestionChip(qrIcon(qr.content), qrChipText(qr.content), onDismiss = null, onClick = { qrSheet = qr.content })
                 // From the QR code shortcut, until a code is found (SPEC §15.5)
                 ui.pointAtCode && ui.mode == Mode.PHOTO && !rulerOpen -> SuggestionChip(R.drawable.ic_qr_code_scanner, stringResource(R.string.label_point_at_code), onDismiss = { viewModel.clearPointAtCode() })
-                // A Night photo gathering its frames (SPEC §9.2)
-                ui.holdingStill -> SuggestionChip(R.drawable.ic_back_hand, stringResource(R.string.label_hold_still), onDismiss = null)
                 // Dark for a while in Photo: Night offered, never switched to by itself (SPEC §9.1)
                 ui.nightSuggested && ui.mode == Mode.PHOTO && camera?.night != null && !rulerOpen -> SuggestionChip(R.drawable.ic_bedtime, stringResource(R.string.label_suggest_night), onDismiss = { viewModel.closeNightSuggestion() }, onClick = { viewModel.selectMode(Mode.NIGHT) })
             }
@@ -1054,8 +1059,10 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
             QuickSettings(
                 PanelState(
                     video = ui.mode == Mode.VIDEO,
-                    flashAvailable = !night && !viewModel.fiftyMp && ((camera.flash && !ledBlocked) || camera.front),
-                    flash = ui.flash,
+                    // As the top row: with Pro's exposure set by hand off or on only, and no screen flash on the front camera
+                    flashAvailable = !night && !viewModel.fiftyMp && ((camera.flash && !ledBlocked) || (camera.front && !proManual)),
+                    flashChoices = if (proManual) listOf(Flash.OFF, Flash.ON) else Flash.entries,
+                    flash = if (proManual && ui.flash == Flash.AUTO) Flash.OFF else ui.flash,
                     flashLevels = if (camera.front) 1 else camera.flashLevels,
                     flashLevel = ui.flashLevel ?: camera.flashDefaultLevel,
                     timer = ui.timer,

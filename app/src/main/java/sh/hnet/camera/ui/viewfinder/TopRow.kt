@@ -311,6 +311,8 @@ class PanelState(
     val video: Boolean,
     val flashAvailable: Boolean,
     val flash: Flash,
+    /** The flash's choices: off and on only with Pro's exposure set by hand (as the top row). */
+    val flashChoices: List<Flash> = Flash.entries,
     val flashLevels: Int,
     val flashLevel: Int,
     val timer: Int,
@@ -417,7 +419,7 @@ fun QuickSettings(state: PanelState, actions: PanelActions) {
                 }
                 if (state.flashAvailable) row { shapes ->
                     PanelRow(shapes, stringResource(R.string.label_panel_flash)) {
-                        Toggles(Flash.entries, state.flash, { stringResource(flashName(it)) }, actions.onFlash) { Icon(painterResource(flashIcon(it)), contentDescription = null, modifier = Modifier.size(20.dp)) }
+                        Toggles(state.flashChoices, state.flash, { stringResource(flashName(it)) }, actions.onFlash) { Icon(painterResource(flashIcon(it)), contentDescription = null, modifier = Modifier.size(20.dp)) }
                     }
                 }
             } else {
