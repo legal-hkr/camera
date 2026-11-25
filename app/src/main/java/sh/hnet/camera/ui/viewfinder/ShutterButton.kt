@@ -2,6 +2,7 @@
 
 package sh.hnet.camera.ui.viewfinder
 
+import android.os.SystemClock
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -23,15 +24,22 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.State
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameMillis
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.disabled
@@ -43,7 +51,7 @@ import androidx.compose.ui.unit.dp
 import sh.hnet.camera.R
 
 /** The shutter's looks (SPEC §5.1); the long shot comes with its mode. */
-enum class ShutterLook { PHOTO, VIDEO, RECORDING, TIMER, NIGHT, BURST }
+enum class ShutterLook { PHOTO, VIDEO, RECORDING, TIMER, NIGHT, BURST, LONG }
 
 /**
  * ShutterButton (SPEC §5.1): 80 dp in `primary`, its shape carrying the state. Photo: a ring inside a circle, both turning to rounded squares while the finger is
@@ -65,6 +73,7 @@ fun ShutterButton(
     count: () -> Int? = { null },
     onHold: (() -> Unit)? = null,
     onRelease: () -> Unit = {},
+    exposing: Exposing? = null,
 ) {
     val interaction = remember { MutableInteractionSource() }
     val click by rememberUpdatedState(onClick)
@@ -84,6 +93,13 @@ fun ShutterButton(
     if (look == ShutterLook.TIMER) {
         CircularWavyProgressIndicator(progress = { progress ?: 0f }, modifier = Modifier.size(92.dp), color = MaterialTheme.colorScheme.primary, trackColor = MaterialTheme.colorScheme.secondaryContainer)
     }
+    // A long exposure (SPEC §5.1 "long shot", §11): the wavy ring fills as its time passes, the time left inside; the frames read only where drawn, the
+    // seconds when they change; once the time is up, a ring that just turns while the camera delivers
+    val left = if (look == ShutterLook.LONG && exposing != null) rememberTimeLeft(exposing) else null
+    if (look == ShutterLook.LONG) {
+        if (left?.over?.value == true) CircularWavyProgressIndicator(modifier = Modifier.size(92.dp), color = MaterialTheme.colorScheme.primary, trackColor = MaterialTheme.colorScheme.secondaryContainer)
+        else CircularWavyProgressIndicator(progress = { left?.progress() ?: 0f }, modifier = Modifier.size(92.dp), color = MaterialTheme.colorScheme.primary, trackColor = MaterialTheme.colorScheme.secondaryContainer)
+    }
     // A Night photo gathering its frames: the extension's progress where it gives one, else a ring that just turns (SPEC §9.2)
     if (look == ShutterLook.NIGHT) {
         val value = progress
@@ -93,7 +109,7 @@ fun ShutterButton(
     Box(
         contentAlignment = Alignment.Center,
         modifier = Modifier
-            .size(if (look == ShutterLook.TIMER || look == ShutterLook.NIGHT) 64.dp else 80.dp)
+            .size(if (look == ShutterLook.TIMER || look == ShutterLook.NIGHT || look == ShutterLook.LONG) 64.dp else 80.dp)
             .clip(RoundedCornerShape(corner))
             .background(container)
             .pointerInput(enabled) {
@@ -149,7 +165,33 @@ fun ShutterButton(
             ShutterLook.TIMER -> Icon(painterResource(R.drawable.ic_close), contentDescription = null, tint = content, modifier = Modifier.size(28.dp).rotate(turn))
             ShutterLook.NIGHT -> Icon(painterResource(R.drawable.ic_bedtime), contentDescription = null, tint = content, modifier = Modifier.size(28.dp).rotate(turn))
             ShutterLook.BURST -> Text("${count() ?: 0}", color = content, style = MaterialTheme.typography.titleLarge.copy(fontFeatureSettings = "tnum"), modifier = Modifier.rotate(turn))
+            ShutterLook.LONG -> if (left?.over?.value != true) Text(
+                stringResource(R.string.value_seconds, left?.seconds?.value ?: 0),
+                color = content,
+                style = MaterialTheme.typography.labelLarge.copy(fontFeatureSettings = "tnum"),
+                modifier = Modifier.rotate(turn),
+            )
         }
     }
+    }
+}
+
+/** A long exposure's time: the share passed (read where it is drawn), the whole seconds left rounded up, and whether it is over. */
+private class TimeLeft(val progress: () -> Float, val seconds: State<Int>, val over: State<Boolean>)
+
+/** The time left of [exposing], following the frames while it runs (the ring moves smoothly, the rest recomposes only when the seconds change). */
+@Composable
+private fun rememberTimeLeft(exposing: Exposing): TimeLeft {
+    val now = remember(exposing) { mutableLongStateOf(SystemClock.uptimeMillis()) }
+    LaunchedEffect(exposing) {
+        while (true) withFrameMillis { now.longValue = SystemClock.uptimeMillis() }
+    }
+    return remember(exposing) {
+        val passed = { (now.longValue - exposing.startMs).coerceIn(0L, exposing.durationMs) }
+        TimeLeft(
+            progress = { if (exposing.durationMs > 0) passed().toFloat() / exposing.durationMs else 1f },
+            seconds = derivedStateOf { ((exposing.durationMs - passed() + 999) / 1000).toInt() },
+            over = derivedStateOf { passed() >= exposing.durationMs },
+        )
     }
 }

@@ -119,6 +119,8 @@ data class ViewfinderUi(
     val pointAtCode: Boolean = false,
     /** A Night photo is gathering its frames: hold still, the shutter waits (SPEC §9.2). */
     val nightGathering: Boolean = false,
+    /** Pro's long exposure under way (SPEC §11): the shutter counts its time down, the mode row is hidden; null when none. */
+    val exposing: Exposing? = null,
     /** The Night photo gathering its frames: the extension's progress (0–1) on the shutter; null when it gives none. */
     val gatherProgress: Float? = null,
     /** The newest Night photo being put together: its progress (0–1) at the thumbnail; null when it gives none. */
@@ -147,6 +149,12 @@ sealed interface Review {
 
 /** The phone's tilt for the level: gravity in the screen's axes (x right, y up, z out of the screen), as a unit vector. */
 data class Tilt(val x: Float, val y: Float, val z: Float)
+
+/** A long exposure under way: when it started (uptime) and how long it takes. */
+data class Exposing(val startMs: Long, val durationMs: Long)
+
+/** A still the phone must be held for is under way (a Night photo gathering its frames, a long exposure): what would end it waits. */
+val ViewfinderUi.holdingStill: Boolean get() = nightGathering || exposing != null
 
 class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     private val application = app as CameraApplication
@@ -186,6 +194,10 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _stopped = MutableSharedFlow<Stopped>(extraBufferCapacity = 2)
     val stopped: SharedFlow<Stopped> = _stopped
+
+    private val _photoLost = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+    /** A photo the camera started taking never came (it says nothing about it otherwise). */
+    val photoLost: SharedFlow<Unit> = _photoLost
 
     private val _refused = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
     /** A recording refused because the phone is too hot. */
@@ -243,8 +255,12 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     private var focusRulerOpen = false
     private var peakingUntil = 0L
     /** A lens switch let happen (the stop and the focus it was for), and until when the camera's own focus runs for it. */
-    private var lensNudgedFor: Pair<Double, Double>? = null
+    private var lensNudgedFor: Triple<String, Double, Boolean>? = null
     private var lensNudgeUntil = 0L
+    /** Photos asked for and not done yet: the camera's own focus doesn't run for a lens switch meanwhile (the photo takes the focus set by hand). */
+    private var lensNudgeHeld = 0
+    /** A long exposure asked for and not done yet (from the press, before the camera starts it). */
+    private var longShot = false
 
     /** Pro's histogram (luma in bins) and focus peaking's edges, from the analysis stream. */
     val histogram: StateFlow<IntArray?> get() = analyzer.histogram
@@ -490,7 +506,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         if (!started) return
         // Not under a recording, a countdown, a Night photo gathering its frames or a burst: a new session would cut the video, lose the timed shot, hold a
         // frozen frame over the gathering, or end the burst
-        if (recording || _ui.value.countdown != null || _ui.value.nightGathering || burstJob != null) {
+        if (recording || _ui.value.countdown != null || _ui.value.holdingStill || burstJob != null) {
             configureLater = true
             // A frame frozen for the change would stay over the live picture until it comes
             _frozen.value = null
@@ -641,7 +657,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     private val recording: Boolean get() = engineState.value.recording != null
 
     fun selectMode(mode: Mode) {
-        if (mode == _ui.value.mode || recording || _entry.value is Entry.Capture || _ui.value.nightGathering || burstJob != null) return
+        if (mode == _ui.value.mode || recording || _entry.value is Entry.Capture || _ui.value.holdingStill || burstJob != null) return
         // Night only on a camera with the extension, Pro only on one with the manual sensor
         if (mode == Mode.NIGHT && camera?.night == null) return
         if (mode == Mode.PRO && camera?.manualSensor != true) return
@@ -666,7 +682,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun switchCamera() {
-        if (cameras.size < 2 || recording || _ui.value.nightGathering || burstJob != null) return
+        if (cameras.size < 2 || recording || _ui.value.holdingStill || burstJob != null) return
         cancelTimer()
         val next = (_ui.value.cameraIndex + 1) % cameras.size
         // Night stays only where the other camera has it too, Pro where it has the manual sensor
@@ -700,6 +716,8 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         // Sent again whatever was sent before: another viewfinder may have reset the engine's controls meanwhile
         proApplied = null
         proLookSent = null
+        lensNudgedFor = null
+        lensNudgeUntil = 0L
         if (!started) {
             // The engine may be another viewfinder's now (its values aren't to be cleared); a start sends everything again
             analyzer.histogramEnabled = false
@@ -741,7 +759,9 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         val ultrawideStop = camera.zoom.ultrawide?.ratio
         val macro = lens != null && lens in camera.ultrawideIds && (ultrawideStop == null || zoom > ultrawideStop + 1e-6)
         val focusLens = if (lens == null || macro) camera.zoom.lensAt(zoom) else lens
-        val sent = proLook(camera, settings, lens, focusLens, lensNudge(camera, settings, zoom, lens))
+        // The lens switch only from this session's own report: right after a mode change or a start the last session's lens is still there
+        val nudging = lensNudge(camera, settings, zoom, now?.takeIf { it.session == engine.sessionNumber }?.lens)
+        val sent = proLook(camera, settings, lens, focusLens, nudging)
         val lensLook = camera.lookOf(lens)
         analyzer.histogramEnabled = settings.proHistogram
         // The histogram counts only the photo's part of the frame
@@ -749,7 +769,8 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         analyzer.peakingEnabled = settings.proPeaking && focusable(camera, camera.lookOf(focusLens)) && (focusRulerOpen || SystemClock.uptimeMillis() < peakingUntil)
         val look = { live: ProLive ->
             live.copy(
-                focusDiopters = sent.focusDiopters ?: now?.focusDiopters,
+                // While the camera's own focus runs for a lens switch, the tile keeps the focus set by hand (it comes back)
+                focusDiopters = (if (nudging) settings.proFocusDiopters else sent.focusDiopters) ?: now?.focusDiopters,
                 kelvin = sent.kelvin?.takeIf { sent.held } ?: lensLook.colorCalibration?.let { c ->
                     now?.gainRed?.let { r -> now.gainBlue?.let { b -> temperatureReaders.getOrPut(c) { WhiteBalance.TemperatureReader(c) }.read(r, b) } }
                 },
@@ -803,8 +824,9 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
 
     /**
      * Whether the camera's own focus runs for a moment now, to let it switch lenses: with the focus set by hand the Pixel keeps its lens while the zoom
-     * slides onto another lens' stop (it switches only with its own focus running, or on a jump – the owner, 25 Nov 2026). Once per stop and focus, only
-     * when that lens reaches the focus set, until it is the lens reported or [LENS_NUDGE_MS] pass; then the focus set by hand is sent again.
+     * slides onto another lens' stop (it switches only with its own focus running, or on a jump – the owner, 25 Nov 2026). Once when the zoom comes to the
+     * stop, and once more if the focus set comes within that lens' reach there (not at every step of the focus ruler: the camera's focus would fight it),
+     * until it is the lens reported or [LENS_NUDGE_MS] pass; then the focus set by hand is sent again. A photo pauses it, and the stop nudges again after it.
      */
     private fun lensNudge(camera: CameraSpec, settings: CameraSettings, zoom: Double, lens: String?): Boolean {
         val focus = settings.proFocusDiopters
@@ -820,10 +842,16 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
             lensNudgeUntil = 0L
             return false
         }
-        val key = stop.ratio to focus
-        if (lensNudgedFor != key && focus <= camera.lookOf(target).minimumFocusDiopters) {
+        // Not while a photo is being taken; an unfinished switch runs again once it is done
+        if (lensNudgeHeld > 0) {
+            lensNudgeUntil = 0L
+            return false
+        }
+        val reachable = focus <= camera.lookOf(target).minimumFocusDiopters
+        val key = Triple(camera.id, stop.ratio, reachable)
+        if (lensNudgedFor != key) {
             lensNudgedFor = key
-            lensNudgeUntil = now + LENS_NUDGE_MS
+            if (reachable) lensNudgeUntil = now + LENS_NUDGE_MS
         }
         return now < lensNudgeUntil
     }
@@ -1114,7 +1142,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
 
     /** A burst may start: in Photo from the app (not another app's photo), without the timer, nothing else under way. */
     private val burstable: Boolean
-        get() = _ui.value.mode == Mode.PHOTO && _entry.value !is Entry.Capture && _ui.value.timer == 0 && _ui.value.countdown == null && _review.value == null && !_ui.value.nightGathering
+        get() = _ui.value.mode == Mode.PHOTO && _entry.value !is Entry.Capture && _ui.value.timer == 0 && _ui.value.countdown == null && _review.value == null && !_ui.value.holdingStill
 
     /**
      * The shutter held (LOGIKA §18, D14, D15): a burst in Photo, in the photo's format (Ultra HDR with HDR on, plain JPEG at up to 30 fps with it off), until it
@@ -1203,7 +1231,8 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     /** The shutter: a recording ends, a running countdown is cancelled, a set timer starts one, else the photo is taken or the recording started. */
     fun shutterPressed() {
         // A press during a burst (a volume key while the finger holds the shutter) does nothing: the two would take each other's stills
-        if (_review.value != null || burstJob != null) return
+        // Nor during a long exposure: it can't be ended early (one frame of the camera's), and another would queue behind it
+        if (_review.value != null || burstJob != null || _ui.value.exposing != null || longShot) return
         // A change waiting for its frozen frame isn't told to the engine yet: the shot waits for it (at most the copy's time), not taken on the old session
         freezing?.let { job ->
             viewModelScope.launch {
@@ -1373,6 +1402,19 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         // The front camera's screen flash in Photo, and in Pro while the camera's exposure is its own (it meters for the lit screen)
         val screenFlash = front && (ui.mode == Mode.PHOTO || (ui.mode == Mode.PRO && !proManual)) && (ui.flash == Flash.ON || (ui.flash == Flash.AUTO && engineState.value.dark))
         val place = placeNow()
+        // A lens switch let happen by the camera's own focus pauses for the photo (it takes the focus set by hand); unfinished, the stop nudges again after it
+        lensNudgeHeld++
+        if (SystemClock.uptimeMillis() < lensNudgeUntil) {
+            lensNudgeUntil = 0L
+            lensNudgedFor = null
+            proLookSent = null
+            proStep()
+        }
+        // A long exposure set by hand (LOGIKA §26): further presses wait for it from now (another would queue behind it); its countdown starts with the request
+        val long = ui.mode == Mode.PRO && ui.settings.proShutterNs?.let { it >= LONG_EXPOSURE_NS } == true
+        if (long) longShot = true
+        val done = AtomicBoolean(false)
+        val clicked = AtomicBoolean(false)
         // In the app's scope: a viewfinder going away right after the shutter (the lock screen's when the screen goes off) doesn't cancel the photo
         application.appScope.launch {
             shots.withLock {
@@ -1383,13 +1425,41 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
                     delay(SCREEN_FLASH_WARM_MS)
                 }
                 val photo = try {
-                    engine.takePhoto(rotation, place, precapture = screenFlash) {
-                        // The click where the setting wants it or the law does
-                        if (!cleared && (ui.settings.shutterSound || MediaActionSound.mustPlayShutterSound())) sound.play(MediaActionSound.SHUTTER_CLICK)
-                        _shutter.tryEmit(Unit)
+                    engine.takePhoto(rotation, place, precapture = screenFlash) { start ->
+                        val longNs = start.exposureNs?.takeIf { it >= LONG_EXPOSURE_NS }
+                        // The request's word only for a long time: a shorter one clicks when the camera starts it (a click before it would let the phone go
+                        // down while the request still waits behind the preview's)
+                        if (!start.measured && longNs == null) return@takePhoto
+                        // Once per shot: a long time is told as its request goes, then by the camera
+                        if (clicked.compareAndSet(false, true)) {
+                            // The click where the setting wants it or the law does
+                            if (!cleared && (ui.settings.shutterSound || MediaActionSound.mustPlayShutterSound())) sound.play(MediaActionSound.SHUTTER_CLICK)
+                            _shutter.tryEmit(Unit)
+                        }
+                        // Counted down from the request, then from the camera's word of the real start (its sensor's time); a word that comes once that count
+                        // is over (the Pixel's, after the exposure) is left out: the ring would go back from spinning for a moment
+                        longNs?.let { ns ->
+                            val ms = ns / 1_000_000
+                            _ui.update {
+                                val keep = done.get() || (it.exposing != null && (!start.measured || SystemClock.uptimeMillis() >= start.uptimeMs + ms))
+                                if (keep) it else it.copy(exposing = Exposing(start.uptimeMs, ms))
+                            }
+                        }
+                    }.also {
+                        // Started and never delivered: said, not lost in silence
+                        if (it == null && clicked.get()) _photoLost.tryEmit(Unit)
                     }
                 } finally {
+                    done.set(true)
                     if (screenFlash) _ui.update { it.copy(screenFlash = false) }
+                    if (long || _ui.value.exposing != null) {
+                        _ui.update { it.copy(exposing = null) }
+                        // A change put off by the exposure
+                        withContext(Dispatchers.Main) {
+                            longShot = false
+                            if (configureLater) configure()
+                        }
+                    }
                 } ?: return@withLock
                 // For another app: Review first, nothing saved here (SPEC §15.3)
                 if (_entry.value is Entry.Capture) {
@@ -1412,7 +1482,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
                     var waiting = wantMotion
                     val clipping = if (wantMotion) async { engine.motionClip(photo) } else null
                     val uri = try {
-                        val saved = media.savePhoto(photo.bytes, photo.takenAt, photo.crop, mirror)
+                        val saved = media.savePhoto(photo.bytes, photo.takenAt, photo.crop, mirror, photo.longExposureNs)
                         phone.refreshStorage()
                         if (clipping != null) {
                             val clip = clipping.await()
@@ -1430,7 +1500,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
                     if (wantPlace) withTimeoutOrNull(LATE_PLACE_MS) { location.fix.first { it != null && location.current() != null } }?.let { media.addLocation(uri, it) }
                 }
             }
-        }
+        }.invokeOnCompletion { application.mainExecutor.execute { lensNudgeHeld-- } }
     }
 
     /**
@@ -1521,6 +1591,8 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         const val BURST_RESERVE_BYTES = 400L * 1024 * 1024
         const val FRAME_MS = 17L
         const val FOCUS_HOLD_DEGREES = 10.0
+        /** A photo exposed this long or longer counts its time down on the shutter (from half a second, the first step the eye waits for). */
+        const val LONG_EXPOSURE_NS = 500_000_000L
         /** How long the camera's own focus may run to let it switch lenses at a stop (the focus set by hand then comes back). */
         const val LENS_NUDGE_MS = 1_500L
         /** Focus peaking stays this long after the focus changed or its ruler closed (SPEC §11). */

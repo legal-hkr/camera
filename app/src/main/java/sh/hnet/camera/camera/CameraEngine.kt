@@ -184,6 +184,8 @@ class CapturedPhoto(
     /** The motion photo's stream of the session the photo was taken in, and the photo's orientation: its clip belongs to it, whatever happens after. */
     internal val motionSource: MotionBuffer?,
     val orientation: Int,
+    /** A time set by hand longer than the camera's EXIF holds (the Pixel writes 4.29 s for 16 s): the one taken, for the file. */
+    val longExposureNs: Long? = null,
 )
 
 /**
@@ -243,6 +245,8 @@ class CameraEngine(context: Context) {
     private var lockJob: Job? = null
     /** A still being taken: the session isn't closed under it (leaving right after the shutter still saves the photo). */
     private var capture: CompletableDeferred<Unit>? = null
+    /** How long the still in flight may take, fixed when it was asked for (Pro's time may change meanwhile). */
+    private var captureTimeoutMs = STILL_TIMEOUT_MS
     /** The exposure has settled on the last frame (converged, or decided it needs the flash). */
     private val aeSettled = MutableStateFlow(false)
     /** The exposure's state on the last frame. */
@@ -420,7 +424,12 @@ class CameraEngine(context: Context) {
      * What the camera reports of a frame for Pro's automatic values: the exposure (the gain after RAW counted in), the focus distance, the white balance's
      * gains against green, and the physical lens that took it (null: the camera has one).
      */
-    class LiveNow(val exposure: Exposure, val focusDiopters: Double?, val gainRed: Double?, val gainBlue: Double?, val lens: String?)
+    class LiveNow(val exposure: Exposure, val focusDiopters: Double?, val gainRed: Double?, val gainBlue: Double?, val lens: String?, val session: Int)
+
+    /** Counts the sessions closed: a [LiveNow] of an earlier one tells of a lens the new session may not be on. */
+    @Volatile
+    var sessionNumber = 0
+        private set
 
     private val _liveNow = MutableStateFlow<LiveNow?>(null)
 
@@ -465,8 +474,19 @@ class CameraEngine(context: Context) {
         repeat()
     }
 
-    /** Takes a still; [onShutter] runs on the camera thread when the exposure starts (the blink, the sound). Null when there is no session or the camera didn't deliver. */
-    suspend fun takePhoto(deviceRotation: Int, location: Location?, precapture: Boolean, onShutter: () -> Unit): CapturedPhoto? = withContext(dispatcher) {
+    /**
+     * When a still's exposure started, in [SystemClock.uptimeMillis]'s clock (from the sensor's own timestamp), and its time when set by hand. [measured] false:
+     * counted from the request, which a time set by hand gets at once (some cameras say the exposure started only once it has ended); the camera's own word
+     * follows.
+     */
+    class ShotStart(val uptimeMs: Long, val exposureNs: Long?, val measured: Boolean = true)
+
+    /**
+     * Takes a still; [onShutter] runs on the camera thread when the camera says the exposure started (the blink, the sound, a long exposure's countdown), and
+     * for a time set by hand once before that, as the request goes.
+     * Null when there is no session or the camera didn't deliver.
+     */
+    suspend fun takePhoto(deviceRotation: Int, location: Location?, precapture: Boolean, onShutter: (ShotStart) -> Unit): CapturedPhoto? = withContext(dispatcher) {
         // A session being built (a mode, a setting, the end of a countdown that put it off) is waited for, not taken as none; before the still is counted
         // as in flight, which the session's close would wait for
         awaitSession()
@@ -474,6 +494,7 @@ class CameraEngine(context: Context) {
         if (bursting != null || !sessionSettled()) return@withContext null
         val done = CompletableDeferred<Unit>()
         capture = done
+        captureTimeoutMs = stillTimeoutMs()
         try {
             shoot(deviceRotation, location, precapture, onShutter)
         } catch (e: CancellationException) {
@@ -491,7 +512,7 @@ class CameraEngine(context: Context) {
      * [precapture]: meter first (the flash's pre-flash, or the front camera's screen lit as its flash) and take the photo once the exposure has settled; the
      * camera's own buffer of frames (ZSL) can't be used then.
      */
-    private suspend fun shoot(deviceRotation: Int, location: Location?, precapture: Boolean, onShutter: () -> Unit): CapturedPhoto? {
+    private suspend fun shoot(deviceRotation: Int, location: Location?, precapture: Boolean, onShutter: (ShotStart) -> Unit): CapturedPhoto? {
         val session = session ?: return null
         val output = still ?: return null
         val request = desired.value.request ?: return null
@@ -520,6 +541,9 @@ class CameraEngine(context: Context) {
         val zsl = request.camera.zsl && !video && !metered && manual == null && SystemClock.uptimeMillis() - lookChangedAt > LOOK_SETTLE_MS
         if (_state.value.range == PictureRange.SDR && !zsl) motion?.let { builder.addTarget(it.surface) }
         applyControls(builder, request, still = true)
+        // The Pixel makes a JPEG still of the still-capture intent by its own processing, which ignores an exposure set by hand (4 s and 1/4 s alike, the
+        // camera's automatic one taken instead); the manual intent gets the time and ISO asked for (LOGIKA §30.4). JPEG_R takes them either way
+        if (manual != null && output.format == StillFormat.JPEG) builder.set(CaptureRequest.CONTROL_CAPTURE_INTENT, CameraMetadata.CONTROL_CAPTURE_INTENT_MANUAL)
         // Set either way: the still template may turn the buffer on by itself, and a flash photo must not come from it
         if (request.camera.zsl) builder.set(CaptureRequest.CONTROL_ENABLE_ZSL, zsl)
         location?.let { builder.set(CaptureRequest.JPEG_GPS_LOCATION, it) }
@@ -530,11 +554,21 @@ class CameraEngine(context: Context) {
         output.drain()
         val takenAt = System.currentTimeMillis()
         var startedAt = 0L
+        var takenExposureNs: Long? = null
+        val started = CompletableDeferred<Unit>()
         val failed = CompletableDeferred<Unit>()
+        val realtime = request.camera.sensorRealtime
         session.capture(builder.build(), object : CameraCaptureSession.CaptureCallback() {
             override fun onCaptureStarted(session: CameraCaptureSession, request: CaptureRequest, timestamp: Long, frameNumber: Long) {
                 startedAt = timestamp
-                onShutter()
+                started.complete(Unit)
+                // The sensor's time of the exposure's start, not this call's (it may come late, some cameras only at the readout)
+                val ago = (if (realtime) SystemClock.elapsedRealtimeNanos() else System.nanoTime()) - timestamp
+                onShutter(ShotStart(SystemClock.uptimeMillis() - (ago / 1_000_000).coerceAtLeast(0), manual?.timeNs))
+            }
+
+            override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+                takenExposureNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME)
             }
 
             override fun onCaptureFailed(session: CameraCaptureSession, request: CaptureRequest, failure: CaptureFailure) {
@@ -546,22 +580,42 @@ class CameraEngine(context: Context) {
                 // Only the still's own buffer matters; the motion video's encoder may drop one
                 if (target == output.reader.surface) failed.complete(Unit)
             }
+
+            // Aborted before it started (the session going): no start, no failure would ever come
+            override fun onCaptureSequenceAborted(session: CameraCaptureSession, sequenceId: Int) {
+                failed.complete(Unit)
+            }
         }, handler)
-        val image = withTimeoutOrNull(stillTimeoutMs()) {
+        // A time set by hand is counted from the request at once: the Pixel says an HLG still's exposure started only once it has ended (LOGIKA §30.4)
+        manual?.let { onShutter(ShotStart(SystemClock.uptimeMillis(), it.timeNs, measured = false)) }
+        val image = withTimeoutOrNull(captureTimeoutMs) {
             var found: StillImage? = null
             while (found == null) {
                 val next = select<StillImage?> {
                     output.images.onReceiveCatching { it.getOrNull() }
                     failed.onAwait { null }
                 } ?: break
-                // Not before this capture has started (the camera says so before it hands the still): what comes earlier is an older shot's (a burst's last
-                // stills); a late one is older than this exposure
+                // The camera may hand the still before it says the capture started: the still waits for that word instead of being taken for an older one
+                if (startedAt == 0L) {
+                    try {
+                        select<Unit> {
+                            started.onAwait {}
+                            failed.onAwait {}
+                        }
+                    } catch (e: CancellationException) {
+                        next.close()
+                        throw e
+                    }
+                }
+                // Not from before this capture started: what comes earlier is an older shot's (a burst's last stills); a late one is older than this exposure
                 if (startedAt == 0L || next.timestamp < startedAt) next.close() else found = next
             }
             found
         } ?: return null
         val bytes = image.use { it.compressedBytes() }
-        return CapturedPhoto(bytes, output.format, cropFor(output.plan.capture, request), takenAt, if (startedAt != 0L) startedAt else image.timestamp, motionSource, orientation)
+        // The camera's EXIF holds the time in 32 bits of nanoseconds; a longer one set by hand is written by the app: the result's when it came before the image
+        val longExposureNs = manual?.timeNs?.takeIf { it > EXIF_MAX_EXPOSURE_NS }?.let { takenExposureNs ?: it }
+        return CapturedPhoto(bytes, output.format, cropFor(output.plan.capture, request), takenAt, if (startedAt != 0L) startedAt else image.timestamp, motionSource, orientation, longExposureNs)
     }
 
     /** The burst under way: its stills' orientation and place, and the stop (touched on the camera thread only). */
@@ -593,6 +647,7 @@ class CameraEngine(context: Context) {
         val request = desired.value.request?.takeIf { it.mode == Mode.PHOTO } ?: return@withContext null
         val done = CompletableDeferred<Unit>()
         capture = done
+        captureTimeoutMs = stillTimeoutMs()
         val state = Bursting(Orientation.jpeg(request.camera.sensorOrientation, deviceRotation, request.camera.front), location, done)
         bursting = state
         output.drain()
@@ -773,7 +828,7 @@ class CameraEngine(context: Context) {
         while (true) {
             val before = Triple(capture, clipping.get(), nightInFlight.get())
             if (before.first == null && before.second == 0 && before.third == 0) break
-            capture?.let { inFlight -> withTimeoutOrNull(stillTimeoutMs()) { inFlight.await() } }
+            capture?.let { inFlight -> withTimeoutOrNull(captureTimeoutMs) { inFlight.await() } }
             if (clipping.get() > 0) withTimeoutOrNull(CLIP_WAIT_MS) { while (clipping.get() > 0) delay(SETTLE_POLL_MS) }
             val night = nightInFlight.get()
             if (night > 0) withTimeoutOrNull(NIGHT_TIMEOUT_MS) { while (nightInFlight.get() >= night) delay(SETTLE_POLL_MS) }
@@ -1353,6 +1408,7 @@ class CameraEngine(context: Context) {
                     gains?.let { it.red.toDouble() / it.greenEven },
                     gains?.let { it.blue.toDouble() / it.greenEven },
                     result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID),
+                    sessionNumber,
                 )
             }
         }
@@ -1699,6 +1755,9 @@ class CameraEngine(context: Context) {
 
     /** Closes the session; its still reader closes when the camera has really let go of it ([configure]'s `onClosed`). */
     private fun closeSession() {
+        // The next session's values aren't this one's: its first result is published at once
+        sessionNumber++
+        liveNowAt = 0L
         // No picture any more: the viewfinder covers until the next session's first frame (a stale "shown" let a frozen frame go over nothing)
         if ((session != null || nightSession != null) && _state.value.frameShown) _state.update { it.copy(frameShown = false) }
         // A burst of this session asks for nothing more (a new session's repeat() must not ask for it)
@@ -1827,6 +1886,8 @@ class CameraEngine(context: Context) {
 
         /** How long after a change of Pro's focus or white balance a photo isn't taken from the buffer. */
         const val LOOK_SETTLE_MS = 500L
+        /** The longest time the camera's EXIF holds: 2³² − 1 ns (about 4.29 s). */
+        const val EXIF_MAX_EXPOSURE_NS = 0xFFFF_FFFFL
         /** The color transform's rationals: ten thousandths. */
         const val TRANSFORM_DENOMINATOR = 10_000
         /** Results kept to pair with analysis frames: about a second. */

@@ -63,8 +63,8 @@ class MediaFiles(private val context: Context) {
     val last: StateFlow<LastShot?> = _last.asStateFlow()
 
     /** Writes a finished JPEG (Ultra HDR or plain), cut to [crop] first when the camera had no size of the shot's aspect, and publishes it; null when the storage refused it. */
-    suspend fun savePhoto(bytes: ByteArray, takenAt: Long, crop: PixelSize? = null, mirror: Boolean = false): Uri? =
-        writePhoto(bytes, takenAt, FileNames.photo(takenAt), crop, mirror, mark = null)?.also { show(it, "image/jpeg", takenAt = takenAt) }
+    suspend fun savePhoto(bytes: ByteArray, takenAt: Long, crop: PixelSize? = null, mirror: Boolean = false, exposureNs: Long? = null): Uri? =
+        writePhoto(bytes, takenAt, FileNames.photo(takenAt), crop, mirror, exposureNs, mark = null)?.also { show(it, "image/jpeg", takenAt = takenAt) }
 
     /**
      * A burst's frame [index] (0 the cover), written as it comes (LOGIKA §18): named and marked as Google's camera does (D12), cut and mirrored as a photo is.
@@ -80,7 +80,8 @@ class MediaFiles(private val context: Context) {
     /** The burst whose cover the thumbnail shows has [frames] saved. */
     fun burstSaved(cover: Uri, frames: Int) = _last.update { if (it?.uri == cover) it.copy(burst = frames) else it }
 
-    private suspend fun writePhoto(bytes: ByteArray, takenAt: Long, name: String, crop: PixelSize?, mirror: Boolean, mark: ((ByteArray) -> ByteArray)?): Uri? = withContext(Dispatchers.IO) {
+    /** [exposureNs]: a time the camera's EXIF couldn't hold, written over its own. */
+    private suspend fun writePhoto(bytes: ByteArray, takenAt: Long, name: String, crop: PixelSize?, mirror: Boolean, exposureNs: Long? = null, mark: ((ByteArray) -> ByteArray)?): Uri? = withContext(Dispatchers.IO) {
         val values = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, name)
             put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
@@ -97,6 +98,9 @@ class MediaFiles(private val context: Context) {
             if (edited != null) {
                 // The photo is kept even if its EXIF can't be carried over
                 runCatching { resolver.openFileDescriptor(uri, "rw")!!.use { StillCrop.copyExif(bytes, it, edited.size) } }.onFailure { Log.w(TAG, "EXIF not copied: ${it.javaClass.simpleName}") }
+            }
+            exposureNs?.let { ns ->
+                runCatching { resolver.openFileDescriptor(uri, "rw")!!.use { StillCrop.setExposure(it, ns) } }.onFailure { Log.w(TAG, "Exposure not written: ${it.javaClass.simpleName}") }
             }
             resolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
             uri

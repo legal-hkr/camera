@@ -73,6 +73,8 @@ data class CameraSpec(
     val lenses: Map<String, LensLook> = emptyMap(),
     /** The camera's own white balance presets (`CONTROL_AWB_MODE_*`), for a lens without its color calibration. */
     val awbModes: Set<Int> = emptySet(),
+    /** The sensor's timestamps are in the elapsed-realtime clock (else a monotonic one): a shot's start in the phone's clocks. */
+    val sensorRealtime: Boolean = false,
 )
 
 /** The Night extension's sizes: the preview, the photo in Ultra HDR and in plain JPEG, and whether it gives an early postview of the photo. */
@@ -154,6 +156,7 @@ object CameraCatalog {
             look = lensLook(chars, chars),
             lenses = chars.physicalCameraIds.mapNotNull { lens -> runCatching { manager.getCameraCharacteristics(lens) }.getOrNull()?.let { lens to lensLook(it, chars) } }.toMap(),
             awbModes = chars.get(CameraCharacteristics.CONTROL_AWB_AVAILABLE_MODES)?.toSet().orEmpty(),
+            sensorRealtime = chars.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE) == CameraMetadata.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME,
             stillStalls = listOf(ImageFormat.JPEG_R, ImageFormat.JPEG).any { format -> sizes(map, format).maxByOrNull { it.area }?.let { runCatching { map.getOutputStallDuration(format, Size(it.width, it.height)) }.getOrDefault(0L) > 0 } == true },
         )
     }

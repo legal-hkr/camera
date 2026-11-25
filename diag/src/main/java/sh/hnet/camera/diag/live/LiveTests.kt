@@ -1,5 +1,6 @@
 package sh.hnet.camera.diag.live
 
+import kotlinx.coroutines.coroutineScope
 import android.content.Context
 import android.graphics.BitmapFactory
 import android.graphics.ImageDecoder
@@ -34,10 +35,16 @@ import androidx.annotation.StringRes
 import androidx.core.graphics.get
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import kotlin.math.abs
 import kotlin.math.roundToInt
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -85,6 +92,8 @@ class LiveTests(context: Context, private val preview: PreviewHost) {
         LiveTest("pro_raw_with_jpeg", R.string.title_test_pro_raw_with_jpeg) { proRawWithJpeg(it) },
         LiveTest("pro_50mp_dng", R.string.title_test_pro_50mp_dng) { pro50mpDng(it) },
         LiveTest("pro_white_balance", R.string.title_test_pro_white_balance) { proWhiteBalance(it) },
+        LiveTest("pro_long_exposure_app", R.string.title_test_pro_long_exposure_app) { proLongExposureApp(it) },
+        LiveTest("pro_manual_sdr", R.string.title_test_pro_manual_sdr) { proManualSdr(it) },
         LiveTest("raw", R.string.title_test_raw) { raw(it) },
     )
 
@@ -799,6 +808,250 @@ class LiveTests(context: Context, private val preview: PreviewHost) {
                             } finally {
                                 session.close()
                             }
+                        }
+                    }
+                })
+            }
+        }
+    }
+
+    /**
+     * A 4 s exposure in the app's own session, step by step (the app's long Pro photos weren't delivered where this test's plain one was): with the HDR
+     * preview and JPEG_R, and with the SDR preview and JPEG, each adding one thing the app has – the analysis stream, the preview's exposure set by hand
+     * (1/15 s with the gain added), the still's ZSL off, the preview's request sent again every 100 ms during the exposure. For each: what the camera said
+     * (start, result, failure, lost buffer), whether and when the still came, and its time against the start.
+     */
+    private suspend fun proLongExposureApp(id: String): JsonObject {
+        val chars = chars(id)
+        val map = map(id)
+        val manual = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)?.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR) == true
+        if (!manual) return notOffered("manual exposure")
+        val isoRange = chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE) ?: return notOffered("an ISO range")
+        val hlgOffered = largest(map, ImageFormat.JPEG_R) != null && chars.get(CameraCharacteristics.REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES)?.supportedProfiles?.contains(DynamicRangeProfiles.HLG10) == true
+        val surface = preview.surface(previewSize(map))
+        val exposureNs = 4_000_000_000L
+        val previewNs = 66_666_667L
+        val steps = listOf("base", "analysis", "manualPreview", "zslOff", "resend")
+        return buildJsonObject {
+            for (hlg in listOf(false, true)) {
+                if (hlg && !hlgOffered) continue
+                val format = if (hlg) ImageFormat.JPEG_R else ImageFormat.JPEG
+                val size = largest(map, format) ?: continue
+                // The app's analysis stream: the smallest 4:3 at least 640 wide, P010 next to an HLG preview, YUV next to SDR
+                val analysisFormat = if (hlg) ImageFormat.YCBCR_P010 else ImageFormat.YUV_420_888
+                val analysisSize = map.getOutputSizes(analysisFormat)?.filter { it.width >= 640 && abs(it.width * 3 - it.height * 4) <= it.width / 20 }?.minByOrNull { area(it) }
+                put(if (hlg) "hlg" else "sdr", buildJsonObject {
+                    for ((index, step) in steps.withIndex()) {
+                        val withAnalysis = index >= 1
+                        val manualPreview = index >= 2
+                        val zslOff = index >= 3
+                        val resend = index >= 4
+                        put(step, probe {
+                            manager.withCamera(id) { device, thread ->
+                                ImageQueue(imageReader(size.width, size.height, format, 3), thread).use { stills ->
+                                    val analysis = if (withAnalysis && analysisSize != null) imageReader(analysisSize.width, analysisSize.height, analysisFormat, 4).also { reader ->
+                                        reader.setOnImageAvailableListener({ r -> runCatching { r.acquireLatestImage() }.getOrNull()?.close() }, thread.handler)
+                                    } else null
+                                    try {
+                                        val outputs = buildList {
+                                            add(OutputConfiguration(surface).apply { if (hlg) dynamicRangeProfile = DynamicRangeProfiles.HLG10 })
+                                            analysis?.let { add(OutputConfiguration(it.surface).apply { if (hlg) dynamicRangeProfile = DynamicRangeProfiles.HLG10 }) }
+                                            add(OutputConfiguration(stills.reader.surface))
+                                        }
+                                        if (supported(id, outputs) == false) return@withCamera buildJsonObject { put("skipped", "session not supported") }
+                                        val session = device.session(outputs, thread)
+                                        try {
+                                            val repeatTargets = listOfNotNull(surface, analysis?.surface)
+                                            val previewIso = (100 * exposureNs / previewNs).toInt().coerceIn(isoRange.lower, isoRange.upper)
+                                            fun CaptureRequest.Builder.previewControls() {
+                                                if (manualPreview) {
+                                                    set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
+                                                    set(CaptureRequest.SENSOR_SENSITIVITY, previewIso)
+                                                    set(CaptureRequest.SENSOR_EXPOSURE_TIME, previewNs)
+                                                    set(CaptureRequest.SENSOR_FRAME_DURATION, previewNs)
+                                                }
+                                            }
+                                            device.repeating(session, thread, repeatTargets) { previewControls() }
+                                            delay(1500)
+                                            val events = mutableListOf<String>()
+                                            var startTs = 0L
+                                            val t0 = SystemClock.elapsedRealtime()
+                                            fun at() = SystemClock.elapsedRealtime() - t0
+                                            val request = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                                                addTarget(stills.reader.surface)
+                                                still(id)
+                                                set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
+                                                set(CaptureRequest.SENSOR_SENSITIVITY, 100.coerceIn(isoRange.lower, isoRange.upper))
+                                                set(CaptureRequest.SENSOR_EXPOSURE_TIME, exposureNs)
+                                                set(CaptureRequest.SENSOR_FRAME_DURATION, exposureNs)
+                                                if (zslOff) set(CaptureRequest.CONTROL_ENABLE_ZSL, false)
+                                            }
+                                            session.capture(request.build(), object : CameraCaptureSession.CaptureCallback() {
+                                                override fun onCaptureStarted(session: CameraCaptureSession, request: CaptureRequest, timestamp: Long, frameNumber: Long) {
+                                                    startTs = timestamp
+                                                    synchronized(events) { events += "started ${at()} ms (frame $frameNumber)" }
+                                                }
+
+                                                override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+                                                    val exposure = result.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.div(1_000_000)
+                                                    val lens = result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)
+                                                    synchronized(events) { events += "completed ${at()} ms (exposure $exposure ms, ISO ${result.get(CaptureResult.SENSOR_SENSITIVITY)}, lens $lens)" }
+                                                }
+
+                                                override fun onCaptureFailed(session: CameraCaptureSession, request: CaptureRequest, failure: CaptureFailure) {
+                                                    synchronized(events) { events += "failed ${at()} ms (reason ${failure.reason}, image captured ${failure.wasImageCaptured()})" }
+                                                }
+
+                                                override fun onCaptureBufferLost(session: CameraCaptureSession, request: CaptureRequest, target: Surface, frameNumber: Long) {
+                                                    synchronized(events) { events += "buffer lost ${at()} ms (${if (target == stills.reader.surface) "still" else "other"})" }
+                                                }
+                                            }, thread.handler)
+                                            // The app sends the preview's request again while metering: every 100 ms here, during the exposure
+                                            val image = coroutineScope {
+                                                val resending = if (resend) launch {
+                                                    while (isActive) {
+                                                        delay(100)
+                                                        runCatching { device.repeating(session, thread, repeatTargets) { previewControls() } }
+                                                    }
+                                                } else null
+                                                runCatching { stills.next(14_000) }.getOrNull().also { resending?.cancel() }
+                                            }
+                                            buildJsonObject {
+                                                put("events", JsonArray(synchronized(events) { events.toList() }.map { JsonPrimitive(it) }))
+                                                if (image == null) {
+                                                    put("still", "none within 14 s")
+                                                } else {
+                                                    val ts = image.timestamp
+                                                    val bytes = image.use { it.planes[0].buffer.let { b -> ByteArray(b.remaining()).also { a -> b.get(a) } } }
+                                                    put("still", "at ${at()} ms")
+                                                    put("stillMinusStartUs", (ts - startTs) / 1000)
+                                                    put("file", Media.saveImage(resolver, "LONG_${Media.stamp()}_${if (hlg) "hlg" else "sdr"}_${step}_cam$id.jpg", "image/jpeg", bytes).toString())
+                                                }
+                                            }
+                                        } finally {
+                                            session.close()
+                                        }
+                                    } finally {
+                                        analysis?.close()
+                                    }
+                                }
+                            }
+                        })
+                    }
+                })
+            }
+        }
+    }
+
+    /** One way to ask for a still set by hand without HDR: its format, template, exposure and what else the request carries. */
+    private class SdrVariant(val key: String, val format: Int, val exposureNs: Long, val template: Int = CameraDevice.TEMPLATE_STILL_CAPTURE, val withPreview: Boolean = false, val extra: CaptureRequest.Builder.() -> Unit = {})
+
+    /**
+     * A still set by hand next to an SDR preview, asked for in several ways: whether the camera takes the time and ISO it was given (the result's and the
+     * image's), how long until the image, and in which order the camera's start, its result and the image come (all on one thread). JPEG files go to
+     * DCIM/CameraDiag.
+     */
+    private suspend fun proManualSdr(id: String): JsonObject {
+        val chars = chars(id)
+        val map = map(id)
+        val manual = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)?.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR) == true
+        if (!manual) return notOffered("manual exposure")
+        val iso = chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)?.clamp(100) ?: 100
+        val surface = preview.surface(previewSize(map))
+        val variants = buildList {
+            add(SdrVariant("jpeg4s", ImageFormat.JPEG, 4_000_000_000L))
+            add(SdrVariant("jpeg250ms", ImageFormat.JPEG, 250_000_000L))
+            add(SdrVariant("jpeg4sManualTemplate", ImageFormat.JPEG, 4_000_000_000L, template = CameraDevice.TEMPLATE_MANUAL))
+            add(SdrVariant("jpeg4sControlOff", ImageFormat.JPEG, 4_000_000_000L) { set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_OFF) })
+            add(SdrVariant("jpeg4sIntentManual", ImageFormat.JPEG, 4_000_000_000L) { set(CaptureRequest.CONTROL_CAPTURE_INTENT, CameraMetadata.CONTROL_CAPTURE_INTENT_MANUAL) })
+            add(SdrVariant("jpeg4sWithPreview", ImageFormat.JPEG, 4_000_000_000L, withPreview = true))
+            add(SdrVariant("yuv4s", ImageFormat.YUV_420_888, 4_000_000_000L))
+            if (largest(map, ImageFormat.JPEG_R) != null) add(SdrVariant("jpegR4s", ImageFormat.JPEG_R, 4_000_000_000L))
+        }
+        return buildJsonObject {
+            put("iso", iso)
+            for (variant in variants) {
+                val size = largest(map, variant.format) ?: continue
+                put(variant.key, probe {
+                    manager.withCamera(id) { device, thread ->
+                        val reader = imageReader(size.width, size.height, variant.format, 2)
+                        try {
+                            val outputs = listOf(OutputConfiguration(surface), OutputConfiguration(reader.surface))
+                            if (supported(id, outputs) == false) return@withCamera buildJsonObject { put("skipped", "session not supported") }
+                            val session = device.session(outputs, thread)
+                            try {
+                                device.repeating(session, thread, listOf(surface))
+                                delay(1500)
+                                val events = mutableListOf<String>()
+                                val t0 = SystemClock.elapsedRealtime()
+                                fun at() = SystemClock.elapsedRealtime() - t0
+                                fun log(event: String) = synchronized(events) { events += "$event ${at()} ms" }
+                                var startTs = 0L
+                                val image = CompletableDeferred<Image>()
+                                val completed = CompletableDeferred<TotalCaptureResult?>()
+                                // The image's arrival logged on the same thread as the camera's callbacks: their real order
+                                reader.setOnImageAvailableListener({ r ->
+                                    val next = runCatching { r.acquireNextImage() }.getOrNull() ?: return@setOnImageAvailableListener
+                                    log("image")
+                                    if (!image.complete(next)) next.close()
+                                }, thread.handler)
+                                val request = device.createCaptureRequest(variant.template).apply {
+                                    addTarget(reader.surface)
+                                    if (variant.withPreview) addTarget(surface)
+                                    still(id)
+                                    set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
+                                    set(CaptureRequest.SENSOR_SENSITIVITY, iso)
+                                    set(CaptureRequest.SENSOR_EXPOSURE_TIME, variant.exposureNs)
+                                    set(CaptureRequest.SENSOR_FRAME_DURATION, variant.exposureNs)
+                                    variant.extra(this)
+                                }
+                                session.captureSingleRequest(request.build(), thread.executor, object : CameraCaptureSession.CaptureCallback() {
+                                    override fun onCaptureStarted(session: CameraCaptureSession, request: CaptureRequest, timestamp: Long, frameNumber: Long) {
+                                        startTs = timestamp
+                                        log("started")
+                                    }
+
+                                    override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+                                        log("completed")
+                                        completed.complete(result)
+                                    }
+
+                                    override fun onCaptureFailed(session: CameraCaptureSession, request: CaptureRequest, failure: CaptureFailure) {
+                                        log("failed (reason ${failure.reason}, image captured ${failure.wasImageCaptured()})")
+                                        completed.complete(null)
+                                    }
+
+                                    override fun onCaptureBufferLost(session: CameraCaptureSession, request: CaptureRequest, target: Surface, frameNumber: Long) {
+                                        log("buffer lost (${if (target == reader.surface) "still" else "preview"})")
+                                    }
+                                })
+                                val still = withTimeoutOrNull(variant.exposureNs / 1_000_000 + 10_000) { image.await() }
+                                val result = withTimeoutOrNull(2_000) { completed.await() }
+                                buildJsonObject {
+                                    put("askedMs", variant.exposureNs / 1e6)
+                                    put("events", JsonArray(synchronized(events) { events.toList() }.map { JsonPrimitive(it) }))
+                                    result?.let { r ->
+                                        put("resultExposureMs", jsonOf(r.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.div(1e6)))
+                                        put("resultIso", jsonOf(r.get(CaptureResult.SENSOR_SENSITIVITY)))
+                                        put("resultAeMode", jsonOf(r.get(CaptureResult.CONTROL_AE_MODE)))
+                                        put("resultControlMode", jsonOf(r.get(CaptureResult.CONTROL_MODE)))
+                                        put("resultLens", jsonOf(r.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)))
+                                    }
+                                    if (still == null) {
+                                        put("still", "none")
+                                    } else still.use { img ->
+                                        put("imageMinusStartUs", if (startTs == 0L) null else (img.timestamp - startTs) / 1000)
+                                        if (variant.format != ImageFormat.YUV_420_888) {
+                                            val name = "SDR_${Media.stamp()}_${variant.key}_cam$id.jpg"
+                                            put("file", Media.saveImage(resolver, name, "image/jpeg", img.compressedBytes()).toString())
+                                        }
+                                    }
+                                }
+                            } finally {
+                                session.close()
+                            }
+                        } finally {
+                            reader.close()
                         }
                     }
                 })

@@ -228,6 +228,7 @@
     <string name="content_description_play">Odtwórz</string>
     <string name="value_playback_time">%1$s / %2$s</string>
     <string name="msg_capture_not_saved">Nie udało się przekazać ujęcia aplikacji.</string>
+    <string name="msg_photo_lost">Aparat nie przekazał zdjęcia, więc nie zostało zapisane. Zrób je ponownie.</string>
     <string name="label_shortcut_selfie_short">Selfie</string>
     <string name="label_shortcut_selfie_long">Zrób selfie</string>
     <string name="label_shortcut_video_short">Wideo</string>

@@ -228,12 +228,13 @@ private inline fun DrawScope.neutral(core: Color, outline: Color, width: Float, 
 }
 
 /**
- * Night's crosshairs (SPEC §5.5, §9.2): a fixed cross at the picture's centre and a moving one showing how far the phone has turned since the photo started –
- * up and down, sideways (as the picture would shift, from the lens's field of view and the zoom) and around the lens's axis. Turns too small to show in the
- * photo are left out; with the phone still the crosses cover each other. From the gyroscope's game rotation vector (no compass, no drift jumps).
+ * The hold-still crosshairs of a Night photo and of a long exposure set by hand (SPEC §5.5, §9.2): a fixed cross at the picture's centre and a moving one
+ * showing how far the phone has turned since the photo started – up and down, sideways (as the picture would shift, from the lens's field of view and the
+ * zoom) and around the lens's axis. Turns too small to show in the photo are left out; with the phone still the crosses cover each other. From the
+ * gyroscope's game rotation vector (no compass, no drift jumps).
  */
 @Composable
-fun NightCrosshairs(lensView: Double, zoom: Double, widthShare: Double, modifier: Modifier) {
+fun HoldStillCrosshairs(lensView: Double, zoom: Double, widthShare: Double, modifier: Modifier) {
     val context = LocalContext.current
     val colors = MaterialTheme.colorScheme
     // The turn since the start: about the screen's x (up/down), y (sideways) and z (the lens's axis), in radians
@@ -291,6 +292,6 @@ fun NightCrosshairs(lensView: Double, zoom: Double, widthShare: Double, modifier
     }
 }
 
-/** Turns below these don't show in a Night photo: the moving cross stays on the fixed one. */
+/** Turns below these don't show in the photo: the moving cross stays on the fixed one. */
 private const val STILL_SHIFT_DEGREES = 0.3
 private const val STILL_ROLL_DEGREES = 1.0

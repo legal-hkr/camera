@@ -51,4 +51,6 @@
     <string name="title_test_pro_raw_with_jpeg">Pro: RAW with the photo in one shot</string>
     <string name="title_test_pro_50mp_dng">Pro: 50 MP DNG (Bayer and quad)</string>
     <string name="title_test_pro_white_balance">Pro: white balance in kelvins (HLG and SDR)</string>
+    <string name="title_test_pro_long_exposure_app">Pro: 4 s exposure in the app’s session</string>
+    <string name="title_test_pro_manual_sdr">Pro: exposure set by hand without HDR (variants)</string>
 </resources>

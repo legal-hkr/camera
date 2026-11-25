@@ -303,7 +303,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
     val burstsSaving = viewModel.burstsSaving.collectAsStateWithLifecycle()
     val bursting by remember { derivedStateOf { burstCount.value != null } }
     val saving by remember { derivedStateOf { burstsSaving.value > 0 } }
-    val busy = engine.recording != null || ui.countdown != null || ui.motionWaiting > 0 || reviewing != null || ui.nightGathering || ui.processing > 0 || bursting || saving
+    val busy = engine.recording != null || ui.countdown != null || ui.motionWaiting > 0 || reviewing != null || ui.holdingStill || ui.processing > 0 || bursting || saving
     var keepOn by remember { mutableStateOf(true) }
     // A tapped focus that ends because the phone turned isn't use either
     // Use is what the user changes: not what the scene or the phone changes by itself (a dark scene's suggestion coming and going, a code found, progress)
@@ -477,6 +477,8 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
         }
     }
     LaunchedEffect(Unit) { viewModel.refused.collect { explain(tooHot) } }
+    val photoLost = stringResource(R.string.msg_photo_lost)
+    LaunchedEffect(Unit) { viewModel.photoLost.collect { explain(photoLost) } }
     // After both restarts failed: a snackbar with the error's details (SPEC §14.1)
     val failedTitle = stringResource(R.string.title_camera_failed)
     val show = stringResource(R.string.button_show)
@@ -671,8 +673,8 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                     postview?.takeIf { night }?.let { Image(it.asImageBitmap(), contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize()) }
                     // The tilt read in here only: it changes many times a second and must not recompose the whole viewfinder
                     Level(viewModel, ui.settings.grid, ui.settings.level, ui.rotation)
-                    // Hold still: the crosshairs while a Night photo gathers its frames
-                    if (ui.nightGathering && camera != null) NightCrosshairs(camera.lensView, ui.zoom, if (ui.settings.aspect == Aspect.SIXTEEN_NINE) 9.0 / 16 else 0.75, Modifier.fillMaxSize())
+                    // Hold still: the crosshairs while a Night photo gathers its frames or a long exposure set by hand runs
+                    if (ui.holdingStill && camera != null) HoldStillCrosshairs(camera.lensView, ui.zoom, if (ui.settings.aspect == Aspect.SIXTEEN_NINE) 9.0 / 16 else 0.75, Modifier.fillMaxSize())
                 }
             }
             // Not of the picture: the countdown and the full storage stay seen whatever the picture does
@@ -727,7 +729,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                 }
             }
             // Nothing that rebuilds the session while a countdown runs or a recording goes on
-            if (recording == null && ui.countdown == null && !ui.nightGathering && !bursting) {
+            if (recording == null && ui.countdown == null && !ui.holdingStill && !bursting) {
                 Row(Modifier.align(Alignment.TopEnd).padding(end = 12.dp, top = topRowTop(status, start = maxWidth - 148.dp, end = maxWidth - 12.dp)), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                     // Another app's low-quality video is SDR whatever the setting: no HDR to switch
                     val hdrAvailable = when {
@@ -812,7 +814,8 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
         }
         // Snackbars 8 dp above the suggestion slot (SPEC §14.2)
         // Pro's tiles stand above the ruler's place (SPEC §11): the snackbars above them there
-        val proShown = pro && camera?.manualSensor == true && problem == null && recording == null && ui.countdown == null
+        // Not during a long exposure: a value changed then would change the time the photo in flight is waited for, and nothing changes it any more
+        val proShown = pro && camera?.manualSensor == true && problem == null && recording == null && ui.countdown == null && ui.exposing == null
         val snackbarBottom = if (proShown) zoomBottom + 44.dp + 12.dp + 48.dp + 8.dp + 48.dp + 8.dp else zoomBottom + 44.dp + 36.dp + 32.dp + 8.dp
         SnackbarHost(snackbars, Modifier.align(Alignment.BottomCenter).padding(bottom = snackbarBottom)) { data ->
             Snackbar(data, shape = MaterialTheme.shapes.extraLarge, modifier = Modifier.padding(horizontal = 12.dp))
@@ -830,7 +833,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                 // From the QR code shortcut, until a code is found (SPEC §15.5)
                 ui.pointAtCode && ui.mode == Mode.PHOTO && !rulerOpen -> SuggestionChip(R.drawable.ic_qr_code_scanner, stringResource(R.string.label_point_at_code), onDismiss = { viewModel.clearPointAtCode() })
                 // A Night photo gathering its frames (SPEC §9.2)
-                ui.nightGathering -> SuggestionChip(R.drawable.ic_back_hand, stringResource(R.string.label_hold_still), onDismiss = null)
+                ui.holdingStill -> SuggestionChip(R.drawable.ic_back_hand, stringResource(R.string.label_hold_still), onDismiss = null)
                 // Dark for a while in Photo: Night offered, never switched to by itself (SPEC §9.1)
                 ui.nightSuggested && ui.mode == Mode.PHOTO && camera?.night != null && !rulerOpen -> SuggestionChip(R.drawable.ic_bedtime, stringResource(R.string.label_suggest_night), onDismiss = { viewModel.closeNightSuggestion() }, onClick = { viewModel.selectMode(Mode.NIGHT) })
             }
@@ -876,7 +879,8 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
             )
         }
 
-        ZoomRow(
+        // Not during a long exposure: the photo in flight keeps its zoom
+        if (ui.exposing == null) ZoomRow(
             scale = camera?.zoom,
             zoom = ui.zoom,
             rulerOpen = zoomRulerOpen,
@@ -885,7 +889,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
             onQuickSettings = { quickSettings = true },
             quickSettingsOpen = quickSettings,
             // Not during a countdown either: the panel's values rebuild the session the timed shot waits for
-            showQuickSettings = recording == null && ui.countdown == null && !ui.nightGathering && !bursting,
+            showQuickSettings = recording == null && ui.countdown == null && !ui.holdingStill && !bursting,
             turn = turn,
             modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = zoomBottom - 4.dp),
         )
@@ -911,7 +915,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                         if (entry.locked) reviewSecure(context, activity, viewModel.sessionShots(), shot) else openInGallery(context, shot)
                     }
                 }
-                if (viewModel.cameras.size > 1 && !ui.nightGathering && !bursting) SwitchCameraButton(turn, onClick = { viewModel.switchCamera() }, modifier = Modifier.align(Alignment.CenterEnd).padding(end = 34.dp))
+                if (viewModel.cameras.size > 1 && !ui.holdingStill && !bursting) SwitchCameraButton(turn, onClick = { viewModel.switchCamera() }, modifier = Modifier.align(Alignment.CenterEnd).padding(end = 34.dp))
             }
             val video = ui.mode == Mode.VIDEO
             val counting = ui.countdown != null
@@ -920,6 +924,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                     bursting -> ShutterLook.BURST
                     counting -> ShutterLook.TIMER
                     ui.nightGathering -> ShutterLook.NIGHT
+                    ui.exposing != null -> ShutterLook.LONG
                     recording != null -> ShutterLook.RECORDING
                     video -> ShutterLook.VIDEO
                     else -> ShutterLook.PHOTO
@@ -927,7 +932,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                 label = stringResource(
                     when {
                         counting -> R.string.content_description_shutter_cancel_timer
-                        ui.nightGathering -> R.string.label_hold_still
+                        ui.holdingStill -> R.string.label_hold_still
                         recording != null -> R.string.content_description_shutter_stop
                         video -> R.string.content_description_shutter_record
                         else -> R.string.content_description_shutter_photo
@@ -947,10 +952,11 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                 onHold = if (ui.mode == Mode.PHOTO && capture == null && ui.timer == 0 && !counting) ({ viewModel.shutterHeld() }) else null,
                 onRelease = viewModel::shutterReleased,
                 modifier = Modifier.align(Alignment.Center),
+                exposing = ui.exposing,
             )
         }
 
-        if (recording == null && ui.countdown == null && !ui.nightGathering && !bursting) ModeRow(
+        if (recording == null && ui.countdown == null && !ui.holdingStill && !bursting) ModeRow(
             modes = rowModes,
             selected = ui.mode,
             label = {

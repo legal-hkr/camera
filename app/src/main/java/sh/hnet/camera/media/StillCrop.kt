@@ -10,6 +10,8 @@ import android.os.ParcelFileDescriptor
 import androidx.exifinterface.media.ExifInterface
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import kotlin.math.log2
+import kotlin.math.roundToLong
 import sh.hnet.camera.capabilities.model.PixelSize
 
 /**
@@ -76,6 +78,15 @@ object StillCrop {
         to.setAttribute(ExifInterface.TAG_PIXEL_X_DIMENSION, size.width.toString())
         to.setAttribute(ExifInterface.TAG_PIXEL_Y_DIMENSION, size.height.toString())
         to.saveAttributes()
+    }
+
+    /** A long time set by hand written over the camera's own (which its 32-bit nanoseconds cut short), with its APEX value where the camera wrote one. */
+    fun setExposure(file: ParcelFileDescriptor, exposureNs: Long) {
+        val exif = ExifInterface(file.fileDescriptor)
+        val ms = exposureNs / 1_000_000
+        exif.setAttribute(ExifInterface.TAG_EXPOSURE_TIME, "$ms/1000")
+        if (exif.getAttribute(ExifInterface.TAG_SHUTTER_SPEED_VALUE) != null) exif.setAttribute(ExifInterface.TAG_SHUTTER_SPEED_VALUE, "${(-log2(ms / 1000.0) * 1000).roundToLong()}/1000")
+        exif.saveAttributes()
     }
 
     /** The place found after the photo was taken (within seconds, SPEC §7.8) written into it. */

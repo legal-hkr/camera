@@ -229,6 +229,7 @@
     <string name="content_description_play">Play</string>
     <string name="value_playback_time">%1$s / %2$s</string>
     <string name="msg_capture_not_saved">The shot couldn’t be handed over to the app.</string>
+    <string name="msg_photo_lost">The camera didn’t return the photo, so it wasn’t saved. Take it again.</string>
     <string name="label_shortcut_selfie_short">Selfie</string>
     <string name="label_shortcut_selfie_long">Take a selfie</string>
     <string name="label_shortcut_video_short">Video</string>
