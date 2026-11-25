@@ -58,6 +58,8 @@ data class CameraSpec(
     val lensView: Double = 0.0,
     /** The phone's Night extension for this camera (Camera2 extensions), null without one. */
     val night: NightSpec? = null,
+    /** A full-size still holds the stream back (a stall duration): a burst can't ride on every preview frame, the requests alternate. */
+    val stillStalls: Boolean = false,
 )
 
 /** The Night extension's sizes: the preview, the photo in Ultra HDR and in plain JPEG, and whether it gives an early postview of the photo. */
@@ -66,6 +68,10 @@ data class NightSpec(
     val jpegR: List<PixelSize>,
     val jpeg: List<PixelSize>,
     val postview: Boolean,
+    /** The zoom the extension takes (Android 15+; null: the camera's own). */
+    val zoom: ClosedFloatingPointRange<Double>? = null,
+    /** The request keys the extension takes, by name (empty: not said, all are set). */
+    val requestKeys: Set<String> = emptySet(),
 )
 
 object CameraCatalog {
@@ -120,6 +126,7 @@ object CameraCatalog {
             videoStabilization = chars.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)?.contains(CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON) == true,
             lensView = logical.view,
             night = runCatching { night(manager, id) }.getOrNull(),
+            stillStalls = listOf(ImageFormat.JPEG_R, ImageFormat.JPEG).any { format -> sizes(map, format).maxByOrNull { it.area }?.let { runCatching { map.getOutputStallDuration(format, Size(it.width, it.height)) }.getOrDefault(0L) > 0 } == true },
         )
     }
 
@@ -132,7 +139,9 @@ object CameraCatalog {
         val preview = ext.getExtensionSupportedSizes(night, SurfaceTexture::class.java).map { PixelSize(it.width, it.height) }
         val jpeg = sizes(ImageFormat.JPEG)
         if (preview.isEmpty() || jpeg.isEmpty()) return null
-        return NightSpec(preview, sizes(ImageFormat.JPEG_R), jpeg, ext.isPostviewAvailable(night))
+        val zoom = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) runCatching { ext.get(night, CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE) }.getOrNull()?.let { it.lower.toDouble()..it.upper.toDouble() } else null
+        val keys = runCatching { ext.getAvailableCaptureRequestKeys(night).map { it.name }.toSet() }.getOrNull().orEmpty()
+        return NightSpec(preview, sizes(ImageFormat.JPEG_R), jpeg, ext.isPostviewAvailable(night), zoom, keys)
     }
 
     /** A lens' focal length and the width of the sensor area it uses (the active array's share of the physical sensor). */

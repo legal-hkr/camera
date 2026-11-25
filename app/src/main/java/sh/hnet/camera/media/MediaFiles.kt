@@ -22,6 +22,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import sh.hnet.camera.camera.MotionClip
 import sh.hnet.camera.camera.VideoTarget
@@ -48,8 +50,7 @@ object FileNames {
 /** One burst being saved: its start (the names), its id (the XMP), and where its frames are cut or mirrored. */
 class BurstFiles(val startedAt: Long, val id: String, val crop: PixelSize?, val mirror: Boolean)
 
-/** The newest shot the app has taken: what the thumbnail shows and the gallery opens. */
-/** [burst]: the frames of the burst it is the cover of (0: a single shot). */
+/** The newest shot the app has taken: what the thumbnail shows and the gallery opens; [burst]: the frames of the burst it is the cover of (0: a single shot). */
 data class LastShot(val uri: Uri, val mimeType: String, val thumbnail: Bitmap?, val burst: Int = 0)
 
 /**
@@ -72,7 +73,7 @@ class MediaFiles(private val context: Context) {
     suspend fun saveBurstFrame(bytes: ByteArray, takenAt: Long, burst: BurstFiles, index: Int, show: Boolean): Uri? {
         val uri = writePhoto(bytes, takenAt, FileNames.burst(burst.startedAt, index), burst.crop, burst.mirror) { MotionPhotoWriter.markBurst(it, burst.id, primary = index == 0) ?: it }
             ?: return null
-        if (show) show(uri, "image/jpeg", burst = 1, takenAt = takenAt) else counted(uri)
+        if (show) show(uri, "image/jpeg", burst = 1, takenAt = takenAt) else counted(uri, "image/jpeg", takenAt)
         return uri
     }
 
@@ -143,7 +144,8 @@ class MediaFiles(private val context: Context) {
                 if (saved) runCatching { resolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null) }
                 else runCatching { resolver.delete(uri, null, null) }
             }
-            if (saved) show(uri, "video/mp4", takenAt = startedAt) else refreshLast()
+            // Shown as of its end: the newest shot (a photo taken while it recorded is older)
+            if (saved) show(uri, "video/mp4", takenAt = System.currentTimeMillis()) else refreshLast()
         }
     }
 
@@ -161,18 +163,44 @@ class MediaFiles(private val context: Context) {
     @Volatile
     private var latestTaken = 0L
 
+    /** One shot at a time decides the thumbnail (a burst's saving, a photo and a video may finish together). */
+    private val showing = Mutex()
+
     /** Shows a shot just saved in the thumbnail, unless a newer one is there. */
     private suspend fun show(uri: Uri, mime: String, burst: Int = 0, takenAt: Long) = withContext(Dispatchers.IO) {
-        counted(uri, mime)
-        if (takenAt < latestTaken) return@withContext
-        latestTaken = takenAt
-        latest = uri to mime
+        counted(uri, mime, takenAt)
         val thumbnail = runCatching { resolver.loadThumbnail(uri, Size(THUMBNAIL_PX, THUMBNAIL_PX), null) }.getOrNull()
-        _last.value = LastShot(uri, mime, thumbnail, burst)
+        showing.withLock {
+            if (takenAt < latestTaken) return@withLock
+            latestTaken = takenAt
+            latest = uri to mime
+            _last.value = LastShot(uri, mime, thumbnail, burst)
+        }
     }
 
-    /** A shot of this session (the lock screen's review has it) not shown in the thumbnail: a burst's frame after the cover. */
-    private fun counted(uri: Uri, mime: String = "image/jpeg") = _saved.update { (it + Saved(uri, mime, System.currentTimeMillis())).takeLast(SAVED_KEPT) }
+    /**
+     * A shot of this session (the lock screen's review has it) not shown in the thumbnail: a burst's frame after the cover. [takenAt] decides the session: a
+     * burst taken before the phone was locked and saved after stays out of the lock screen's.
+     */
+    private fun counted(uri: Uri, mime: String, takenAt: Long) = _saved.update { (it + Saved(uri, mime, takenAt)).takeLast(SAVED_KEPT) }
+
+    /**
+     * Before a burst's frame put aside by an ended process is saved: whether it is in the gallery already (saved, its file not yet deleted when the process
+     * ended), and its pending entry from a write cut off removed (the name would be taken).
+     */
+    suspend fun burstFrameSaved(name: String): Boolean = withContext(Dispatchers.IO) {
+        val collection = MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        fun ids(pending: Boolean): List<Long> = runCatching {
+            val args = Bundle().apply {
+                putString(ContentResolver.QUERY_ARG_SQL_SELECTION, "${MediaStore.MediaColumns.DISPLAY_NAME} = ?")
+                putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS, arrayOf(name))
+                putInt(MediaStore.QUERY_ARG_MATCH_PENDING, if (pending) MediaStore.MATCH_ONLY else MediaStore.MATCH_EXCLUDE)
+            }
+            resolver.query(collection, arrayOf(MediaStore.MediaColumns._ID), args, null)?.use { c -> buildList { while (c.moveToNext()) add(c.getLong(0)) } }.orEmpty()
+        }.getOrDefault(emptyList())
+        ids(pending = true).forEach { runCatching { resolver.delete(ContentUris.withAppendedId(collection, it), null, null) } }
+        ids(pending = false).isNotEmpty()
+    }
 
     /**
      * Reads the newest own shot again (when the viewfinder comes back): the one saved last by this process while it still exists (a gallery may have deleted it),
@@ -189,7 +217,12 @@ class MediaFiles(private val context: Context) {
             }
             val exists = runCatching { resolver.query(collection, arrayOf(MediaStore.MediaColumns._ID), args, null)?.use { it.count > 0 } }.getOrNull() == true
             if (exists) {
-                if (_last.value?.uri != uri || _last.value?.thumbnail == null) _last.value = LastShot(uri, mime, thumbnail(uri), burstOf(uri)?.second ?: 0)
+                // A burst's count again too: frames may have been deleted in a gallery
+                val current = _last.value
+                if (current?.uri != uri || current.thumbnail == null || current.burst > 0) {
+                    val burst = burstOf(uri)
+                    _last.value = LastShot(burst?.first ?: uri, mime, current?.takeIf { it.uri == uri }?.thumbnail ?: thumbnail(uri), burst?.second ?: 0)
+                }
                 return@withContext
             }
             latest = null
@@ -201,13 +234,15 @@ class MediaFiles(private val context: Context) {
             putString(ContentResolver.QUERY_ARG_SQL_SORT_ORDER, "${MediaStore.MediaColumns.DATE_TAKEN} DESC, ${MediaStore.MediaColumns._ID} DESC")
             putInt(ContentResolver.QUERY_ARG_LIMIT, 1)
         }
-        val projection = arrayOf(MediaStore.MediaColumns._ID, MediaStore.Files.FileColumns.MEDIA_TYPE, MediaStore.MediaColumns.MIME_TYPE)
+        val projection = arrayOf(MediaStore.MediaColumns._ID, MediaStore.Files.FileColumns.MEDIA_TYPE, MediaStore.MediaColumns.MIME_TYPE, MediaStore.MediaColumns.DATE_TAKEN)
         val found = runCatching {
             resolver.query(MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL), projection, args, null)?.use { c ->
                 if (!c.moveToFirst()) return@use null
                 val id = c.getLong(0)
                 val video = c.getInt(1) == MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO
                 val collection = if (video) MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL) else MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
+                // A shot saved later by this process (a burst's frames saved from an ended process's) mustn't replace a newer one found here
+                latestTaken = maxOf(latestTaken, c.getLong(3))
                 ContentUris.withAppendedId(collection, id) to (c.getString(2) ?: if (video) "video/mp4" else "image/jpeg")
             }
         }.getOrNull()
@@ -231,8 +266,9 @@ class MediaFiles(private val context: Context) {
         val prefix = FileNames.burstPrefix(name) ?: return@runCatching null
         val collection = MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
         val args = Bundle().apply {
-            putString(ContentResolver.QUERY_ARG_SQL_SELECTION, "${MediaStore.MediaColumns.DISPLAY_NAME} LIKE ?")
-            putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS, arrayOf("$prefix%"))
+            // In the camera's folder only: the table may be large
+            putString(ContentResolver.QUERY_ARG_SQL_SELECTION, "${MediaStore.MediaColumns.RELATIVE_PATH} = ? AND ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE ?")
+            putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS, arrayOf("$CAMERA_DIR/", "$prefix%"))
             putInt(MediaStore.QUERY_ARG_MATCH_TRASHED, MediaStore.MATCH_EXCLUDE)
         }
         resolver.query(collection, arrayOf(MediaStore.MediaColumns._ID, MediaStore.MediaColumns.DISPLAY_NAME), args, null)?.use { c ->
@@ -273,7 +309,7 @@ class MediaFiles(private val context: Context) {
 
     private companion object {
         /** The shots of a lock-screen session: far more than one takes before unlocking. */
-        const val SAVED_KEPT = 2000
+        const val SAVED_KEPT = 1000
         const val TAG = "MediaFiles"
         const val CAMERA_DIR = "DCIM/Camera"
         /** The thumbnail is 52 dp; this covers it at up to 3.7× density. */

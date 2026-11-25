@@ -17,6 +17,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import java.io.File
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.acos
 import kotlin.math.sqrt
 import kotlinx.coroutines.CoroutineStart
@@ -42,6 +43,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import sh.hnet.camera.CameraApplication
 import sh.hnet.camera.CameraSettings
@@ -435,8 +437,9 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         analyzer.qrEnabled = _ui.value.mode == Mode.PHOTO && (_ui.value.settings.qrCodes || _ui.value.pointAtCode)
         // A viewfinder not shown doesn't touch the shared engine (another one may have it); start() configures
         if (!started) return
-        // Not under a recording or a countdown: a new session would cut the video or lose the timed shot
-        if (recording || _ui.value.countdown != null) {
+        // Not under a recording, a countdown, a Night photo gathering its frames or a burst: a new session would cut the video, lose the timed shot, hold a
+        // frozen frame over the gathering, or end the burst
+        if (recording || _ui.value.countdown != null || _ui.value.nightGathering || burstJob != null) {
             configureLater = true
             // A frame frozen for the change would stay over the live picture until it comes
             _frozen.value = null
@@ -590,7 +593,10 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         cancelTimer()
         _ui.update { it.copy(mode = mode, focus = null, locked = false, exposure = 0, torch = false, pointAtCode = false) }
         analyzer.reset()
+        // After any resets still waiting (a camera switch just before, its zoom back to 1×)
+        val before = onTold
         onTold = {
+            before?.invoke()
             engine.setTorch(false)
             engine.resetFocus(exposure = 0)
         }
@@ -603,8 +609,11 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         val next = (_ui.value.cameraIndex + 1) % cameras.size
         // Night stays only where the other camera has it too
         val mode = if (_ui.value.mode == Mode.NIGHT && cameras[next].night == null) Mode.PHOTO else _ui.value.mode
-        _ui.update { it.copy(cameraIndex = next, mode = mode, zoom = 1.0, focus = null, locked = false, exposure = 0, torch = false, flashLevel = null) }
+        // The Night suggestion only where the camera has Night
+        _ui.update { it.copy(cameraIndex = next, mode = mode, zoom = 1.0, focus = null, locked = false, exposure = 0, torch = false, flashLevel = null, nightSuggested = it.nightSuggested && cameras[next].night != null) }
+        val before = onTold
         onTold = {
+            before?.invoke()
             engine.setTorch(false)
             engine.setZoom(1.0)
             engine.resetFocus(exposure = 0)
@@ -836,7 +845,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
                     index++
                     _burstCount.value = index
                     if (index == 1) _shutter.tryEmit(Unit)
-                    // The click at the first frame and every tenth (my decision: one per frame would be a rattle at 15–30 fps)
+                    // The click at the first frame and every tenth: one per frame would rattle at 15–30 fps
                     if ((index == 1 || index % BURST_TICK == 0) && clicks && !cleared) sound.play(MediaActionSound.SHUTTER_CLICK)
                     if (index % BURST_TICK == 0) _burstTick.tryEmit(index >= MAX_BURST)
                     // Room for the frames put aside and their copies in the gallery: below it the burst ends (SPEC §14.1)
@@ -850,6 +859,9 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
                 _burstCount.value = null
                 phone.fast = recording
                 phone.refreshStorage()
+                // A change put off by the burst (the job is still the one under way here: the check in configure() is left by clearing it first)
+                if (burstJob === coroutineContext[Job]) burstJob = null
+                if (configureLater) configure()
             }
         }
         burstJob = job
@@ -975,17 +987,20 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
                     return@withLock
                 }
                 // The progress on the shutter while this photo gathers, then at the thumbnail while it is the newest one put together
-                var gathering = true
+                // Read by the progress collector on another thread
+                val gathering = AtomicBoolean(true)
                 val progress = launch {
                     shot.progress.collect { value ->
                         val share = value / 100f
-                        _ui.update { if (gathering) it.copy(gatherProgress = share) else if (newestNight == id) it.copy(nightProgress = share) else it }
+                        _ui.update { if (gathering.get()) it.copy(gatherProgress = share) else if (newestNight == id) it.copy(nightProgress = share) else it }
                     }
                 }
                 shot.gathered.await()
-                gathering = false
+                gathering.set(false)
                 newestNight = id
                 _ui.update { it.copy(nightGathering = false, gatherProgress = null, nightProgress = null, processing = it.processing + 1) }
+                // A change put off by the gathering
+                withContext(Dispatchers.Main) { if (configureLater) configure() }
                 // Put together and saved outside the lock: the next Night photo may start meanwhile. Waited for even when the extension didn't say its frames
                 // were in (the photo may still come)
                 application.appScope.launch {

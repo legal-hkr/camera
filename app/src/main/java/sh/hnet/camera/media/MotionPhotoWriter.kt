@@ -102,6 +102,8 @@ object MotionPhotoWriter {
 
     /** The camera's XMP with GCamera [attributes] added to its first `rdf:Description` (and the namespace where it is missing). */
     internal fun addAttributes(xml: String, attributes: String): String {
+        // Marked already (a frame saved again): not twice, which would make the XML invalid
+        if ("GCamera:BurstID=" in xml) return xml
         val open = Regex("<rdf:Description\\b[^>]*?(/?)>").find(xml) ?: return plain(attributes)
         val selfClosing = open.groupValues[1] == "/"
         val tag = open.value.removeSuffix("/>").removeSuffix(">")

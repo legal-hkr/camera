@@ -48,6 +48,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
@@ -281,7 +282,18 @@ class CameraEngine(context: Context) {
     fun configure(request: CameraRequest) = desired.update { if (it.request == request) it else it.copy(request = request) }
 
     /** Whether [a] and [b] are served by the same session: they differ at most in an aspect cut from the same streams (a square cut from 4:3, any aspect in Video). */
-    fun sameSession(a: CameraRequest, b: CameraRequest): Boolean = a.copy(aspect = sessionAspect(a)) == b.copy(aspect = sessionAspect(b))
+    fun sameSession(a: CameraRequest, b: CameraRequest): Boolean = sessionShape(a) == sessionShape(b)
+
+    /** What of a request makes its session: the aspect of its streams, and only what its mode uses (Photo and Night have no video choice, only Photo a motion photo). */
+    private fun sessionShape(request: CameraRequest) = request.copy(
+        aspect = sessionAspect(request),
+        video = if (request.mode == Mode.VIDEO) request.video else VideoChoice(),
+        motion = request.mode == Mode.PHOTO && request.motion,
+        motionFirst = request.mode == Mode.PHOTO && request.motionFirst,
+    )
+
+    /** The session there is the one wanted now (not one about to be replaced). */
+    private fun sessionSettled() = (session != null || nightSession != null) && sessionKey?.shape() == desired.value.shape()
 
     /** The aspect the session's streams have: a square cut from the 4:3 still is 4:3 (unless the camera has a full square size of its own), Video is 16:9. */
     private fun sessionAspect(request: CameraRequest): Aspect = when {
@@ -295,7 +307,7 @@ class CameraEngine(context: Context) {
         return lists.filter { it.isNotEmpty() }.all { Sizes.still(it, Aspect.SQUARE)?.capture == Sizes.still(it, Aspect.FOUR_THREE)?.capture }
     }
 
-    private fun Desired.shape(): Desired = copy(request = request?.let { it.copy(aspect = sessionAspect(it)) })
+    private fun Desired.shape(): Desired = copy(request = request?.let(::sessionShape))
 
     /** The crop a still of [capture] needs for the aspect asked at the shot: 4:3 and a square share the session, so it is decided here, not with the session. */
     private fun cropFor(capture: PixelSize, request: CameraRequest): PixelSize? = request.pictureAspect.let { if (Sizes.near(capture, it)) null else Sizes.cropTo(capture, it) }
@@ -389,8 +401,8 @@ class CameraEngine(context: Context) {
         // A session being built (a mode, a setting, the end of a countdown that put it off) is waited for, not taken as none; before the still is counted
         // as in flight, which the session's close would wait for
         awaitSession()
-        // Not during a burst: the two would take each other's stills
-        if (bursting != null) return@withContext null
+        // Not during a burst (the two would take each other's stills), nor on a session about to go
+        if (bursting != null || !sessionSettled()) return@withContext null
         val done = CompletableDeferred<Unit>()
         capture = done
         try {
@@ -469,8 +481,9 @@ class CameraEngine(context: Context) {
                     output.images.onReceiveCatching { it.getOrNull() }
                     failed.onAwait { null }
                 } ?: break
-                // A late image of an earlier shot that timed out is older than this exposure
-                if (startedAt != 0L && next.timestamp < startedAt) next.close() else found = next
+                // Not before this capture has started (the camera says so before it hands the still): what comes earlier is an older shot's (a burst's last
+                // stills); a late one is older than this exposure
+                if (startedAt == 0L || next.timestamp < startedAt) next.close() else found = next
             }
             found
         } ?: return null
@@ -500,7 +513,7 @@ class CameraEngine(context: Context) {
      */
     suspend fun startBurst(deviceRotation: Int, location: Location?): BurstShot? = withContext(dispatcher) {
         awaitSession()
-        if (session == null || bursting != null || capture != null) return@withContext null
+        if (session == null || bursting != null || capture != null || !sessionSettled()) return@withContext null
         // Stills from before the burst (a single photo's late one) are older than the newest frame seen
         val after = latestFrameNs
         val output = still ?: return@withContext null
@@ -518,7 +531,7 @@ class CameraEngine(context: Context) {
         scope.launch {
             var count = 0
             try {
-                while (count < MAX_BURST) {
+                while (true) {
                     // After the stop only the stills already in flight still come; the stop wakes a wait for one that won't
                     val image = if (state.stopping) {
                         withTimeoutOrNull(BURST_TAIL_MS) { output.images.receiveCatching().getOrNull() } ?: break
@@ -530,13 +543,17 @@ class CameraEngine(context: Context) {
                         if (stopped) continue
                         next ?: break
                     }
-                    if (image.timestamp <= after) {
+                    // Older than the burst, or past its last frame (the stills in flight at the end): given back, not handed on
+                    if (image.timestamp <= after || count >= MAX_BURST) {
                         image.close()
                         continue
                     }
                     val frame = image.use { BurstFrame(it.compressedBytes(), it.timestamp) }
-                    frames.send(frame)
+                    // A consumer gone (its result lost) doesn't hold the burst for good
+                    if (withTimeoutOrNull(BURST_HANDOFF_WAIT_MS) { frames.send(frame) } == null) break
                     count++
+                    // The last frame: no more asked for; those in flight still come and are given back above
+                    if (count >= MAX_BURST) stopAsking(state)
                 }
             } catch (e: CancellationException) {
                 throw e
@@ -589,8 +606,8 @@ class CameraEngine(context: Context) {
                 builder.set(CaptureRequest.JPEG_QUALITY, JPEG_QUALITY)
                 state.location?.let { builder.set(CaptureRequest.JPEG_GPS_LOCATION, it) }
             }
-            if (_state.value.range == PictureRange.HLG) {
-                // The HLG preview and a still of the standard profile can't share a request: they alternate
+            if (_state.value.range == PictureRange.HLG || request.camera.stillStalls) {
+                // The HLG preview and a still of the standard profile can't share a request, nor can a still that stalls the stream: they alternate
                 val preview = device.createCaptureRequest(template(request))
                 preview.addTarget(surface)
                 addRecordingTarget(preview)
@@ -601,6 +618,11 @@ class CameraEngine(context: Context) {
                 val stillRequest = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
                 stillRequest.addTarget(output.reader.surface)
                 stillControls(stillRequest)
+                // The session's own keys the same in both (some cameras reconfigure when they change between requests)
+                runCatching { manager.getCameraCharacteristics(request.camera.id).availableSessionKeys }.getOrNull()?.forEach { key ->
+                    @Suppress("UNCHECKED_CAST")
+                    (key as CaptureRequest.Key<Any?>).let { stillRequest.set(it, preview.get(it)) }
+                }
                 session.setRepeatingBurst(listOf(preview.build(), stillRequest.build()), results, handler)
             } else {
                 // One profile: every preview frame is a still too (the still template, as measured: 30 fps for JPEG)
@@ -650,6 +672,8 @@ class CameraEngine(context: Context) {
         // again when the new surface comes (two blinks per change)
         val surface = want.surface?.takeIf { want.surfaceSize == size }
         if (surface == null) {
+            // No more preview into a surface that went away while Night photos are finished (the extension could fail them over it)
+            nightSession?.let { runCatching { it.stopRepeating() } }
             awaitCapture()
             closeSession()
             return
@@ -672,10 +696,16 @@ class CameraEngine(context: Context) {
     private suspend fun awaitCapture() {
         // A burst ends at once when its session must go; its frames in flight still come (the wait for `capture` below)
         bursting?.let(::stopAsking)
-        capture?.let { inFlight -> withTimeoutOrNull(STILL_TIMEOUT_MS) { inFlight.await() } }
-        if (clipping.get() > 0) withTimeoutOrNull(CLIP_WAIT_MS) { while (clipping.get() > 0) delay(SETTLE_POLL_MS) }
-        // Night photos the extension is still putting together: the session stays until they are out
-        if (nightInFlight.get() > 0) withTimeoutOrNull(NIGHT_TIMEOUT_MS) { while (nightInFlight.get() > 0) delay(SETTLE_POLL_MS) }
+        // Until nothing is in flight (a still, a motion photo's video, Night photos the extension is still putting together), as long as the waits make progress
+        while (true) {
+            val before = Triple(capture, clipping.get(), nightInFlight.get())
+            if (before.first == null && before.second == 0 && before.third == 0) break
+            capture?.let { inFlight -> withTimeoutOrNull(STILL_TIMEOUT_MS) { inFlight.await() } }
+            if (clipping.get() > 0) withTimeoutOrNull(CLIP_WAIT_MS) { while (clipping.get() > 0) delay(SETTLE_POLL_MS) }
+            val night = nightInFlight.get()
+            if (night > 0) withTimeoutOrNull(NIGHT_TIMEOUT_MS) { while (nightInFlight.get() >= night) delay(SETTLE_POLL_MS) }
+            if (Triple(capture, clipping.get(), nightInFlight.get()) == before) break
+        }
         finishRecording()
     }
 
@@ -1179,9 +1209,13 @@ class CameraEngine(context: Context) {
         val boost = result.get(CaptureResult.CONTROL_POST_RAW_SENSITIVITY_BOOST)?.takeIf { it > 0 } ?: 100
         val aperture = result.get(CaptureResult.LENS_APERTURE)?.takeIf { it > 0 }?.toDouble() ?: DEFAULT_APERTURE
         val gain = iso * boost / 100.0
-        val compensation = controls.exposure.coerceIn(request.camera.exposureSteps) * request.camera.exposureStep
+        // Night's extension takes no compensation
+        val compensation = if (request.mode == Mode.NIGHT) 0.0 else controls.exposure.coerceIn(request.camera.exposureSteps) * request.camera.exposureStep
         return log2(aperture * aperture / (time / 1e9)) - log2(gain / 100) + compensation
     }
+
+    /** The newest Night photo asked for: the next one waits for it (camera thread). */
+    private var nightTail: Job? = null
 
     /** The sensor time of the newest frame the session reported (camera thread). */
     private var latestFrameNs = 0L
@@ -1199,7 +1233,8 @@ class CameraEngine(context: Context) {
             val face = steadyFace(focusedFace(result, request))
             val light = sceneEv(result, request)
             // Darker than the threshold to become dark, clearly lighter to stop being it: noise around the threshold would flicker the flash's amber and restart the Night suggestion's wait
-            val dark = light != null && if (_state.value.dark) light < LIGHT_EV else light <= DARK_EV
+            // A result without the exposure's numbers keeps what was known
+            val dark = if (light == null) _state.value.dark else if (_state.value.dark) light < LIGHT_EV else light <= DARK_EV
             // The exposure's own word where the camera gives it; the Pixel doesn't in the preview, so a dark scene counts too (as for the front camera's screen flash)
             val flashNeeded = aeState == CameraMetadata.CONTROL_AE_STATE_FLASH_REQUIRED || dark
             val lens = result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)
@@ -1319,7 +1354,8 @@ class CameraEngine(context: Context) {
                 val stillOutput = runCatching { StillOutput(formatPlan, if (format == ImageFormat.JPEG_R) StillFormat.JPEG_R else StillFormat.JPEG, format) }.getOrNull() ?: continue
                 val postOutput = if (withPostview && postSize != null) runCatching { PostviewOutput(postSize, format) }.getOrNull() else null
                 val session = try {
-                    suspendCancellableCoroutine<CameraExtensionSession?> { cont ->
+                    // An extension that never answers doesn't hold the camera's thread (a late session is closed in onConfigured)
+                    withTimeoutOrNull(NIGHT_SETUP_MS) { suspendCancellableCoroutine<CameraExtensionSession?> { cont ->
                         val config = ExtensionSessionConfiguration(
                             CameraExtensionCharacteristics.EXTENSION_NIGHT,
                             listOf(OutputConfiguration(surface), OutputConfiguration(stillOutput.reader.surface)),
@@ -1341,7 +1377,7 @@ class CameraEngine(context: Context) {
                         )
                         postOutput?.let { config.postviewOutputConfiguration = OutputConfiguration(it.reader.surface) }
                         device.createExtensionSession(config)
-                    }
+                    } }
                 } catch (e: Exception) {
                     Log.w(TAG, "Night session rung failed: ${e.javaClass.simpleName}")
                     null
@@ -1403,13 +1439,16 @@ class CameraEngine(context: Context) {
     /** The keys the Night extension takes (LOGIKA §16): the zoom and the tapped region for focus and exposure, focus following it continuously (no trigger). */
     private fun nightControls(builder: CaptureRequest.Builder, request: CameraRequest) {
         val spec = request.camera
-        builder.set(CaptureRequest.CONTROL_ZOOM_RATIO, controls.zoom.toFloat())
-        if (spec.autofocus) builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+        val night = spec.night
+        // Only what the extension takes (it says so by name; nothing said: everything is set), the zoom within its own range
+        fun takes(key: CaptureRequest.Key<*>) = night == null || night.requestKeys.isEmpty() || key.name in night.requestKeys
+        if (takes(CaptureRequest.CONTROL_ZOOM_RATIO)) builder.set(CaptureRequest.CONTROL_ZOOM_RATIO, (night?.zoom?.let { controls.zoom.coerceIn(it) } ?: controls.zoom).toFloat())
+        if (spec.autofocus && takes(CaptureRequest.CONTROL_AF_MODE)) builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
         controls.focus?.let { point ->
             val region = Orientation.meteringRegion(point, spec.sensorOrientation, spec.front, visible(request))
             val rect = arrayOf(MeteringRectangle(region.left, region.top, region.width, region.height, MeteringRectangle.METERING_WEIGHT_MAX - 1))
-            if (spec.afRegions > 0) builder.set(CaptureRequest.CONTROL_AF_REGIONS, rect)
-            if (spec.aeRegions > 0) builder.set(CaptureRequest.CONTROL_AE_REGIONS, rect)
+            if (spec.afRegions > 0 && takes(CaptureRequest.CONTROL_AF_REGIONS)) builder.set(CaptureRequest.CONTROL_AF_REGIONS, rect)
+            if (spec.aeRegions > 0 && takes(CaptureRequest.CONTROL_AE_REGIONS)) builder.set(CaptureRequest.CONTROL_AE_REGIONS, rect)
         }
     }
 
@@ -1419,6 +1458,7 @@ class CameraEngine(context: Context) {
      */
     suspend fun takeNightPhoto(deviceRotation: Int, location: Location?, onShutter: () -> Unit): NightShot? = withContext(dispatcher) {
         awaitSession()
+        if (!sessionSettled()) return@withContext null
         val session = nightSession ?: return@withContext null
         val output = still ?: return@withContext null
         val request = desired.value.request ?: return@withContext null
@@ -1464,9 +1504,12 @@ class CameraEngine(context: Context) {
         }
         val takenAt = System.currentTimeMillis()
         nightInFlight.incrementAndGet()
-        // The extension's photos come in the order they were asked for: each waits for the next image
+        // The extension's photos come in the order they were asked for: each waits for the next image, its time counted from the previous one's end (a
+        // queue of several would otherwise run out of time while waiting its turn)
+        val previous = nightTail
         val photo = scope.async {
             try {
+                previous?.join()
                 val image = withTimeoutOrNull(NIGHT_TIMEOUT_MS) {
                     var found: StillImage? = null
                     while (found == null) {
@@ -1491,6 +1534,7 @@ class CameraEngine(context: Context) {
                 nightInFlight.decrementAndGet()
             }
         }
+        nightTail = photo
         NightShot(gathered, photo, progress.asStateFlow())
     }
 
@@ -1503,7 +1547,12 @@ class CameraEngine(context: Context) {
             reader.setOnImageAvailableListener({ r ->
                 val image = runCatching { r.acquireNextImage() }.getOrNull() ?: return@setOnImageAvailableListener
                 val bytes = image.use { it.compressedBytes() }
-                if (postview === this) _postviewImage.value = runCatching { postviewTurn?.let { turnPostview(bytes, it) } }.getOrNull()
+                val turn = postviewTurn ?: return@setOnImageAvailableListener
+                // Decoded and turned off the camera's thread (tens of milliseconds for Ultra HDR)
+                scope.launch(Dispatchers.Default) {
+                    val picture = runCatching { turnPostview(bytes, turn) }.getOrNull()
+                    withContext(dispatcher) { if (postview === this@PostviewOutput && postviewTurn === turn) _postviewImage.value = picture }
+                }
             }, handler)
         }
 
@@ -1520,6 +1569,8 @@ class CameraEngine(context: Context) {
         if ((session != null || nightSession != null) && _state.value.frameShown) _state.update { it.copy(frameShown = false) }
         // A burst of this session asks for nothing more (a new session's repeat() must not ask for it)
         bursting?.stop()
+        // Another camera or session may count its time differently
+        latestFrameNs = 0L
         lockJob?.cancel()
         // The prepared encoder goes at once (the next session's may need the hardware); the surface goes when the session has closed
         recorder?.retire()
@@ -1633,6 +1684,10 @@ class CameraEngine(context: Context) {
         const val BURST_HANDOFF = 4
         /** After a burst's stop, its stills still in flight are waited for this long. */
         const val BURST_TAIL_MS = 400L
+        /** A burst's frame waits this long for its consumer, then the burst ends (the consumer is gone). */
+        const val BURST_HANDOFF_WAIT_MS = 10_000L
+        /** The Night extension's session is waited for this long. */
+        const val NIGHT_SETUP_MS = 5_000L
         /** The Night extension's longest shot (8 s on the Pixel) and a margin. */
         const val NIGHT_TIMEOUT_MS = 15_000L
         const val POSTVIEW_WIDTH = 1920

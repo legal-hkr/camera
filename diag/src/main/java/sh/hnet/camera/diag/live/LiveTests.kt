@@ -465,7 +465,7 @@ class LiveTests(context: Context, private val preview: PreviewHost) {
         val previewSize = previewSizes.firstOrNull { it.width == 1920 && it.height == 1440 } ?: previewSizes.filter { it.width <= 1920 }.maxByOrNull { area(it) } ?: previewSizes.first()
         val jpegR = ext.getExtensionSupportedSizes(night, ImageFormat.JPEG_R)
         val format = if (jpegR.isNotEmpty()) ImageFormat.JPEG_R else ImageFormat.JPEG
-        val size = ext.getExtensionSupportedSizes(night, format).maxBy { area(it) }
+        val size = ext.getExtensionSupportedSizes(night, format).maxByOrNull { area(it) } ?: return notOffered("Night sizes")
         val surface = preview.surface(previewSize)
         return manager.withCamera(id) { device, thread ->
             buildJsonObject {
@@ -599,19 +599,17 @@ class LiveTests(context: Context, private val preview: PreviewHost) {
 
     /**
      * A 5-second burst next to an HLG preview, as the camera app's Photo has it with Ultra HDR on: can one request hold the preview and the still, and if not,
-     * what rates do the preview and the stills get when their requests alternate ([preview, still] and [preview, still, still])? Also whether the session
-     * takes a JPEG reader beside JPEG_R (a fast plain-JPEG burst with Ultra HDR single photos), and its rates. At 30 fps: HLG sessions at 60 fps are refused.
+     * what rates do the preview and the stills get when their requests alternate ([preview, still] and [preview, still, still])? At 30 fps: HLG sessions at
+     * 60 fps are refused. A JPEG reader beside JPEG_R and the HLG preview was measured once and broke the Pixel's camera service: never configured again.
      */
     private suspend fun burstHdrPreview(id: String): JsonObject {
         val map = map(id)
         val previewSize = previewSize(map)
         val jpegR = largest(map, ImageFormat.JPEG_R) ?: return notOffered("JPEG_R")
-        val jpeg = largest(map, ImageFormat.JPEG) ?: return notOffered("JPEG")
         val fps = Range(30, 30)
         return manager.withCamera(id) { device, thread ->
             buildJsonObject {
                 put("JPEG_R", probe { burstNextToHlg(device, thread, previewSize, listOf(ImageFormat.JPEG_R to jpegR), fps) })
-                put("JPEG_R + JPEG readers, bursting JPEG", probe { burstNextToHlg(device, thread, previewSize, listOf(ImageFormat.JPEG_R to jpegR, ImageFormat.JPEG to jpeg), fps) })
             }
         }
     }

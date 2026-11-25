@@ -296,7 +296,8 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
     val busy = engine.recording != null || ui.countdown != null || ui.motionWaiting > 0 || reviewing != null || ui.nightGathering || ui.processing > 0 || bursting || saving
     var keepOn by remember { mutableStateOf(true) }
     // A tapped focus that ends because the phone turned isn't use either
-    LaunchedEffect(ui.copy(rotation = 0, focus = null), busy) { used() }
+    // Use is what the user changes: not what the scene or the phone changes by itself (a dark scene's suggestion coming and going, a code found, progress)
+    LaunchedEffect(ui.copy(rotation = 0, focus = null, nightSuggested = false, pointAtCode = false, gatherProgress = null, nightProgress = null, processing = 0), busy) { used() }
     // Back in front (the screen on again, back from another app): a use, so the hold starts over
     LifecycleEventEffect(Lifecycle.Event.ON_START) { used() }
     // The time of the last use read in the effect only: a touch mustn't recompose the whole viewfinder
@@ -540,6 +541,8 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
         }
         val frame = geometry.photo(sensor, shownAspect)
         val frozenMotion = remember { FrozenMotion() }
+        // Its bitmap (about 11 MB) isn't kept while the app is away
+        LifecycleEventEffect(Lifecycle.Event.ON_STOP) { frozenMotion.held = null }
         val fade = MaterialTheme.motionScheme.defaultEffectsSpec<Float>()
         LaunchedEffect(frozen) { frozenMotion.follow(frozen, fade) }
         // The photo's frame: where the fading frozen frame's was while it goes, then the live session's (sliding with the square's bands)
@@ -687,10 +690,14 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                 }
             }
             // Nothing that rebuilds the session while a countdown runs or a recording goes on
-            if (recording == null && ui.countdown == null) {
+            if (recording == null && ui.countdown == null && !ui.nightGathering && !bursting) {
                 Row(Modifier.align(Alignment.TopEnd).padding(end = 12.dp, top = topRowTop(status, start = maxWidth - 148.dp, end = maxWidth - 12.dp)), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                     // Another app's low-quality video is SDR whatever the setting: no HDR to switch
-                    val hdrAvailable = if (video) camera.hlg && capture?.lowQuality != true else camera.jpegR.isNotEmpty()
+                    val hdrAvailable = when {
+                        video -> camera.hlg && capture?.lowQuality != true
+                        night -> camera.night?.jpegR?.isNotEmpty() == true
+                        else -> camera.jpegR.isNotEmpty()
+                    }
                     if (hdrAvailable) {
                         val possible = !video || viewModel.videoHdrPossible
                         val on = (if (video) settings.hdrVideo else settings.ultraHdr) && possible
@@ -784,7 +791,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                 // A Night photo gathering its frames (SPEC §9.2)
                 ui.nightGathering -> SuggestionChip(R.drawable.ic_back_hand, stringResource(R.string.label_hold_still), onDismiss = null)
                 // Dark for a while in Photo: Night offered, never switched to by itself (SPEC §9.1)
-                ui.nightSuggested && ui.mode == Mode.PHOTO && !exposureOpen -> SuggestionChip(R.drawable.ic_bedtime, stringResource(R.string.label_suggest_night), onDismiss = { viewModel.closeNightSuggestion() }, onClick = { viewModel.selectMode(Mode.NIGHT) })
+                ui.nightSuggested && ui.mode == Mode.PHOTO && camera?.night != null && !exposureOpen -> SuggestionChip(R.drawable.ic_bedtime, stringResource(R.string.label_suggest_night), onDismiss = { viewModel.closeNightSuggestion() }, onClick = { viewModel.selectMode(Mode.NIGHT) })
             }
         }
         // The exposure ruler above the zoom row, in the suggestion slot's place
@@ -811,7 +818,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
             onQuickSettings = { quickSettings = true },
             quickSettingsOpen = quickSettings,
             // Not during a countdown either: the panel's values rebuild the session the timed shot waits for
-            showQuickSettings = recording == null && ui.countdown == null,
+            showQuickSettings = recording == null && ui.countdown == null && !ui.nightGathering && !bursting,
             turn = turn,
             modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = zoomBottom - 4.dp),
         )
@@ -837,7 +844,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                         if (entry.locked) reviewSecure(context, activity, viewModel.sessionShots(), shot) else openInGallery(context, shot)
                     }
                 }
-                if (viewModel.cameras.size > 1) SwitchCameraButton(turn, onClick = { viewModel.switchCamera() }, modifier = Modifier.align(Alignment.CenterEnd).padding(end = 34.dp))
+                if (viewModel.cameras.size > 1 && !ui.nightGathering && !bursting) SwitchCameraButton(turn, onClick = { viewModel.switchCamera() }, modifier = Modifier.align(Alignment.CenterEnd).padding(end = 34.dp))
             }
             val video = ui.mode == Mode.VIDEO
             val counting = ui.countdown != null
@@ -876,7 +883,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
             )
         }
 
-        if (recording == null && ui.countdown == null && !ui.nightGathering) ModeRow(
+        if (recording == null && ui.countdown == null && !ui.nightGathering && !bursting) ModeRow(
             modes = modes,
             selected = ui.mode,
             label = {
@@ -1101,7 +1108,8 @@ private fun Thumbnail(last: LastShot?, turn: Float, processing: () -> Int, progr
  * the lock screen gets them after the phone is unlocked.
  */
 private fun reviewSecure(context: Context, activity: Activity?, shots: List<MediaFiles.Saved>, newest: LastShot) {
-    val uris = shots.map { it.uri }.ifEmpty { listOf(newest.uri) }
+    // The newest few hundred: a session of several bursts would not fit in one intent
+    val uris = shots.map { it.uri }.take(REVIEW_SECURE_MAX).ifEmpty { listOf(newest.uri) }
     val intent = Intent(MediaStore.ACTION_REVIEW_SECURE).setDataAndType(newest.uri, newest.mimeType).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION).apply {
         clipData = ClipData.newRawUri("", uris.first()).apply { uris.drop(1).forEach { addItem(ClipData.Item(it)) } }
     }
@@ -1504,3 +1512,4 @@ private fun FrozenLayer(motion: FrozenMotion, published: FrozenFrame?, geometry:
     }
 }
 
+private const val REVIEW_SECURE_MAX = 300
