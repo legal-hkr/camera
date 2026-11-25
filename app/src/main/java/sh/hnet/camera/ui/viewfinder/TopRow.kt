@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -27,6 +28,7 @@ import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.ListItemShapes
+import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.MenuDefaults
 import androidx.compose.material3.PlainTooltip
@@ -57,12 +59,18 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.LineHeightStyle
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import kotlin.math.roundToInt
 import sh.hnet.camera.Grid
 import sh.hnet.camera.MotionPhoto
 import sh.hnet.camera.R
+import sh.hnet.camera.RawMode
 import sh.hnet.camera.camera.Flash
+import sh.hnet.camera.capabilities.CameraSpec
+import sh.hnet.camera.capabilities.fiftyMp
 import sh.hnet.camera.capabilities.model.Aspect
 import sh.hnet.camera.ui.components.SettingsGroup
 import sh.hnet.camera.ui.components.settingsRowColors
@@ -96,6 +104,8 @@ fun TopButton(
     onDisabled: () -> Unit = {},
     /** Stands out as on although its value is the default: the automatic flash that will fire with the next photo. */
     accent: Boolean = false,
+    /** A small word over the icon ("50 MP" over the raw icon), the icon's own size kept. */
+    caption: String? = null,
     onClick: () -> Unit,
 ) {
     val overlay = overlayColors()
@@ -120,7 +130,26 @@ fun TopButton(
                     state?.let { stateDescription = it }
                 },
         ) {
-            Shadowed(Modifier.rotate(turn), alpha = if (enabled) 1f else DISABLED_ALPHA) { shadow -> Icon(painterResource(icon), contentDescription = null, tint = shadow ?: tint, modifier = Modifier.size(20.dp)) }
+            Shadowed(Modifier.rotate(turn), alpha = if (enabled) 1f else DISABLED_ALPHA) { shadow ->
+                if (caption == null) {
+                    Icon(painterResource(icon), contentDescription = null, tint = shadow ?: tint, modifier = Modifier.size(20.dp))
+                } else {
+                    // The icon's letters fill only its middle band (7.5–12.5 of 20 dp): the word sits just above them, the two together centered as the other
+                    // icons are (letters about 5–7.5 dp below the middle, the word's capitals about 3–9 dp above it)
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(painterResource(icon), contentDescription = null, tint = shadow ?: tint, modifier = Modifier.size(20.dp).offset(y = 5.dp))
+                        Text(
+                            caption,
+                            color = shadow ?: tint,
+                            fontSize = 8.sp,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            style = LocalTextStyle.current.copy(lineHeight = 8.sp, lineHeightStyle = LineHeightStyle(LineHeightStyle.Alignment.Center, LineHeightStyle.Trim.Both)),
+                            modifier = Modifier.offset(y = (-6).dp),
+                        )
+                    }
+                }
+            }
         }
     }
 }
@@ -157,6 +186,23 @@ fun TopTextButton(text: String, label: String, turn: Float, stacked: List<String
             }
         }
     }
+}
+
+/** Pro's raw choices this camera has: off and the DNG beside the photo, and 50 MP where it has the mode. */
+fun rawModes(camera: CameraSpec): List<RawMode> = listOfNotNull(RawMode.OFF, RawMode.RAW, RawMode.MP50.takeIf { camera.fiftyMp })
+
+/** A raw choice in the top row's menu: "Off", "RAW (DNG)", "50 MP (DNG)". */
+fun rawMenuName(mode: RawMode) = when (mode) {
+    RawMode.OFF -> R.string.label_off
+    RawMode.RAW -> R.string.label_panel_raw
+    RawMode.MP50 -> R.string.menu_raw_50mp
+}
+
+/** A raw choice on the panel's toggles: "Off", "RAW", "50 MP". */
+fun rawToggleName(mode: RawMode) = when (mode) {
+    RawMode.OFF -> R.string.label_off
+    RawMode.RAW -> R.string.value_raw
+    RawMode.MP50 -> R.string.label_50mp
 }
 
 /** One choice of a top-row menu. */
@@ -292,6 +338,9 @@ class PanelState(
     val location: Boolean,
     /** Pro's histogram; null outside Pro. */
     val histogram: Boolean?,
+    /** Pro's raw image; null where it isn't offered (not Pro, another app's photo, a camera without raw images); [rawModes] the camera has. */
+    val raw: RawMode? = null,
+    val rawModes: List<RawMode> = emptyList(),
 )
 
 class PanelActions(
@@ -308,6 +357,7 @@ class PanelActions(
     val onUltraHdr: () -> Unit,
     val onMotionPhoto: (MotionPhoto) -> Unit,
     val onHistogram: (Boolean) -> Unit,
+    val onRaw: (RawMode) -> Unit,
     val onLocation: () -> Unit,
     /** None for another app's shot: its Settings are the app's own business. */
     val onSettings: (() -> Unit)?,
@@ -319,7 +369,14 @@ fun QuickSettings(state: PanelState, actions: PanelActions) {
     val numbers = rememberNumbers()
     Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp).padding(bottom = 16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
         SettingsGroup {
-            // Every value of the top row is here too, within the thumb's reach (SPEC §2.1)
+            // The DNG on top (SPEC §7.12's order); every value of the top row is here too, within the thumb's reach (SPEC §2.1)
+            state.raw?.let { mode ->
+                row { shapes ->
+                    PanelRow(shapes, stringResource(R.string.label_panel_raw)) {
+                        Toggles(state.rawModes, mode, { stringResource(rawMenuName(it)) }, actions.onRaw) { Text(stringResource(rawToggleName(it)), maxLines = 1) }
+                    }
+                }
+            }
             row { PanelSwitchRow(it, stringResource(R.string.label_panel_location), state.location) { actions.onLocation() } }
             // The grid and the level show in both modes, so both panels set them
             row { PanelSwitchRow(it, stringResource(R.string.label_panel_level), state.level, actions.onLevel) }

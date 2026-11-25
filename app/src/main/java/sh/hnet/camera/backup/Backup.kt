@@ -13,6 +13,7 @@ import kotlinx.serialization.json.jsonPrimitive
 import sh.hnet.camera.CameraSettings
 import sh.hnet.camera.Grid
 import sh.hnet.camera.MotionPhoto
+import sh.hnet.camera.RawMode
 import sh.hnet.camera.VolumeKeys
 import sh.hnet.camera.capabilities.model.Aspect
 import sh.hnet.camera.capabilities.model.ProExposure
@@ -71,6 +72,8 @@ data class BackupSettings(
     val proKelvin: Int? = null,
     val proHistogram: Boolean? = null,
     val proPeaking: Boolean? = null,
+    /** `OFF`, `RAW`, `MP50`. */
+    val rawMode: String? = null,
     /** The mode last chosen from "More" (`PRO`). */
     val moreMode: String? = null,
 ) {
@@ -118,6 +121,7 @@ data class BackupSettings(
         },
         proHistogram = proHistogram ?: current.proHistogram,
         proPeaking = proPeaking ?: current.proPeaking,
+        rawMode = rawMode?.let { name -> RawMode.entries.firstOrNull { it.name == name } } ?: current.rawMode,
         moreMode = moreMode ?: current.moreMode,
     )
 
@@ -152,6 +156,7 @@ data class BackupSettings(
             proKelvin = settings.proKelvin ?: 0,
             proHistogram = settings.proHistogram,
             proPeaking = settings.proPeaking,
+            rawMode = settings.rawMode.name,
             moreMode = settings.moreMode,
         )
     }

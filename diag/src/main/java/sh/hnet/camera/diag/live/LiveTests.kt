@@ -35,6 +35,7 @@ import androidx.annotation.StringRes
 import androidx.core.graphics.get
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.math.abs
 import kotlin.math.roundToInt
 import kotlinx.coroutines.CompletableDeferred
@@ -94,6 +95,9 @@ class LiveTests(context: Context, private val preview: PreviewHost) {
         LiveTest("pro_white_balance", R.string.title_test_pro_white_balance) { proWhiteBalance(it) },
         LiveTest("pro_long_exposure_app", R.string.title_test_pro_long_exposure_app) { proLongExposureApp(it) },
         LiveTest("pro_manual_sdr", R.string.title_test_pro_manual_sdr) { proManualSdr(it) },
+        LiveTest("pro_raw_lenses", R.string.title_test_pro_raw_lenses) { proRawLenses(it) },
+        LiveTest("lens_by_zoom", R.string.title_test_lens_by_zoom) { lensByZoom(it) },
+        LiveTest("pro_50mp_app", R.string.title_test_pro_50mp_app) { pro50mpApp(it) },
         LiveTest("raw", R.string.title_test_raw) { raw(it) },
     )
 
@@ -1056,6 +1060,296 @@ class LiveTests(context: Context, private val preview: PreviewHost) {
                     }
                 })
             }
+        }
+    }
+
+    /**
+     * RAW from the lens of each zoom stop in the app's session (preview, photo, analysis stream): the logical camera's raw stream comes from the main sensor at
+     * every zoom (owner's test, 25 Nov 2026), so the raw stream is asked of the stop's physical lens. With an HLG and an SDR preview: whether the session is
+     * confirmed, the lens the camera used, whether the raw image came and its size; then whether one session may hold every lens' raw stream at once. The
+     * photo and the DNG (that lens' own metadata, with orientation) go to DCIM/CameraDiag.
+     */
+    private suspend fun proRawLenses(id: String): JsonObject {
+        val spec = CameraCatalog.read(manager).firstOrNull { it.id == id } ?: return notOffered("the camera in the catalog")
+        val map = map(id)
+        val surface = preview.surface(previewSize(map))
+        val stops = spec.zoom.stops.filter { it.lens != null }
+        if (stops.isEmpty()) return notOffered("physical lenses")
+        fun rawSize(lens: String) = largest(chars(lens).get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP), ImageFormat.RAW_SENSOR)
+        val hlgOffered = largest(map, ImageFormat.JPEG_R) != null && chars(id).get(CameraCharacteristics.REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES)?.supportedProfiles?.contains(DynamicRangeProfiles.HLG10) == true
+        return buildJsonObject {
+            for (hlg in listOf(true, false)) {
+                if (hlg && !hlgOffered) continue
+                val format = if (hlg) ImageFormat.JPEG_R else ImageFormat.JPEG
+                val size = largest(map, format) ?: continue
+                val analysisFormat = if (hlg) ImageFormat.YCBCR_P010 else ImageFormat.YUV_420_888
+                val analysisSize = map.getOutputSizes(analysisFormat)?.filter { it.width >= 640 && abs(it.width * 3 - it.height * 4) <= it.width / 20 }?.minByOrNull { area(it) }
+                val profile = if (hlg) DynamicRangeProfiles.HLG10 else DynamicRangeProfiles.STANDARD
+                fun base(still: Surface, analysis: Surface?) = listOfNotNull(
+                    OutputConfiguration(surface).apply { dynamicRangeProfile = profile },
+                    OutputConfiguration(still),
+                    analysis?.let { OutputConfiguration(it).apply { dynamicRangeProfile = profile } },
+                )
+                put(if (hlg) "hlg" else "sdr", buildJsonObject {
+                    // Every lens' raw stream in one session: only asked
+                    run {
+                        val readers = stops.mapNotNull { stop -> rawSize(stop.lens!!)?.let { stop.lens to imageReader(it.width, it.height, ImageFormat.RAW_SENSOR, 1) } }
+                        val still = imageReader(size.width, size.height, format, 1)
+                        val analysis = analysisSize?.let { imageReader(it.width, it.height, analysisFormat, 1) }
+                        try {
+                            val outputs = base(still.surface, analysis?.surface) + readers.map { (lens, reader) -> OutputConfiguration(reader.surface).apply { setPhysicalCameraId(lens) } }
+                            put("allLensesOneSession", jsonOf(supported(id, outputs)))
+                        } finally {
+                            readers.forEach { it.second.close() }
+                            still.close()
+                            analysis?.close()
+                        }
+                    }
+                    for (stop in stops) {
+                        val lens = stop.lens!!
+                        val raw = rawSize(lens) ?: continue
+                        put("${stop.ratio}x lens $lens", probe {
+                            manager.withCamera(id) { device, thread ->
+                                ImageQueue(imageReader(size.width, size.height, format, 2), thread).use { stills ->
+                                    ImageQueue(imageReader(raw.width, raw.height, ImageFormat.RAW_SENSOR, 2), thread).use { raws ->
+                                        val analysis = analysisSize?.let { a -> imageReader(a.width, a.height, analysisFormat, 4).also { r -> r.setOnImageAvailableListener({ runCatching { it.acquireLatestImage() }.getOrNull()?.close() }, thread.handler) } }
+                                        try {
+                                            val outputs = base(stills.reader.surface, analysis?.surface) + OutputConfiguration(raws.reader.surface).apply { setPhysicalCameraId(lens) }
+                                            val confirmed = supported(id, outputs)
+                                            // Configured only as the camera confirms it: a refused physical stream may break the camera service
+                                            if (confirmed != true) return@withCamera buildJsonObject { put("supported", jsonOf(confirmed)) }
+                                            val session = device.session(outputs, thread)
+                                            try {
+                                                val zoom = stop.ratio.toFloat()
+                                                device.repeating(session, thread, listOfNotNull(surface, analysis?.surface)) { set(CaptureRequest.CONTROL_ZOOM_RATIO, zoom) }
+                                                delay(1500)
+                                                val request = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                                                    addTarget(stills.reader.surface)
+                                                    addTarget(raws.reader.surface)
+                                                    still(id)
+                                                    set(CaptureRequest.CONTROL_ZOOM_RATIO, zoom)
+                                                    if (chars(lens).get(CameraCharacteristics.STATISTICS_INFO_AVAILABLE_LENS_SHADING_MAP_MODES)?.contains(CameraMetadata.STATISTICS_LENS_SHADING_MAP_MODE_ON) == true) {
+                                                        set(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE, CameraMetadata.STATISTICS_LENS_SHADING_MAP_MODE_ON)
+                                                    }
+                                                }
+                                                val result = runCatching { session.captureOnce(request.build(), thread) }
+                                                val still = withTimeoutOrNull(6000) { stills.next(7000) }
+                                                val rawImage = withTimeoutOrNull(3000) { raws.next(4000) }
+                                                val stamp = Media.stamp()
+                                                buildJsonObject {
+                                                    put("supported", jsonOf(confirmed))
+                                                    put("result", result.exceptionOrNull()?.message ?: "completed")
+                                                    result.getOrNull()?.let { r ->
+                                                        put("activePhysicalId", jsonOf(r.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)))
+                                                        put("physicalResults", jsonOf(r.physicalCameraTotalResults.keys.sorted().joinToString(",")))
+                                                    }
+                                                    put("photo", still != null)
+                                                    still?.use { img -> put("photoFile", Media.saveImage(resolver, "LENSRAW_${stamp}_${if (hlg) "hlg" else "sdr"}_${stop.ratio}x_cam$id.jpg", "image/jpeg", img.compressedBytes()).toString()) }
+                                                    put("raw", rawImage?.let { "${it.width}x${it.height}" } ?: "none")
+                                                    val physical = result.getOrNull()?.let { r -> r.physicalCameraTotalResults[lens] ?: r }
+                                                    if (rawImage != null && physical != null) rawImage.use { img ->
+                                                        put("rawMatchesResult", img.timestamp == physical.get(CaptureResult.SENSOR_TIMESTAMP))
+                                                        val dng = Media.newImage(resolver, "LENSRAW_${stamp}_${if (hlg) "hlg" else "sdr"}_${stop.ratio}x_cam$id.dng", "image/x-adobe-dng")
+                                                        val written = runCatching {
+                                                            DngCreator(chars(lens), physical).use { creator ->
+                                                                creator.setOrientation(exifOrientation(orientation(id)))
+                                                                resolver.openOutputStream(dng)!!.use { creator.writeImage(it, img) }
+                                                            }
+                                                            Media.publish(resolver, dng)
+                                                        }
+                                                        put("dng", written.exceptionOrNull()?.let { e -> "${e.javaClass.simpleName}: ${e.message}" } ?: dng.toString())
+                                                    } else rawImage?.close()
+                                                }
+                                            } finally {
+                                                session.close()
+                                            }
+                                        } finally {
+                                            analysis?.close()
+                                        }
+                                    }
+                                }
+                            }
+                        })
+                    }
+                })
+            }
+        }
+    }
+
+    /**
+     * Which lens the camera takes the picture with at each zoom, in the app's session (SDR preview, photo, analysis stream): the zoom slid up from the lowest
+     * to the highest by 0.1 and back, each step held 0.7 s; the active physical lens and the logical crop. Where the lens changes between the stops (the DNG's
+     * raw stream follows the lens), and whether up and down differ. Pointed at something farther than 2 m (the tele isn't used for near subjects).
+     */
+    private suspend fun lensByZoom(id: String): JsonObject {
+        val chars = chars(id)
+        if (chars.physicalCameraIds.isEmpty()) return notOffered("physical lenses")
+        val map = map(id)
+        val range = chars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE) ?: return notOffered("a zoom ratio range")
+        val size = largest(map, ImageFormat.JPEG) ?: return notOffered("JPEG")
+        val surface = preview.surface(previewSize(map))
+        val top = minOf(range.upper, 6f)
+        val up = buildList {
+            var z = range.lower.toDouble()
+            while (z <= top + 1e-6) {
+                add((z * 100).roundToInt() / 100.0)
+                z = if (z < 1.0) minOf(1.0, z + 0.1) else z + 0.1
+            }
+        }
+        val watch = ResultWatch()
+        return manager.withCamera(id) { device, thread ->
+            ImageQueue(imageReader(size.width, size.height, ImageFormat.JPEG, 1), thread).use { stills ->
+                val analysisSize = map.getOutputSizes(ImageFormat.YUV_420_888)?.filter { it.width >= 640 && abs(it.width * 3 - it.height * 4) <= it.width / 20 }?.minByOrNull { area(it) }
+                val analysis = analysisSize?.let { a -> imageReader(a.width, a.height, ImageFormat.YUV_420_888, 4).also { r -> r.setOnImageAvailableListener({ runCatching { it.acquireLatestImage() }.getOrNull()?.close() }, thread.handler) } }
+                try {
+                    val outputs = listOfNotNull(OutputConfiguration(surface), OutputConfiguration(stills.reader.surface), analysis?.let { OutputConfiguration(it.surface) })
+                    val session = device.session(outputs, thread)
+                    try {
+                        buildJsonObject {
+                            for ((name, steps) in listOf("up" to up, "down" to up.reversed())) put(name, buildJsonArray {
+                                for (zoom in steps) {
+                                    device.repeating(session, thread, listOfNotNull(surface, analysis?.surface), callback = watch) { set(CaptureRequest.CONTROL_ZOOM_RATIO, zoom.toFloat()) }
+                                    delay(700)
+                                    val r = watch.result
+                                    add(JsonPrimitive("$zoom: lens ${r?.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)}, focus ${r?.get(CaptureResult.LENS_FOCUS_DISTANCE)?.let { String.format(java.util.Locale.ROOT, "%.2f", it) }} D"))
+                                }
+                            })
+                        }
+                    } finally {
+                        session.close()
+                    }
+                } finally {
+                    analysis?.close()
+                }
+            }
+        }
+    }
+
+    /**
+     * 50 MP in the app's Pro session: which sets with the maximum-resolution RAW10 the camera confirms (SDR or HLG preview, the analysis stream, a JPEG
+     * beside it, the logical camera or its main lens), then in the best confirmed one two shots (the camera's exposure, and 1/4 s at ISO 100 set by hand):
+     * time to the image, preview frames meanwhile, the result's exposure, sensor mode, crop and lens shading map. Only the main lens (the tele's 50 MP mode
+     * breaks the camera service); nothing unconfirmed is configured. No files.
+     */
+    private suspend fun pro50mpApp(id: String): JsonObject {
+        val chars = chars(id)
+        val maxMap = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP_MAXIMUM_RESOLUTION) ?: return notOffered("maximum resolution")
+        val raw = largest(maxMap, ImageFormat.RAW10) ?: return notOffered("RAW10 at maximum resolution")
+        val map = map(id)
+        val surface = preview.surface(previewSize(map))
+        val spec = CameraCatalog.read(manager).firstOrNull { it.id == id }
+        val main = spec?.zoom?.stops?.firstOrNull { abs(it.ratio - 1.0) < 1e-6 }?.lens
+        val jpeg = largest(map, ImageFormat.JPEG)
+        val yuv = map.getOutputSizes(ImageFormat.YUV_420_888)?.filter { it.width >= 640 && abs(it.width * 3 - it.height * 4) <= it.width / 20 }?.minByOrNull { area(it) }
+        val p010 = map.getOutputSizes(ImageFormat.YCBCR_P010)?.filter { it.width >= 640 && abs(it.width * 3 - it.height * 4) <= it.width / 20 }?.minByOrNull { area(it) }
+        class Set(val key: String, val hlg: Boolean, val analysis: Boolean, val photo: Boolean, val physical: Boolean)
+        val sets = buildList {
+            for (physical in listOfNotNull(false, true.takeIf { main != null })) {
+                val tag = if (physical) "lens$main" else "logical"
+                add(Set("${tag}_sdr", hlg = false, analysis = false, photo = false, physical = physical))
+                add(Set("${tag}_sdr_analysis", hlg = false, analysis = true, photo = false, physical = physical))
+                add(Set("${tag}_sdr_analysis_jpeg", hlg = false, analysis = true, photo = true, physical = physical))
+                add(Set("${tag}_hlg_analysis", hlg = true, analysis = true, photo = false, physical = physical))
+            }
+        }
+        fun outputs(set: Set, previewTarget: Surface, rawTarget: Surface, analysisTarget: Surface?, photoTarget: Surface?): List<OutputConfiguration> {
+            val profile = if (set.hlg) DynamicRangeProfiles.HLG10 else DynamicRangeProfiles.STANDARD
+            return listOfNotNull(
+                OutputConfiguration(previewTarget).apply { dynamicRangeProfile = profile },
+                OutputConfiguration(rawTarget).apply {
+                    addSensorPixelModeUsed(CameraMetadata.SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION)
+                    if (set.physical) setPhysicalCameraId(main)
+                },
+                analysisTarget?.let { OutputConfiguration(it).apply { dynamicRangeProfile = profile } },
+                photoTarget?.let { OutputConfiguration(it) },
+            )
+        }
+        return buildJsonObject {
+            put("raw", sizeText(raw))
+            put("mainLens", jsonOf(main))
+            // Asked only: readers of the right sizes stand in for the streams
+            val confirmed = mutableListOf<Set>()
+            put("supported", buildJsonObject {
+                for (set in sets) {
+                    val rawReader = imageReader(raw.width, raw.height, ImageFormat.RAW10, 1)
+                    val analysisSize = if (set.hlg) p010 else yuv
+                    val analysis = if (set.analysis) analysisSize?.let { imageReader(it.width, it.height, if (set.hlg) ImageFormat.YCBCR_P010 else ImageFormat.YUV_420_888, 1) } else null
+                    val photo = if (set.photo) jpeg?.let { imageReader(it.width, it.height, ImageFormat.JPEG, 1) } else null
+                    try {
+                        val answer = supported(id, outputs(set, surface, rawReader.surface, analysis?.surface, photo?.surface))
+                        put(set.key, jsonOf(answer))
+                        if (answer == true) confirmed += set
+                    } finally {
+                        rawReader.close()
+                        analysis?.close()
+                        photo?.close()
+                    }
+                }
+            })
+            // The fullest confirmed set without a JPEG (DNG only, as the app's 50 MP), the logical camera first
+            val chosen = confirmed.filter { !it.photo }.maxByOrNull { (if (it.analysis) 2 else 0) + (if (!it.physical) 1 else 0) - (if (it.hlg) 4 else 0) } ?: return@buildJsonObject
+            put("used", chosen.key)
+            put("shots", probe {
+                manager.withCamera(id) { device, thread ->
+                    ImageQueue(imageReader(raw.width, raw.height, ImageFormat.RAW10, 1), thread).use { raws ->
+                        val analysisSize = if (chosen.hlg) p010 else yuv
+                        val analysis = if (chosen.analysis) analysisSize?.let { a -> imageReader(a.width, a.height, if (chosen.hlg) ImageFormat.YCBCR_P010 else ImageFormat.YUV_420_888, 4).also { r -> r.setOnImageAvailableListener({ runCatching { it.acquireLatestImage() }.getOrNull()?.close() }, thread.handler) } } else null
+                        try {
+                            val session = device.session(outputs(chosen, surface, raws.reader.surface, analysis?.surface, null), thread)
+                            try {
+                                val frames = CopyOnWriteArrayList<Long>()
+                                val watch = object : CameraCaptureSession.CaptureCallback() {
+                                    override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+                                        frames += SystemClock.elapsedRealtime()
+                                    }
+                                }
+                                device.repeating(session, thread, listOfNotNull(surface, analysis?.surface), callback = watch) { set(CaptureRequest.CONTROL_ZOOM_RATIO, 1f) }
+                                delay(1500)
+                                buildJsonObject {
+                                    for ((name, manual) in listOf("auto" to false, "quarterSecondIso100" to true)) put(name, probe {
+                                        val request = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                                            addTarget(raws.reader.surface)
+                                            set(CaptureRequest.SENSOR_PIXEL_MODE, CameraMetadata.SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION)
+                                            set(CaptureRequest.CONTROL_ZOOM_RATIO, 1f)
+                                            set(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE, CameraMetadata.STATISTICS_LENS_SHADING_MAP_MODE_ON)
+                                            if (manual) {
+                                                set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
+                                                set(CaptureRequest.CONTROL_CAPTURE_INTENT, CameraMetadata.CONTROL_CAPTURE_INTENT_MANUAL)
+                                                set(CaptureRequest.SENSOR_SENSITIVITY, 100)
+                                                set(CaptureRequest.SENSOR_EXPOSURE_TIME, 250_000_000L)
+                                                set(CaptureRequest.SENSOR_FRAME_DURATION, 250_000_000L)
+                                            }
+                                        }
+                                        val start = SystemClock.elapsedRealtime()
+                                        val result = session.captureOnce(request.build(), thread)
+                                        val image = raws.next(10_000)
+                                        val end = SystemClock.elapsedRealtime()
+                                        image.use { img ->
+                                            val physical = if (chosen.physical) result.physicalCameraTotalResults[main] ?: result else result
+                                            buildJsonObject {
+                                                put("latencyMs", end - start)
+                                                put("previewFramesMeanwhile", frames.count { it in start..end })
+                                                put("image", "${img.width}x${img.height}")
+                                                put("activePhysicalId", jsonOf(result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)))
+                                                put("sensorPixelMode", jsonOf(physical.get(CaptureResult.SENSOR_PIXEL_MODE)))
+                                                put("exposureMs", jsonOf(physical.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.div(1e6)))
+                                                put("iso", jsonOf(physical.get(CaptureResult.SENSOR_SENSITIVITY)))
+                                                put("cropRegion", jsonOf(physical.get(CaptureResult.SCALER_CROP_REGION)))
+                                                put("lensShadingMap", jsonOf(physical.get(CaptureResult.STATISTICS_LENS_SHADING_CORRECTION_MAP)?.let { "${it.columnCount}x${it.rowCount}" }))
+                                                put("sameFrame", img.timestamp == physical.get(CaptureResult.SENSOR_TIMESTAMP))
+                                            }
+                                        }
+                                    })
+                                }
+                            } finally {
+                                session.close()
+                            }
+                        } finally {
+                            analysis?.close()
+                        }
+                    }
+                }
+            })
         }
     }
 

@@ -10,8 +10,11 @@ data class LensOptics(val id: String, val focalLength: Double, val sensorWidth: 
     val view: Double get() = sensorWidth / focalLength
 }
 
-/** A zoom stop: the ratio set on the logical camera, whether it is the separate ultrawide button, and the physical lens behind it (null: not known). */
-data class ZoomStop(val ratio: Double, val ultrawide: Boolean = false, val lens: String? = null)
+/**
+ * A zoom stop: the ratio set on the logical camera (as the zoom shows it), whether it is the separate ultrawide button, the physical lens behind it (null: not
+ * known), and [optical], the lens' own field of view over the main lens' (Pixel's tele: 5× shown, about 4.5 by the optics).
+ */
+data class ZoomStop(val ratio: Double, val ultrawide: Boolean = false, val lens: String? = null, val optical: Double = ratio)
 
 /** The zoom of one logical camera: its stops (native lenses only), and where the control ends. */
 data class ZoomScale(val stops: List<ZoomStop>, val min: Double, val max: Double, val end: Double) {
@@ -45,9 +48,9 @@ object ZoomStops {
             val ratio = main.view / lens.view
             val sameOptics = lenses.any { other -> other != lens && abs(other.focalLength / lens.focalLength - 1) < 0.01 && other.sensorWidth > lens.sensorWidth }
             when {
-                ratio < ULTRAWIDE_BELOW && !sameOptics && range.start < ULTRAWIDE_BELOW -> stops += ZoomStop(range.start, ultrawide = true, lens = lens.id)
-                sameOptics -> if (abs(lens.focalLength / main.focalLength - 1) < 0.01 && abs(ratio - 2) < 0.1 && range.endInclusive >= 2) stops += ZoomStop(2.0, lens = lens.id)
-                ratio > TELE_ABOVE -> stops += ZoomStop(teleStop(ratio).coerceAtMost(range.endInclusive), lens = lens.id)
+                ratio < ULTRAWIDE_BELOW && !sameOptics && range.start < ULTRAWIDE_BELOW -> stops += ZoomStop(range.start, ultrawide = true, lens = lens.id, optical = ratio)
+                sameOptics -> if (abs(lens.focalLength / main.focalLength - 1) < 0.01 && abs(ratio - 2) < 0.1 && range.endInclusive >= 2) stops += ZoomStop(2.0, lens = lens.id, optical = ratio)
+                ratio > TELE_ABOVE -> stops += ZoomStop(teleStop(ratio).coerceAtMost(range.endInclusive), lens = lens.id, optical = ratio)
             }
         }
         if (physical.isEmpty() && range.start < ULTRAWIDE_BELOW) stops += ZoomStop(range.start, ultrawide = true)

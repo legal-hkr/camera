@@ -11,12 +11,16 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.ParcelFileDescriptor
 import android.provider.MediaStore
+import android.system.Os
 import android.util.Log
 import android.util.Size
+import java.io.EOFException
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -26,6 +30,8 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import sh.hnet.camera.camera.MotionClip
+import sh.hnet.camera.camera.Raw50Shot
+import sh.hnet.camera.camera.RawShot
 import sh.hnet.camera.camera.VideoTarget
 import sh.hnet.camera.capabilities.model.PixelSize
 
@@ -34,6 +40,9 @@ object FileNames {
     private val stamp = DateTimeFormatter.ofPattern("yyyyMMdd_HHmmssSSS")
 
     fun photo(takenAt: Long, zone: ZoneId = ZoneId.systemDefault()) = "IMG_${stamp.format(Instant.ofEpochMilli(takenAt).atZone(zone))}.jpg"
+
+    /** A photo's DNG: the photo's own name with the raw format's extension. */
+    fun raw(takenAt: Long, zone: ZoneId = ZoneId.systemDefault()) = "IMG_${stamp.format(Instant.ofEpochMilli(takenAt).atZone(zone))}.dng"
 
     fun video(startedAt: Long, zone: ZoneId = ZoneId.systemDefault()) = "VID_${stamp.format(Instant.ofEpochMilli(startedAt).atZone(zone))}.mp4"
 
@@ -108,6 +117,91 @@ class MediaFiles(private val context: Context) {
             Log.w(TAG, "Photo not saved: ${e.javaClass.simpleName}")
             runCatching { resolver.delete(uri, null, null) }
             null
+        }
+    }
+
+    /**
+     * A photo's DNG next to it (LOGIKA §28), named as the photo; the writer is let go either way. Not in the thumbnail nor in the lock screen's review (the
+     * photo stands for the shot there); null when the storage refused it.
+     */
+    suspend fun saveRaw(raw: RawShot, takenAt: Long): Uri? = withContext(Dispatchers.IO) {
+        raw.use {
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, FileNames.raw(takenAt))
+                put(MediaStore.MediaColumns.MIME_TYPE, DNG_MIME)
+                put(MediaStore.MediaColumns.RELATIVE_PATH, CAMERA_DIR)
+                put(MediaStore.MediaColumns.DATE_TAKEN, takenAt)
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
+            }
+            val uri = runCatching { resolver.insert(MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), values) }.getOrNull() ?: return@withContext null
+            try {
+                resolver.openOutputStream(uri)!!.use { out -> it.write(out) }
+                // The photo's framing as the DNG's default crop; without it the whole sensor shows (the DNG is kept either way)
+                val cropped = runCatching { resolver.openFileDescriptor(uri, "rw")!!.use { file -> DngCrop.apply(FileAccess(file), it.zoom, it.aspect, it.cropShare) } }
+                    .onFailure { e -> Log.w(TAG, "DNG crop not written: ${e.javaClass.simpleName}") }.getOrDefault(false)
+                if (!cropped) Log.w(TAG, "DNG keeps the whole sensor's crop")
+                resolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
+                uri
+            } catch (e: CancellationException) {
+                runCatching { resolver.delete(uri, null, null) }
+                throw e
+            } catch (e: Throwable) {
+                // Out of memory too: the DNG goes, the app and the photos still being saved stay
+                Log.w(TAG, "DNG not saved: ${e.javaClass.simpleName}")
+                runCatching { resolver.delete(uri, null, null) }
+                null
+            }
+        }
+    }
+
+    /** Pro's 50 MP shot: its DNG alone (LOGIKA §30.6), named as a photo; null when it couldn't be written. [shown] puts it in the thumbnail after. */
+    suspend fun saveRaw50(shot: Raw50Shot, takenAt: Long): Uri? = withContext(Dispatchers.IO) {
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, FileNames.raw(takenAt))
+            put(MediaStore.MediaColumns.MIME_TYPE, DNG_MIME)
+            put(MediaStore.MediaColumns.RELATIVE_PATH, CAMERA_DIR)
+            put(MediaStore.MediaColumns.DATE_TAKEN, takenAt)
+            put(MediaStore.MediaColumns.IS_PENDING, 1)
+        }
+        val uri = runCatching { resolver.insert(MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), values) }.getOrNull() ?: return@withContext null
+        try {
+            resolver.openOutputStream(uri)!!.use { DngWriter.write(it, shot, takenAt) }
+            resolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
+        } catch (e: CancellationException) {
+            runCatching { resolver.delete(uri, null, null) }
+            throw e
+        } catch (e: Throwable) {
+            // Out of memory too: the shot goes, the app stays
+            Log.w(TAG, "50 MP DNG not saved: ${e.javaClass.simpleName}")
+            runCatching { resolver.delete(uri, null, null) }
+            return@withContext null
+        }
+        uri
+    }
+
+    /** A 50 MP DNG saved put in the thumbnail (its thumbnail made then, which takes a while). */
+    suspend fun showRaw50(uri: Uri, takenAt: Long) = show(uri, DNG_MIME, takenAt = takenAt)
+
+    /** A file's bytes read and written in place (the DNG's crop). */
+    private class FileAccess(private val file: ParcelFileDescriptor) : DngCrop.Access {
+        override fun read(position: Long, length: Int): ByteArray {
+            val bytes = ByteArray(length)
+            var done = 0
+            while (done < length) {
+                val n = Os.pread(file.fileDescriptor, bytes, done, length - done, position + done)
+                if (n <= 0) throw EOFException()
+                done += n
+            }
+            return bytes
+        }
+
+        override fun write(position: Long, bytes: ByteArray) {
+            var done = 0
+            while (done < bytes.size) {
+                val n = Os.pwrite(file.fileDescriptor, bytes, done, bytes.size - done, position + done)
+                if (n <= 0) throw EOFException()
+                done += n
+            }
         }
     }
 
@@ -236,12 +330,20 @@ class MediaFiles(private val context: Context) {
             putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS, arrayOf(MediaStore.Files.FileColumns.MEDIA_TYPE_IMAGE.toString(), MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO.toString()))
             // The SQL order: MediaStore ignored QUERY_ARG_SORT_DIRECTION and gave the oldest shot
             putString(ContentResolver.QUERY_ARG_SQL_SORT_ORDER, "${MediaStore.MediaColumns.DATE_TAKEN} DESC, ${MediaStore.MediaColumns._ID} DESC")
-            putInt(ContentResolver.QUERY_ARG_LIMIT, 1)
+            // Two: a DNG with its photo beside it (the same name) gives way to the photo (it stands for the shot, and is quick to show); a DNG alone (Pro's
+            // 50 MP) is the shot
+            putInt(ContentResolver.QUERY_ARG_LIMIT, 2)
         }
-        val projection = arrayOf(MediaStore.MediaColumns._ID, MediaStore.Files.FileColumns.MEDIA_TYPE, MediaStore.MediaColumns.MIME_TYPE, MediaStore.MediaColumns.DATE_TAKEN)
+        val projection = arrayOf(MediaStore.MediaColumns._ID, MediaStore.Files.FileColumns.MEDIA_TYPE, MediaStore.MediaColumns.MIME_TYPE, MediaStore.MediaColumns.DATE_TAKEN, MediaStore.MediaColumns.DISPLAY_NAME)
         val found = runCatching {
             resolver.query(MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL), projection, args, null)?.use { c ->
                 if (!c.moveToFirst()) return@use null
+                if (c.getString(2) == DNG_MIME) {
+                    // Its photo is the one of its own name (IMG_<stamp>.jpg beside IMG_<stamp>.dng)
+                    val stem = c.getString(4)?.substringBeforeLast('.')
+                    val photoBeside = c.moveToNext() && c.getString(2) != DNG_MIME && stem != null && c.getString(4)?.substringBeforeLast('.') == stem
+                    if (!photoBeside) c.moveToFirst()
+                }
                 val id = c.getLong(0)
                 val video = c.getInt(1) == MediaStore.Files.FileColumns.MEDIA_TYPE_VIDEO
                 val collection = if (video) MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL) else MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
@@ -316,6 +418,7 @@ class MediaFiles(private val context: Context) {
         const val SAVED_KEPT = 1000
         const val TAG = "MediaFiles"
         const val CAMERA_DIR = "DCIM/Camera"
+        const val DNG_MIME = "image/x-adobe-dng"
         /** The thumbnail is 52 dp; this covers it at up to 3.7× density. */
         const val THUMBNAIL_PX = 192
         const val ABANDONED_AFTER_S = 3600L

@@ -76,6 +76,7 @@
     <string name="tooltip_timer">Timer</string>
     <string name="tooltip_location">Location in photos</string>
     <string name="tooltip_hdr">HDR</string>
+    <string name="tooltip_raw">RAW (DNG)</string>
     <string name="tooltip_aspect_ratio">Aspect ratio</string>
     <string name="tooltip_video_quality">Resolution and frame rate</string>
     <string name="desc_state_flash_off">Flash – off</string>
@@ -86,6 +87,8 @@
     <string name="desc_state_location_off">Location – off</string>
     <string name="desc_state_hdr_on">HDR – on</string>
     <string name="desc_state_hdr_off">HDR – off</string>
+    <string name="desc_state_raw_on">RAW – on</string>
+    <string name="desc_state_raw_off">RAW – off</string>
     <string name="menu_flash_off">Off</string>
     <string name="menu_flash_auto">Auto</string>
     <string name="menu_flash_on">On</string>
@@ -230,6 +233,9 @@
     <string name="value_playback_time">%1$s / %2$s</string>
     <string name="msg_capture_not_saved">The shot couldn’t be handed over to the app.</string>
     <string name="msg_photo_lost">The camera didn’t return the photo, so it wasn’t saved. Take it again.</string>
+    <string name="msg_raw_unavailable">The camera can’t save a DNG file with the current settings.</string>
+    <string name="msg_raw_other_lens">This photo was taken with another lens, so no DNG file was saved.</string>
+    <string name="msg_hdr_unavailable">HDR isn’t available with this lens.</string>
     <string name="label_shortcut_selfie_short">Selfie</string>
     <string name="label_shortcut_selfie_long">Take a selfie</string>
     <string name="label_shortcut_video_short">Video</string>
@@ -284,6 +290,10 @@
     <string name="value_infinity">∞</string>
     <string name="value_focus_manual">Manual</string>
     <string name="label_panel_histogram">Histogram</string>
+    <string name="label_panel_raw">RAW (DNG)</string>
+    <string name="value_raw">RAW</string>
+    <string name="label_50mp">50 MP</string>
+    <string name="menu_raw_50mp">50 MP (DNG)</string>
     <string name="tooltip_focus_peaking">Focus peaking</string>
     <string name="button_undo">Undo</string>
     <string name="value_shutter_fraction">1/%1$d s</string>

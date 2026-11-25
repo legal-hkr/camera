@@ -75,6 +75,7 @@
     <string name="tooltip_timer">Samowyzwalacz</string>
     <string name="tooltip_location">Lokalizacja</string>
     <string name="tooltip_hdr">HDR</string>
+    <string name="tooltip_raw">RAW (DNG)</string>
     <string name="tooltip_aspect_ratio">Proporcje obrazu</string>
     <string name="tooltip_video_quality">Rozdzielczość i liczba klatek</string>
     <string name="desc_state_flash_off">Lampa – wyłączona</string>
@@ -85,6 +86,8 @@
     <string name="desc_state_location_off">Lokalizacja – wyłączona</string>
     <string name="desc_state_hdr_on">HDR – włączony</string>
     <string name="desc_state_hdr_off">HDR – wyłączony</string>
+    <string name="desc_state_raw_on">RAW – włączony</string>
+    <string name="desc_state_raw_off">RAW – wyłączony</string>
     <string name="menu_flash_off">Wyłączona</string>
     <string name="menu_flash_auto">Automatycznie</string>
     <string name="menu_flash_on">Włączona</string>
@@ -229,6 +232,9 @@
     <string name="value_playback_time">%1$s / %2$s</string>
     <string name="msg_capture_not_saved">Nie udało się przekazać ujęcia aplikacji.</string>
     <string name="msg_photo_lost">Aparat nie przekazał zdjęcia, więc nie zostało zapisane. Zrób je ponownie.</string>
+    <string name="msg_raw_unavailable">Przy obecnych ustawieniach aparat nie może zapisać pliku DNG.</string>
+    <string name="msg_raw_other_lens">Zdjęcie zostało zrobione innym obiektywem, więc nie zapisano pliku DNG.</string>
+    <string name="msg_hdr_unavailable">HDR nie jest dostępny dla tego obiektywu.</string>
     <string name="label_shortcut_selfie_short">Selfie</string>
     <string name="label_shortcut_selfie_long">Zrób selfie</string>
     <string name="label_shortcut_video_short">Wideo</string>
@@ -285,6 +291,10 @@
     <string name="value_infinity">∞</string>
     <string name="value_focus_manual">Ręcznie</string>
     <string name="label_panel_histogram">Histogram</string>
+    <string name="label_panel_raw">RAW (DNG)</string>
+    <string name="value_raw">RAW</string>
+    <string name="label_50mp">50 MP</string>
+    <string name="menu_raw_50mp">50 MP (DNG)</string>
     <string name="tooltip_focus_peaking">Podświetlanie ostrości</string>
     <string name="button_undo">Cofnij</string>
     <string name="value_shutter_fraction">1/%1$d s</string>

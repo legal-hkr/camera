@@ -86,7 +86,8 @@ fun ZoomRow(
     zoom: Double,
     rulerOpen: Boolean,
     onRulerOpen: (Boolean) -> Unit,
-    onZoom: (Double) -> Unit,
+    /** A zoom value, and whether it is a jump (a stop tapped) rather than a slide. */
+    onZoom: (Double, Boolean) -> Unit,
     onQuickSettings: () -> Unit,
     quickSettingsOpen: Boolean,
     modifier: Modifier = Modifier,
@@ -167,7 +168,7 @@ fun ZoomRow(
                                 else if (stop == null && floor(next) != floor(shown) && next >= 1) haptics.step()
                                 if (next >= end && shown < end) haptics.end()
                                 shown = next
-                                onZoom(next)
+                                onZoom(next, false)
                             }
                             change.consume()
                         }
@@ -187,7 +188,7 @@ fun ZoomRow(
                             val label = if (selected) stringResource(R.string.value_zoom, numbers.zoom(wide.ratio)) else numbers.zoom(wide.ratio)
                             ZoomPill(label, selected, stringResource(R.string.tooltip_ultrawide), Modifier.height(44.dp).defaultMinSize(minWidth = 44.dp).controlSurface(CircleShape, controlColor()), turn) {
                                 haptics.detent()
-                                onZoom(wide.ratio)
+                                onZoom(wide.ratio, true)
                             }
                         }
                         Row(
@@ -209,7 +210,7 @@ fun ZoomRow(
                                 val label = if (current) stringResource(R.string.value_zoom, numbers.zoom(zoom)) else numbers.zoom(stop.ratio)
                                 ZoomPill(label, current, label, Modifier.height(36.dp).defaultMinSize(minWidth = 36.dp), turn) {
                                     haptics.detent()
-                                    onZoom(stop.ratio)
+                                    onZoom(stop.ratio, true)
                                 }
                             }
                         }

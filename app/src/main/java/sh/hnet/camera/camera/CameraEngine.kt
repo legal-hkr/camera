@@ -11,6 +11,7 @@ import android.graphics.Matrix
 import android.hardware.HardwareBuffer
 import android.hardware.camera2.CameraAccessException
 import android.hardware.camera2.CameraCaptureSession
+import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraExtensionCharacteristics
 import android.hardware.camera2.CameraExtensionSession
@@ -19,6 +20,7 @@ import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureFailure
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
+import android.hardware.camera2.DngCreator
 import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.params.ColorSpaceTransform
 import android.hardware.camera2.params.DynamicRangeProfiles
@@ -42,6 +44,8 @@ import android.view.Surface
 import androidx.annotation.RequiresApi
 import androidx.exifinterface.media.ExifInterface
 import java.io.ByteArrayInputStream
+import java.io.OutputStream
+import java.nio.ByteBuffer
 import java.util.concurrent.Executor
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
@@ -72,6 +76,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import sh.hnet.camera.capabilities.CameraCatalog
 import sh.hnet.camera.capabilities.CameraSpec
+import sh.hnet.camera.capabilities.fiftyMp
 import sh.hnet.camera.capabilities.model.Aspect
 import sh.hnet.camera.capabilities.model.Exposure
 import sh.hnet.camera.capabilities.model.ManualWhiteBalance
@@ -92,7 +97,21 @@ import sh.hnet.camera.capabilities.model.WhiteBalance
 enum class Mode { PHOTO, VIDEO, NIGHT, PRO }
 
 /** What the viewfinder wants: which camera, in which mode and aspect ratio. */
-data class CameraRequest(val camera: CameraSpec, val mode: Mode, val aspect: Aspect, val video: VideoChoice = VideoChoice(), val ultraHdr: Boolean = true, val motion: Boolean = false, val motionFirst: Boolean = false) {
+data class CameraRequest(
+    val camera: CameraSpec,
+    val mode: Mode,
+    val aspect: Aspect,
+    val video: VideoChoice = VideoChoice(),
+    val ultraHdr: Boolean = true,
+    val motion: Boolean = false,
+    val motionFirst: Boolean = false,
+    /** The raw sensor image (DNG) next to each photo (Photo and Pro). */
+    val raw: Boolean = false,
+    /** The physical lens whose raw image it is (the zoom's stop's; a session holds one lens' raw stream), null: the logical camera's. */
+    val rawLens: String? = null,
+    /** Pro's 50 MP: the main lens' maximum-resolution raw image alone, as a DNG (D4, D18). */
+    val raw50: Boolean = false,
+) {
     /** The aspect the preview and the session use: video is always 16:9. */
     val pictureAspect: Aspect get() = if (mode == Mode.VIDEO) Aspect.SIXTEEN_NINE else aspect
 }
@@ -129,6 +148,10 @@ data class EngineState(
     val analysis: Boolean = false,
     /** The session keeps the motion photo's last seconds. */
     val motion: Boolean = false,
+    /** The session has the raw stream: a photo gets its DNG. */
+    val raw: Boolean = false,
+    /** The session has the 50 MP raw stream: a shot is that DNG alone. */
+    val raw50: Boolean = false,
     /** A recording is being finished and saved: the shutter waits for it. */
     val finishing: Boolean = false,
     /** A frame of the current session has been shown (the viewfinder's crossfade ends then). */
@@ -186,7 +209,58 @@ class CapturedPhoto(
     val orientation: Int,
     /** A time set by hand longer than the camera's EXIF holds (the Pixel writes 4.29 s for 16 s): the one taken, for the file. */
     val longExposureNs: Long? = null,
+    /** The photo's raw image for its DNG (Photo and Pro with RAW on); null without it. */
+    val raw: RawShot? = null,
+    /** The DNG was asked for, but the camera took the photo with another lens than the raw stream's: none. */
+    val rawOtherLens: Boolean = false,
+    /** Pro's 50 MP shot: this DNG is the shot ([bytes] empty, no photo beside it). */
+    val raw50: Raw50Shot? = null,
 )
+
+/**
+ * A 50 MP raw image (RAW10 as the camera packs it, quad Bayer on the Pixel) with the lens' characteristics and the shot's result: the DNG is made from it when
+ * saved ([sh.hnet.camera.media.DngWriter]: rearranged to Bayer, the lens shading as gain maps, orientation, place, the photo's aspect as its crop).
+ */
+class Raw50Shot(
+    val packed: ByteBuffer,
+    val width: Int,
+    val height: Int,
+    val characteristics: CameraCharacteristics,
+    val result: CaptureResult,
+    val exifOrientation: Int,
+    val location: Location?,
+    val aspect: Double,
+)
+
+/**
+ * A photo's raw image with the camera's metadata, written as a DNG when the photo is saved ([DngCreator]: orientation, place, the lens shading map); [close]
+ * lets the writer go, once written or when the photo isn't kept.
+ */
+class RawShot internal constructor(
+    private val creator: DngCreator,
+    private val size: PixelSize,
+    pixels: ByteArray,
+    /**
+     * The photo's framing in the raw image, written as the DNG's default crop: the lens' own crop as shares of its active array where its result gives one,
+     * else the zoom over the lens' field of view; then the aspect's long side over its short one.
+     */
+    val zoom: Double,
+    val aspect: Double,
+    val cropShare: DoubleArray? = null,
+) : AutoCloseable {
+    /** The 25 MB or so of pixels, let go with the writer (the photo itself may be held a while longer, for its motion video or a late place). */
+    private var pixels: ByteArray? = pixels
+
+    fun write(out: OutputStream) {
+        val data = pixels ?: error("DNG already written or let go")
+        creator.writeByteBuffer(out, Size(size.width, size.height), ByteBuffer.wrap(data), 0)
+    }
+
+    override fun close() {
+        pixels = null
+        creator.close()
+    }
+}
 
 /**
  * The app's camera (LOGIKA §1, §2): one device and one session at a time on a thread of its own. The viewfinder says what it wants (camera, mode, aspect, preview
@@ -231,6 +305,14 @@ class CameraEngine(context: Context) {
     private var session: CameraCaptureSession? = null
     private var sessionKey: Desired? = null
     private var still: StillOutput? = null
+    /** The session's raw stream (Photo and Pro with the DNG asked for), and Pro's 50 MP one. */
+    private var rawOutput: ImageOutput? = null
+    private var raw50Output: ImageOutput? = null
+    /** The physical lens the camera streams from now (the newest result's; null before this session's first), and whether the session has had a result yet. */
+    @Volatile
+    var activeLens: String? = null
+        private set
+    private var resultSeen = false
     private var recorder: VideoRecorder? = null
     /** Written on the camera thread, read on the analysis thread: frames of a session that is going aren't handed on. */
     @Volatile
@@ -309,7 +391,16 @@ class CameraEngine(context: Context) {
         video = if (request.mode == Mode.VIDEO) request.video else VideoChoice(),
         motion = request.mode == Mode.PHOTO && request.motion,
         motionFirst = request.mode == Mode.PHOTO && request.motionFirst,
+        raw = (request.mode == Mode.PHOTO || request.mode == Mode.PRO) && request.raw && request.camera.raw != null,
+        rawLens = request.rawLens.takeIf { (request.mode == Mode.PHOTO || request.mode == Mode.PRO) && request.raw && it in request.camera.rawLenses },
+        raw50 = request.mode == Mode.PRO && request.raw50 && request.camera.fiftyMp,
     )
+
+    /** The raw stream a request's session has: its size, and the physical lens it is asked of (null: the logical camera's). */
+    private fun rawStream(request: CameraRequest): Pair<PixelSize, String?>? {
+        val lens = request.rawLens?.takeIf { it in request.camera.rawLenses }
+        return lens?.let { request.camera.rawLenses.getValue(it) to it } ?: request.camera.raw?.let { it to null }
+    }
 
     /** The session there is the one wanted now (not one about to be replaced). */
     private fun sessionSettled() = (session != null || nightSession != null) && sessionKey?.shape() == desired.value.shape()
@@ -517,6 +608,8 @@ class CameraEngine(context: Context) {
         val output = still ?: return null
         val request = desired.value.request ?: return null
         val device = device ?: return null
+        // Pro's 50 MP: the maximum-resolution raw image alone
+        raw50Output?.takeIf { request.mode == Mode.PRO && request.raw50 }?.let { return shoot50(it, session, device, request, deviceRotation, location, onShutter) }
         // The flash meters first: always when on, when auto only if the exposure says the flash is needed (daylight shots stay quick, from the buffer)
         // With the exposure set by hand the flash fires as it is, without metering
         val manual = manualExposure(request)
@@ -538,7 +631,14 @@ class CameraEngine(context: Context) {
         // still may come from an earlier frame (ZSL), whose time would go back in the video
         // Nor with the exposure set by hand: the buffer's frames have the preview's (shorter) one
         // Nor for a moment after Pro's focus or white balance changed: the buffer's frames are from before
-        val zsl = request.camera.zsl && !video && !metered && manual == null && SystemClock.uptimeMillis() - lookChangedAt > LOOK_SETTLE_MS
+        // Nor with the DNG: the buffer's still and the raw image might be of different frames. A lens' raw stream gives an image only while the camera takes
+        // the picture with that lens: when it took another one by itself (macro, a near subject at the tele's stop) the photo goes without its DNG
+        // Right after a new session its first result may not be in yet: the lens it streams from is waited for a moment (a camera that doesn't report one,
+        // results in and still none, gets the raw target anyway: a lens not streaming only loses that buffer)
+        if (rawOutput?.lens != null && !video && !resultSeen) withTimeoutOrNull(FIRST_RESULT_MS) { while (!resultSeen) delay(SETTLE_POLL_MS) }
+        val rawOut = rawOutput?.takeIf { !video && (it.lens == null || activeLens == null || it.lens == activeLens) }
+        val rawOtherLens = rawOutput != null && !video && rawOut == null
+        val zsl = request.camera.zsl && !video && !metered && manual == null && rawOut == null && SystemClock.uptimeMillis() - lookChangedAt > LOOK_SETTLE_MS
         if (_state.value.range == PictureRange.SDR && !zsl) motion?.let { builder.addTarget(it.surface) }
         applyControls(builder, request, still = true)
         // The Pixel makes a JPEG still of the still-capture intent by its own processing, which ignores an exposure set by hand (4 s and 1/4 s alike, the
@@ -546,17 +646,27 @@ class CameraEngine(context: Context) {
         if (manual != null && output.format == StillFormat.JPEG) builder.set(CaptureRequest.CONTROL_CAPTURE_INTENT, CameraMetadata.CONTROL_CAPTURE_INTENT_MANUAL)
         // Set either way: the still template may turn the buffer on by itself, and a flash photo must not come from it
         if (request.camera.zsl) builder.set(CaptureRequest.CONTROL_ENABLE_ZSL, zsl)
+        // The raw image of the same frame, with the lens shading map where the camera gives it (the DNG's vignetting correction)
+        rawOut?.let {
+            builder.addTarget(it.reader.surface)
+            if (request.camera.rawShading) builder.set(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE, CameraMetadata.STATISTICS_LENS_SHADING_MAP_MODE_ON)
+        }
         location?.let { builder.set(CaptureRequest.JPEG_GPS_LOCATION, it) }
         val orientation = Orientation.jpeg(request.camera.sensorOrientation, deviceRotation, request.camera.front)
         builder.set(CaptureRequest.JPEG_ORIENTATION, orientation)
         val motionSource = motion
         builder.set(CaptureRequest.JPEG_QUALITY, JPEG_QUALITY)
+        // The zoom the photo is taken at (the DNG's framing when its lens' result gives no crop)
+        val shotZoom = controls.zoom
         output.drain()
+        rawOut?.drain()
         val takenAt = System.currentTimeMillis()
         var startedAt = 0L
         var takenExposureNs: Long? = null
         val started = CompletableDeferred<Unit>()
         val failed = CompletableDeferred<Unit>()
+        val completed = CompletableDeferred<TotalCaptureResult?>()
+        val rawLost = CompletableDeferred<Unit>()
         val realtime = request.camera.sensorRealtime
         session.capture(builder.build(), object : CameraCaptureSession.CaptureCallback() {
             override fun onCaptureStarted(session: CameraCaptureSession, request: CaptureRequest, timestamp: Long, frameNumber: Long) {
@@ -569,16 +679,19 @@ class CameraEngine(context: Context) {
 
             override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
                 takenExposureNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME)
+                completed.complete(result)
             }
 
             override fun onCaptureFailed(session: CameraCaptureSession, request: CaptureRequest, failure: CaptureFailure) {
-                // The image may still come (its metadata failed, not the picture)
+                // The image may still come (its metadata failed, not the picture); without the metadata no DNG can be written
                 if (!failure.wasImageCaptured()) failed.complete(Unit)
+                completed.complete(null)
             }
 
             override fun onCaptureBufferLost(session: CameraCaptureSession, request: CaptureRequest, target: Surface, frameNumber: Long) {
-                // Only the still's own buffer matters; the motion video's encoder may drop one
+                // Only the still's own buffer matters; the motion video's encoder may drop one; without its raw image the photo has no DNG
                 if (target == output.reader.surface) failed.complete(Unit)
+                if (target == rawOut?.reader?.surface) rawLost.complete(Unit)
             }
 
             // Aborted before it started (the session going): no start, no failure would ever come
@@ -615,8 +728,179 @@ class CameraEngine(context: Context) {
         val bytes = image.use { it.compressedBytes() }
         // The camera's EXIF holds the time in 32 bits of nanoseconds; a longer one set by hand is written by the app: the result's when it came before the image
         val longExposureNs = manual?.timeNs?.takeIf { it > EXIF_MAX_EXPOSURE_NS }?.let { takenExposureNs ?: it }
-        return CapturedPhoto(bytes, output.format, cropFor(output.plan.capture, request), takenAt, if (startedAt != 0L) startedAt else image.timestamp, motionSource, orientation, longExposureNs)
+        // The photo's framing within the lens' raw image when the lens' result has no crop: the zoom over the lens' own field of view (its optics, not the
+        // stop's label: the Pixel's tele is about 4.5× shown as 5×)
+        val rawZoom = shotZoom / (rawOut?.lens?.let { lens -> request.camera.zoom.stops.firstOrNull { it.lens == lens }?.optical } ?: 1.0)
+        val raw = rawOut?.let { rawShot(it, completed, rawLost, request, orientation, location, rawZoom) }
+        return CapturedPhoto(bytes, output.format, cropFor(output.plan.capture, request), takenAt, if (startedAt != 0L) startedAt else image.timestamp, motionSource, orientation, longExposureNs, raw, rawOtherLens)
     }
+
+    /**
+     * The photo's DNG (LOGIKA §28): this capture's raw image (not one from before it started) and its result, waited for a little after the photo; null when
+     * either doesn't come – the photo is kept without it.
+     */
+    private suspend fun rawShot(out: ImageOutput, completed: Deferred<TotalCaptureResult?>, lost: Deferred<Unit>, request: CameraRequest, orientation: Int, location: Location?, zoom: Double): RawShot? {
+        // A lens' raw image is described by that lens: its own characteristics (color filter layout, matrices, size) and its own result
+        val lens = out.lens
+        val taken = withTimeoutOrNull(RAW_WAIT_MS) {
+            val total = completed.await() ?: return@withTimeoutOrNull null
+            val result = (if (lens != null) total.physicalCameraTotalResults[lens] else total) ?: return@withTimeoutOrNull null
+            // The raw image of that very frame: older ones are an earlier shot's, a newer one means this one's was lost
+            val frame = result.get(CaptureResult.SENSOR_TIMESTAMP) ?: return@withTimeoutOrNull null
+            var found: StillImage? = null
+            while (found == null) {
+                val next = select<StillImage?> {
+                    out.images.onReceiveCatching { it.getOrNull() }
+                    lost.onAwait { null }
+                } ?: return@withTimeoutOrNull null
+                when {
+                    next.timestamp < frame -> next.close()
+                    next.timestamp > frame -> {
+                        next.close()
+                        return@withTimeoutOrNull null
+                    }
+                    else -> found = next
+                }
+            }
+            found to result
+        }
+        if (taken == null) {
+            Log.w(TAG, "No raw image for the photo")
+            return null
+        }
+        val (image, result) = taken
+        return image.use {
+            runCatching {
+                val chars = characteristicsOf(lens ?: request.camera.id) ?: error("no characteristics")
+                val (size, pixels) = it.rawPixels()
+                val creator = DngCreator(chars, result)
+                try {
+                    creator.setOrientation(exifOrientation(orientation))
+                    location?.let { place -> creator.setLocation(place) }
+                } catch (e: Exception) {
+                    creator.close()
+                    throw e
+                }
+                RawShot(creator, size, pixels, zoom, request.pictureAspect.ratio.let { r -> maxOf(r, 1 / r) }, cropShare(chars, result))
+            }.onFailure { e -> Log.w(TAG, "DNG not prepared: ${e.javaClass.simpleName}") }.getOrNull()
+        }
+    }
+
+    /**
+     * The crop the lens' result says it took for the photo, as shares of its active array (left, top, right, bottom): the zoom on that lens and where the
+     * camera aligned it with the others; null when it gives none, or the whole array.
+     */
+    private fun cropShare(chars: CameraCharacteristics, result: CaptureResult): DoubleArray? {
+        val active = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return null
+        val crop = result.get(CaptureResult.SCALER_CROP_REGION) ?: return null
+        if (crop.width() <= 0 || crop.height() <= 0 || active.width() <= 0 || active.height() <= 0) return null
+        val share = doubleArrayOf(
+            (crop.left - active.left).toDouble() / active.width(),
+            (crop.top - active.top).toDouble() / active.height(),
+            (crop.right - active.left).toDouble() / active.width(),
+            (crop.bottom - active.top).toDouble() / active.height(),
+        )
+        // Outside the array (another lens' coordinates, a maximum-resolution crop): not to be trusted
+        if (share.any { it < -0.01 || it > 1.01 }) return null
+        return share.takeIf { it[2] - it[0] < 0.999 || it[3] - it[1] < 0.999 }
+    }
+
+    /**
+     * A 50 MP shot (LOGIKA §30.6): one request for the maximum-resolution raw image only, at the main lens' whole sensor (zoom 1×), with the lens shading map;
+     * its bytes copied out at once (the reader's one buffer back), the DNG made when saved. Its start told as a photo's (the click, a long time's countdown).
+     */
+    private suspend fun shoot50(out: ImageOutput, session: CameraCaptureSession, device: CameraDevice, request: CameraRequest, deviceRotation: Int, location: Location?, onShutter: (ShotStart) -> Unit): CapturedPhoto? {
+        val manual = manualExposure(request)
+        val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+        builder.addTarget(out.reader.surface)
+        applyControls(builder, request, still = true)
+        // No flash (offered nowhere at 50 MP: one maximum-resolution frame isn't metered for it), and no regions: theirs are in the normal array's
+        // coordinates, not the maximum-resolution one's
+        builder.set(CaptureRequest.FLASH_MODE, CameraMetadata.FLASH_MODE_OFF)
+        if (manual == null) builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
+        builder.set(CaptureRequest.CONTROL_AE_REGIONS, null)
+        builder.set(CaptureRequest.CONTROL_AF_REGIONS, null)
+        builder.set(CaptureRequest.CONTROL_AWB_REGIONS, null)
+        builder.set(CaptureRequest.SENSOR_PIXEL_MODE, CameraMetadata.SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION)
+        builder.set(CaptureRequest.CONTROL_ZOOM_RATIO, 1f)
+        if (manual != null) builder.set(CaptureRequest.CONTROL_CAPTURE_INTENT, CameraMetadata.CONTROL_CAPTURE_INTENT_MANUAL)
+        if (request.camera.zsl) builder.set(CaptureRequest.CONTROL_ENABLE_ZSL, false)
+        if (request.camera.rawShading) builder.set(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE, CameraMetadata.STATISTICS_LENS_SHADING_MAP_MODE_ON)
+        val orientation = Orientation.jpeg(request.camera.sensorOrientation, deviceRotation, request.camera.front)
+        out.drain()
+        val takenAt = System.currentTimeMillis()
+        var startedAt = 0L
+        val completed = CompletableDeferred<TotalCaptureResult?>()
+        val failed = CompletableDeferred<Unit>()
+        val realtime = request.camera.sensorRealtime
+        session.capture(builder.build(), object : CameraCaptureSession.CaptureCallback() {
+            override fun onCaptureStarted(session: CameraCaptureSession, request: CaptureRequest, timestamp: Long, frameNumber: Long) {
+                startedAt = timestamp
+                val ago = (if (realtime) SystemClock.elapsedRealtimeNanos() else System.nanoTime()) - timestamp
+                onShutter(ShotStart(SystemClock.uptimeMillis() - (ago / 1_000_000).coerceAtLeast(0), manual?.timeNs))
+            }
+
+            override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+                completed.complete(result)
+            }
+
+            override fun onCaptureFailed(session: CameraCaptureSession, request: CaptureRequest, failure: CaptureFailure) {
+                completed.complete(null)
+                if (!failure.wasImageCaptured()) failed.complete(Unit)
+            }
+
+            override fun onCaptureBufferLost(session: CameraCaptureSession, request: CaptureRequest, target: Surface, frameNumber: Long) {
+                failed.complete(Unit)
+            }
+
+            override fun onCaptureSequenceAborted(session: CameraCaptureSession, sequenceId: Int) {
+                completed.complete(null)
+                failed.complete(Unit)
+            }
+        }, handler)
+        manual?.let { onShutter(ShotStart(SystemClock.uptimeMillis(), it.timeNs, measured = false)) }
+        val taken = withTimeoutOrNull(captureTimeoutMs) {
+            // Its result first (the frame's time and the metadata the DNG needs), then the image of that very frame
+            val result = select<TotalCaptureResult?> {
+                completed.onAwait { it }
+                failed.onAwait { null }
+            } ?: return@withTimeoutOrNull null
+            val frame = result.get(CaptureResult.SENSOR_TIMESTAMP) ?: return@withTimeoutOrNull null
+            var found: StillImage? = null
+            while (found == null) {
+                val next = select<StillImage?> {
+                    out.images.onReceiveCatching { it.getOrNull() }
+                    failed.onAwait { null }
+                } ?: return@withTimeoutOrNull null
+                when {
+                    next.timestamp < frame -> next.close()
+                    next.timestamp > frame -> {
+                        next.close()
+                        return@withTimeoutOrNull null
+                    }
+                    else -> found = next
+                }
+            }
+            found to result
+        } ?: return null
+        val (image, total) = taken
+        val shot = image.use {
+            runCatching {
+                // The lens that took it describes it, where its maximum-resolution array is the image's size (else the logical camera's, if that one is)
+                fun fits(chars: CameraCharacteristics) = chars.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE_MAXIMUM_RESOLUTION)?.let { a -> a.width == it.width && a.height == it.height } == true
+                val lens = total.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)?.takeIf { id -> characteristicsOf(id)?.let(::fits) == true }
+                val chars = lens?.let { id -> characteristicsOf(id) } ?: characteristicsOf(request.camera.id)?.takeIf(::fits) ?: error("no characteristics of the image's size")
+                val result = lens?.let { id -> total.physicalCameraTotalResults[id] } ?: total
+                Raw50Shot(it.packedPlane(), it.width, it.height, chars, result, exifOrientation(orientation), location, request.pictureAspect.ratio.let { r -> maxOf(r, 1 / r) })
+            }.onFailure { e -> Log.w(TAG, "50 MP image not kept: ${e.javaClass.simpleName}") }.getOrNull()
+        } ?: return null
+        return CapturedPhoto(ByteArray(0), still?.format ?: StillFormat.JPEG, null, takenAt, total.get(CaptureResult.SENSOR_TIMESTAMP) ?: startedAt, null, orientation, raw50 = shot)
+    }
+
+    /** Characteristics read once per camera id (a binder call each). */
+    private val characteristics = mutableMapOf<String, CameraCharacteristics>()
+
+    private fun characteristicsOf(id: String): CameraCharacteristics? = characteristics[id] ?: runCatching { manager.getCameraCharacteristics(id) }.getOrNull()?.also { characteristics[id] = it }
 
     /** The burst under way: its stills' orientation and place, and the stop (touched on the camera thread only). */
     private class Bursting(val orientation: Int, val location: Location?, val done: CompletableDeferred<Unit>) {
@@ -828,7 +1112,8 @@ class CameraEngine(context: Context) {
         while (true) {
             val before = Triple(capture, clipping.get(), nightInFlight.get())
             if (before.first == null && before.second == 0 && before.third == 0) break
-            capture?.let { inFlight -> withTimeoutOrNull(captureTimeoutMs) { inFlight.await() } }
+            // The photo's DNG may come a little after it
+            capture?.let { inFlight -> withTimeoutOrNull(captureTimeoutMs + RAW_WAIT_MS) { inFlight.await() } }
             if (clipping.get() > 0) withTimeoutOrNull(CLIP_WAIT_MS) { while (clipping.get() > 0) delay(SETTLE_POLL_MS) }
             val night = nightInFlight.get()
             if (night > 0) withTimeoutOrNull(NIGHT_TIMEOUT_MS) { while (nightInFlight.get() >= night) delay(SETTLE_POLL_MS) }
@@ -931,12 +1216,24 @@ class CameraEngine(context: Context) {
     }
 
     /** One rung of a ladder: the range, the still stream (none in a video session without photos) and the video stream (Video mode). */
-    private data class Rung(val range: PictureRange, val still: StillFormat?, val video: VideoFormat?, val analysis: Boolean = false, val motion: Boolean = false)
+    private data class Rung(val range: PictureRange, val still: StillFormat?, val video: VideoFormat?, val analysis: Boolean = false, val motion: Boolean = false, val raw: Boolean = false, val raw50: Boolean = false)
 
     private fun rungs(request: CameraRequest): List<Rung> {
         val spec = request.camera
         return when (request.mode) {
-            Mode.PHOTO, Mode.PRO -> SessionLadder.photo(spec.hlg, spec.jpegR.isNotEmpty(), wantMotion = request.motion, wantAnalysis = true, wantUltraHdr = request.ultraHdr, motionFirst = request.motionFirst).map { Rung(it.range, it.still, null, it.analysis, it.motion) }
+            Mode.PHOTO, Mode.PRO -> {
+                val photo = SessionLadder.photo(spec.hlg, spec.jpegR.isNotEmpty(), wantMotion = request.motion, wantAnalysis = true, wantUltraHdr = request.ultraHdr, motionFirst = request.motionFirst)
+                    .map { Rung(it.range, it.still, null, it.analysis, it.motion) }
+                // The DNG asked for: each rung first with the raw stream, then without it (the photo, its range and Pro's analysis stream before the DNG;
+                // the viewfinder says when the session came without it)
+                when {
+                    // 50 MP: every rung with the maximum-resolution raw stream before any without it (the shot is that raw image alone; the rest only
+                    // serves the preview)
+                    request.mode == Mode.PRO && request.raw50 && spec.fiftyMp -> photo.map { it.copy(raw50 = true) } + photo
+                    request.raw && spec.raw != null -> photo.flatMap { listOf(it.copy(raw = true), it) }
+                    else -> photo
+                }
+            }
             Mode.VIDEO -> {
                 // AVC only where chosen (Settings › Video) or HEVC is missing; HLG is always HEVC
                 val hevc = request.video.hevc && Encoders.hevc()
@@ -974,15 +1271,26 @@ class CameraEngine(context: Context) {
             if (rung.still != null && stillPlan == null) continue
             val format = if (rung.still == StillFormat.JPEG_R) ImageFormat.JPEG_R else ImageFormat.JPEG
             val last = index == rungs.lastIndex
-            if (!last && spec.sessionQueries && Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM && supported(spec.id, request, previewSize, rung, stillPlan, format) == false) continue
+            val confirmed = if (spec.sessionQueries && Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) supported(spec.id, request, previewSize, rung, stillPlan, format) else null
+            if (!last && confirmed == false) continue
+            // A lens' own raw stream and the maximum-resolution mode only as the camera confirms them (CLAUDE.md, session safety: a refused physical or
+            // maximum-resolution stream may restart the camera service)
+            if (rung.raw && rawStream(request)?.second != null && confirmed != true) continue
+            if (rung.raw50 && confirmed != true) continue
             // A rung with the analysis stream needs a size for it; without one the next rung (without analysis) is tried
             val analysisSize = if (rung.analysis) analysisSize(spec, rung.range) ?: continue else null
             var output: StillOutput? = null
             var video: VideoRecorder? = null
             var analysis: AnalysisOutput? = null
             var motion: MotionBuffer? = null
+            var raw: ImageOutput? = null
+            var raw50: ImageOutput? = null
             val made = try {
                 output = stillPlan?.let { StillOutput(it, rung.still, format) }
+                val rawStream = rawStream(request)?.takeIf { rung.raw }
+                raw = rawStream?.let { (size, lens) -> ImageOutput(size.width, size.height, ImageFormat.RAW_SENSOR, RAW_BUFFERS, lens) }
+                // One 50 MP buffer (about 60 MB): its bytes are copied out at once, the buffer back for the next shot
+                raw50 = spec.raw50?.takeIf { rung.raw50 }?.let { ImageOutput(it.width, it.height, ImageFormat.RAW10, 1) }
                 video = rung.video?.let { VideoRecorder(it, audio, scope) }
                 analysis = analysisSize?.let { AnalysisOutput(it, rung.range == PictureRange.HLG, spec) }
                 motion = if (rung.motion) MotionBuffer(previewSize, rung.range == PictureRange.HLG, appContext.cacheDir) else null
@@ -996,12 +1304,16 @@ class CameraEngine(context: Context) {
                     analysis?.let { OutputConfiguration(it.reader.surface).apply { dynamicRangeProfile = profile } },
                     // The motion photo's frames in the sensor's clock, as the photo's own timestamp
                     motion?.let { OutputConfiguration(it.surface).apply { dynamicRangeProfile = profile; timestampBase = OutputConfiguration.TIMESTAMP_BASE_SENSOR } },
+                    raw?.let { OutputConfiguration(it.reader.surface).apply { it.lens?.let { lens -> setPhysicalCameraId(lens) } } },
+                    raw50?.let { OutputConfiguration(it.reader.surface).apply { addSensorPixelModeUsed(CameraMetadata.SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION) } },
                 )
                 val closeOutputs: () -> Unit = {
                     output?.close()
                     video?.release()
                     analysis?.close()
                     motion?.release()
+                    raw?.close()
+                    raw50?.close()
                 }
                 configure(device, sessionParameters(device.createCaptureRequest(template(request)), request, rung.video), outputs, closeOutputs)
             } catch (e: Exception) {
@@ -1014,6 +1326,8 @@ class CameraEngine(context: Context) {
                 video?.release()
                 analysis?.close()
                 motion?.release()
+                raw?.close()
+                raw50?.close()
                 continue
             }
             // The world may have moved while the session was being made: the device lost, another request or surface wanted (only the aspect of a square cut
@@ -1024,12 +1338,14 @@ class CameraEngine(context: Context) {
             }
             session = made
             still = output
+            rawOutput = raw
+            raw50Output = raw50
             recorder = video
             analyzing = analysis
             this.motion = motion
             previewSurface = surface
             controls = controls.copy(zoom = controls.zoom.coerceIn(spec.zoom.min, spec.zoom.max))
-            _state.update { EngineState(CameraStatus.Ready, request, rung.range, rung.video, frameShown = false, analysis = analysis != null, motion = motion != null) }
+            _state.update { EngineState(CameraStatus.Ready, request, rung.range, rung.video, frameShown = false, analysis = analysis != null, motion = motion != null, raw = raw != null, raw50 = raw50 != null) }
             repeat()
             return true
         }
@@ -1062,7 +1378,9 @@ class CameraEngine(context: Context) {
             OutputConfiguration(if (tenBit) ImageFormat.YCBCR_P010 else ImageFormat.YUV_420_888, Size(size.width, size.height)).apply { dynamicRangeProfile = profile }
         } else null
         val motion = if (rung.motion) OutputConfiguration(ImageFormat.PRIVATE, Size(previewSize.width, previewSize.height), HardwareBuffer.USAGE_VIDEO_ENCODE).apply { dynamicRangeProfile = profile; timestampBase = OutputConfiguration.TIMESTAMP_BASE_SENSOR } else null
-        val outputs = listOfNotNull(preview, video, still?.let { OutputConfiguration(format, Size(it.capture.width, it.capture.height)) }, analysis, motion)
+        val raw = rawStream(request)?.takeIf { rung.raw }?.let { (size, lens) -> OutputConfiguration(ImageFormat.RAW_SENSOR, Size(size.width, size.height)).apply { lens?.let { setPhysicalCameraId(it) } } }
+        val raw50 = request.camera.raw50?.takeIf { rung.raw50 }?.let { OutputConfiguration(ImageFormat.RAW10, Size(it.width, it.height)).apply { addSensorPixelModeUsed(CameraMetadata.SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION) } }
+        val outputs = listOfNotNull(preview, video, still?.let { OutputConfiguration(format, Size(it.capture.width, it.capture.height)) }, analysis, motion, raw, raw50)
         val config = SessionConfiguration(SessionConfiguration.SESSION_REGULAR, outputs)
         config.setSessionParameters(sessionParameters(setup.createCaptureRequest(template(request)), request, rung.video))
         setup.isSessionConfigurationSupported(config)
@@ -1384,6 +1702,8 @@ class CameraEngine(context: Context) {
 
     private fun onResult(result: TotalCaptureResult) {
         result.get(CaptureResult.SENSOR_TIMESTAMP)?.let { latestFrameNs = maxOf(latestFrameNs, it) }
+        activeLens = result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)
+        resultSeen = true
         // Pro's values: every frame's kept for the metering, a few a second shown (not with every frame: whoever shows them would redraw each time)
         val iso = result.get(CaptureResult.SENSOR_SENSITIVITY)
         val time = result.get(CaptureResult.SENSOR_EXPOSURE_TIME)
@@ -1777,6 +2097,10 @@ class CameraEngine(context: Context) {
         _postviewImage.value = null
         sessionKey = null
         still = null
+        rawOutput = null
+        raw50Output = null
+        activeLens = null
+        resultSeen = false
         recorder = null
         analyzing = null
         motion = null
@@ -1789,13 +2113,43 @@ class CameraEngine(context: Context) {
         device = null
     }
 
-    /** The still's reader and the images it delivers. */
     /** A still taken from the reader; closing it gives its buffer back and lets the reader hand on the next one waiting. */
     private class StillImage(private val image: Image, private val released: () -> Unit) : AutoCloseable {
         private var closed = false
         val timestamp: Long get() = image.timestamp
+        val width: Int get() = image.width
+        val height: Int get() = image.height
 
         fun compressedBytes() = image.compressedBytes()
+
+        /** A packed raw image's (RAW10) rows without the padding at their ends, copied out of the camera's buffer (it goes back at once). */
+        fun packedPlane(): ByteBuffer {
+            val plane = image.planes[0]
+            val rowBytes = image.width * 5 / 4
+            val out = ByteBuffer.allocateDirect(rowBytes * image.height)
+            val buffer = plane.buffer
+            val row = ByteArray(rowBytes)
+            for (y in 0 until image.height) {
+                buffer.position(y * plane.rowStride)
+                buffer.get(row)
+                out.put(row)
+            }
+            out.flip()
+            return out
+        }
+
+        /** A raw image's 16-bit pixels packed row after row (DngCreator takes no padding at the rows' ends). */
+        fun rawPixels(): Pair<PixelSize, ByteArray> {
+            val plane = image.planes[0]
+            val rowBytes = image.width * 2
+            val pixels = ByteArray(rowBytes * image.height)
+            val buffer = plane.buffer
+            for (row in 0 until image.height) {
+                buffer.position(row * plane.rowStride)
+                buffer.get(pixels, row * rowBytes, rowBytes)
+            }
+            return PixelSize(image.width, image.height) to pixels
+        }
 
         override fun close() {
             if (closed) return
@@ -1805,8 +2159,12 @@ class CameraEngine(context: Context) {
         }
     }
 
-    private inner class StillOutput(val plan: StillPlan, val format: StillFormat, imageFormat: Int) {
-        val reader: ImageReader = ImageReader.Builder(plan.capture.width, plan.capture.height).setImageFormat(imageFormat).setMaxImages(STILL_BUFFERS).build()
+    /** The still's reader and the images it delivers. */
+    private inner class StillOutput(val plan: StillPlan, val format: StillFormat, imageFormat: Int) : ImageOutput(plan.capture.width, plan.capture.height, imageFormat, STILL_BUFFERS)
+
+    /** A reader of stills (or raw images) and the images it delivers, at most [buffers] held at once. */
+    private open inner class ImageOutput(width: Int, height: Int, imageFormat: Int, private val buffers: Int, val lens: String? = null) {
+        val reader: ImageReader = ImageReader.Builder(width, height).setImageFormat(imageFormat).setMaxImages(buffers).build()
         // An image the channel can't hand on any more (closed, a receive cancelled) is closed, its buffer back
         val images = Channel<StillImage>(Channel.UNLIMITED, onUndeliveredElement = { it.close() })
         private var closed = false
@@ -1822,7 +2180,7 @@ class CameraEngine(context: Context) {
          * left in the queue then would only come with the next one's callback – every later still a frame behind (a burst's end left stills like that).
          */
         private fun pull() {
-            while (!closed && held < STILL_BUFFERS) {
+            while (!closed && held < buffers) {
                 val image = runCatching { reader.acquireNextImage() }.getOrNull() ?: return
                 held++
                 val still = StillImage(image) {
@@ -1872,6 +2230,12 @@ class CameraEngine(context: Context) {
         const val TAG = "CameraEngine"
         const val JPEG_QUALITY: Byte = 95
         const val STILL_BUFFERS = 3
+        /** Raw images held at once: one photo's and the next one's (about 25 MB each). */
+        const val RAW_BUFFERS = 2
+        /** How long after its photo a raw image and the result may still come. */
+        const val RAW_WAIT_MS = 3_000L
+        /** How long a shot waits for a new session's first result (the lens it streams from) before it decides on the DNG. */
+        const val FIRST_RESULT_MS = 500L
         const val STILL_TIMEOUT_MS = 10_000L
         /** Frames handed to the saving at once; beyond them the camera waits for the saving (memory stays bounded). */
         const val BURST_HANDOFF = 4
@@ -1928,6 +2292,14 @@ class CameraEngine(context: Context) {
         /** Frames a face may be missing before its mark goes (about 0.3 s). */
         const val FACE_HOLD_FRAMES = 9
     }
+}
+
+/** A JPEG orientation in degrees as EXIF says it (the DNG's). */
+private fun exifOrientation(degrees: Int) = when (degrees) {
+    90 -> ExifInterface.ORIENTATION_ROTATE_90
+    180 -> ExifInterface.ORIENTATION_ROTATE_180
+    270 -> ExifInterface.ORIENTATION_ROTATE_270
+    else -> ExifInterface.ORIENTATION_NORMAL
 }
 
 /** The bytes of a compressed image (JPEG, JPEG_R) from its single plane. */

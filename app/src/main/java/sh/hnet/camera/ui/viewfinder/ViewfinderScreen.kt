@@ -156,6 +156,7 @@ import sh.hnet.camera.FirstRun
 import sh.hnet.camera.Grid
 import sh.hnet.camera.MotionPhoto
 import sh.hnet.camera.R
+import sh.hnet.camera.RawMode
 import sh.hnet.camera.camera.CameraStatus
 import sh.hnet.camera.camera.Flash
 import sh.hnet.camera.camera.Mode
@@ -163,6 +164,7 @@ import sh.hnet.camera.camera.PhoneState
 import sh.hnet.camera.camera.QrContent
 import sh.hnet.camera.camera.Recording
 import sh.hnet.camera.capabilities.CameraSpec
+import sh.hnet.camera.capabilities.fiftyMp
 import sh.hnet.camera.capabilities.lookOf
 import sh.hnet.camera.capabilities.model.Aspect
 import sh.hnet.camera.capabilities.model.FocusScale
@@ -431,6 +433,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
     val scope = rememberCoroutineScope()
     val micBusy = stringResource(R.string.msg_mic_busy)
     val hdrFps = stringResource(R.string.msg_hdr_fps)
+    val hdrUnavailable = stringResource(R.string.msg_hdr_unavailable)
     val hdrCodec = stringResource(R.string.msg_hdr_codec)
     val locationDenied = stringResource(R.string.msg_location_denied)
     fun explain(message: String) = scope.launch { snackbars.showSnackbar(message, duration = SnackbarDuration.Short) }
@@ -479,6 +482,14 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
     LaunchedEffect(Unit) { viewModel.refused.collect { explain(tooHot) } }
     val photoLost = stringResource(R.string.msg_photo_lost)
     LaunchedEffect(Unit) { viewModel.photoLost.collect { explain(photoLost) } }
+    val rawOtherLens = stringResource(R.string.msg_raw_other_lens)
+    LaunchedEffect(Unit) { viewModel.rawOtherLens.collect { explain(rawOtherLens) } }
+    // The DNG asked for, but the camera took the session only without its stream: said once per such session, not left to be found missing
+    val rawUnavailable = stringResource(R.string.msg_raw_unavailable)
+    val rawMissing = engine.status == CameraStatus.Ready && engine.request?.let {
+        it.mode == Mode.PRO && ((it.raw && it.camera.raw != null && !engine.raw) || (it.raw50 && it.camera.fiftyMp && !engine.raw50))
+    } == true
+    LaunchedEffect(rawMissing) { if (rawMissing) explain(rawUnavailable) }
     // After both restarts failed: a snackbar with the error's details (SPEC §14.1)
     val failedTitle = stringResource(R.string.title_camera_failed)
     val show = stringResource(R.string.button_show)
@@ -699,7 +710,8 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                 }
                 // Night's extension takes no flash
                 // The front camera's screen flash needs the camera's own exposure: not with Pro's set by hand
-                if (!video && !night && (camera.flash || (camera.front && !proManual))) {
+                // Not with 50 MP: its one maximum-resolution frame isn't metered for a flash (my decision)
+                if (!video && !night && !viewModel.fiftyMp && (camera.flash || (camera.front && !proManual))) {
                     // With Pro's exposure set by hand, automatic means nothing: off or on (LOGIKA §25)
                     val shownFlash = if (proManual && ui.flash == Flash.AUTO) Flash.OFF else ui.flash
                     MenuButton(listOf((if (proManual) listOf(Flash.OFF, Flash.ON) else Flash.entries).map { f -> MenuChoice(stringResource(flashName(f)), f == shownFlash) { viewModel.setFlash(f) } })) { open ->
@@ -730,7 +742,11 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
             }
             // Nothing that rebuilds the session while a countdown runs or a recording goes on
             if (recording == null && ui.countdown == null && !ui.holdingStill && !bursting) {
-                Row(Modifier.align(Alignment.TopEnd).padding(end = 12.dp, top = topRowTop(status, start = maxWidth - 148.dp, end = maxWidth - 12.dp)), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                // Pro's raw image in its top row (SPEC §6.3, §8.4; in Pro only, owner, 25 Nov 2026)
+                val rawShown = pro && capture == null && camera.raw != null
+                val fifty = viewModel.fiftyMp
+                val rightWidth = 148.dp
+                Row(Modifier.align(Alignment.TopEnd).padding(end = 12.dp, top = topRowTop(status, start = maxWidth - rightWidth, end = maxWidth - 12.dp)), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                     // Another app's low-quality video is SDR whatever the setting: no HDR to switch
                     val hdrAvailable = when {
                         video -> camera.hlg && capture?.lowQuality != true
@@ -747,9 +763,27 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                             // Amber while on: it is switched on (owner, 25 Nov 2026), its usual state though it is
                             on = on,
                             turn = turn,
-                            enabled = possible,
-                            onDisabled = { explain(if (settings.videoHevc) hdrFps else hdrCodec) },
+                            // 50 MP is a DNG alone: no Ultra HDR photo to switch (D22)
+                            enabled = possible && !fifty,
+                            onDisabled = { explain(if (fifty) hdrUnavailable else if (settings.videoHevc) hdrFps else hdrCodec) },
                         ) { viewModel.toggleHdr() }
+                    }
+                    // A menu of off, the DNG beside the photo and 50 MP (D21); amber while on, 50 MP as a small "50 MP" over the raw icon (owner: the
+                    // written-out text was far larger than the icons)
+                    if (rawShown) {
+                        val modes = rawModes(camera)
+                        MenuButton(listOf(modes.map { m -> MenuChoice(stringResource(rawMenuName(m)), m == settings.rawMode) { viewModel.setRawMode(m) } })) { open ->
+                            val on = settings.rawMode == RawMode.RAW || fifty
+                            TopButton(
+                                if (on) R.drawable.ic_raw_on else R.drawable.ic_raw_off,
+                                stringResource(R.string.tooltip_raw),
+                                stringResource(if (fifty) R.string.menu_raw_50mp else if (on) R.string.desc_state_raw_on else R.string.desc_state_raw_off),
+                                on = on,
+                                turn = turn,
+                                caption = if (fifty) stringResource(R.string.label_50mp) else null,
+                                onClick = open,
+                            )
+                        }
                     }
                     // Not for another app's photo: it never gets a motion photo (SPEC §15.3)
                     // Not in Pro either (SPEC §6.3)
@@ -797,7 +831,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
             // The phone's states (SPEC §14.1): heat, a low battery, little room left
             if (phone.hot) IndicatorChip(R.drawable.ic_device_thermostat, stringResource(R.string.label_phone_hot)) { explain(ledReason) }
             if (phone.lowBattery) IndicatorChip(R.drawable.ic_battery_alert, stringResource(R.string.label_battery_level, phone.battery ?: 0)) { explain(flashBattery) }
-            roomLeft(phone, ui.mode == Mode.VIDEO, engine.video?.bitrate, ui.mode == Mode.PHOTO && ui.settings.motionPhoto != MotionPhoto.OFF)?.let { left ->
+            roomLeft(phone, ui.mode == Mode.VIDEO, engine.video?.bitrate, ui.mode == Mode.PHOTO && ui.settings.motionPhoto != MotionPhoto.OFF, engine.raw, engine.raw50)?.let { left ->
                 IndicatorChip(R.drawable.ic_storage, if (left.minutes) stringResource(R.string.label_minutes_left, left.count) else pluralStringResource(R.plurals.label_photos_left, left.count, left.count)) {}
             }
             if (noSound) {
@@ -879,13 +913,13 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
             )
         }
 
-        // Not during a long exposure: the photo in flight keeps its zoom
+        // Not during a long exposure: the photo in flight keeps its zoom; with 50 MP (the main lens' whole sensor, D22) only the quick-settings button
         if (ui.exposing == null) ZoomRow(
-            scale = camera?.zoom,
+            scale = camera?.zoom?.takeIf { !viewModel.fiftyMp },
             zoom = ui.zoom,
             rulerOpen = zoomRulerOpen,
             onRulerOpen = { zoomRulerOpen = it },
-            onZoom = { viewModel.zoomTo(it) },
+            onZoom = { ratio, jump -> viewModel.zoomTo(ratio, jump) },
             onQuickSettings = { quickSettings = true },
             quickSettingsOpen = quickSettings,
             // Not during a countdown either: the panel's values rebuild the session the timed shot waits for
@@ -1041,7 +1075,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
             QuickSettings(
                 PanelState(
                     video = ui.mode == Mode.VIDEO,
-                    flashAvailable = !night && ((camera.flash && !ledBlocked) || camera.front),
+                    flashAvailable = !night && !viewModel.fiftyMp && ((camera.flash && !ledBlocked) || camera.front),
                     flash = ui.flash,
                     flashLevels = if (camera.front) 1 else camera.flashLevels,
                     flashLevel = ui.flashLevel ?: camera.flashDefaultLevel,
@@ -1057,7 +1091,8 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                     fps = viewModel.videoFps,
                     torch = ui.torch,
                     torchAvailable = camera.flash && !ledBlocked,
-                    ultraHdrAvailable = camera.jpegR.isNotEmpty(),
+                    // Not with 50 MP: a DNG alone (D22)
+                    ultraHdrAvailable = camera.jpegR.isNotEmpty() && !viewModel.fiftyMp,
                     motionPhoto = settings.motionPhoto,
                     motionAvailable = capture == null && !night && !pro,
                     hdrAvailable = camera.hlg && capture?.lowQuality != true,
@@ -1065,6 +1100,9 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                     ultraHdr = settings.ultraHdr,
                     location = locationOn,
                     histogram = settings.proHistogram.takeIf { pro },
+                    // A stored 50 MP on a camera without it reads as off
+                    raw = settings.rawMode.let { if (it == RawMode.MP50 && !camera.fiftyMp) RawMode.OFF else it }.takeIf { capture == null && camera.raw != null && pro },
+                    rawModes = rawModes(camera),
                 ),
                 PanelActions(
                     onFlash = viewModel::setFlash,
@@ -1085,6 +1123,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                     onUltraHdr = { viewModel.toggleHdr() },
                     onMotionPhoto = { viewModel.setMotionPhoto(it) },
                     onHistogram = { viewModel.setProHistogram(it) },
+                    onRaw = { viewModel.setRawMode(it) },
                     onLocation = {
                         if (!ui.settings.location && !viewModel.location.allowed()) quickSettings = false
                         toggleLocation()
@@ -1304,7 +1343,7 @@ private fun CameraProblem(status: CameraStatus, onRetry: () -> Unit, modifier: M
 /** How many more shots fit: photos under 100 or video minutes under 15 (SPEC §14.1); null with more room. */
 private class RoomLeft(val count: Int, val minutes: Boolean)
 
-private fun roomLeft(phone: PhoneState, video: Boolean, bitrate: Int?, motion: Boolean): RoomLeft? {
+private fun roomLeft(phone: PhoneState, video: Boolean, bitrate: Int?, motion: Boolean, raw: Boolean, raw50: Boolean): RoomLeft? {
     val free = phone.freeBytes ?: return null
     if (phone.storageFull) return null
     return if (video) {
@@ -1312,8 +1351,9 @@ private fun roomLeft(phone: PhoneState, video: Boolean, bitrate: Int?, motion: B
         val perSecond = ((bitrate ?: UHD_BITS) + AUDIO_BITS) / 8L
         (free / perSecond / 60).toInt().takeIf { it < LOW_MINUTES }?.let { RoomLeft(it, minutes = true) }
     } else {
-        // An Ultra HDR photo of the default size, with a motion photo's video when they are on
-        val perPhoto = if (motion) PHOTO_BYTES + MOTION_BYTES else PHOTO_BYTES
+        // An Ultra HDR photo of the default size, with a motion photo's video and the DNG when they are on
+        // 50 MP: its DNG alone
+        val perPhoto = if (raw50) RAW50_BYTES else PHOTO_BYTES + (if (motion) MOTION_BYTES else 0) + (if (raw) RAW_BYTES else 0)
         (free / perPhoto).toInt().takeIf { it < LOW_PHOTOS }?.let { RoomLeft(it, minutes = false) }
     }
 }
@@ -1322,6 +1362,8 @@ private const val UHD_BITS = 50_000_000
 private const val AUDIO_BITS = 256_000
 private const val PHOTO_BYTES = 5L * 1024 * 1024
 private const val MOTION_BYTES = 3L * 1024 * 1024
+private const val RAW_BYTES = 25L * 1024 * 1024
+private const val RAW50_BYTES = 100L * 1024 * 1024
 private const val LOW_PHOTOS = 100
 private const val LOW_MINUTES = 15
 

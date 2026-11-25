@@ -47,6 +47,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -55,6 +56,7 @@ import sh.hnet.camera.CameraSettings
 import sh.hnet.camera.Grid
 import sh.hnet.camera.MotionPhoto
 import sh.hnet.camera.ProValues
+import sh.hnet.camera.RawMode
 import sh.hnet.camera.VolumeKeys
 import sh.hnet.camera.camera.AnalysisFrame
 import sh.hnet.camera.camera.BurstFrame
@@ -70,6 +72,7 @@ import sh.hnet.camera.camera.PhoneState
 import sh.hnet.camera.camera.PhoneStates
 import sh.hnet.camera.capabilities.CameraSpec
 import sh.hnet.camera.capabilities.LensLook
+import sh.hnet.camera.capabilities.fiftyMp
 import sh.hnet.camera.capabilities.lookOf
 import sh.hnet.camera.capabilities.model.Aspect
 import sh.hnet.camera.capabilities.model.ColorCalibration
@@ -82,6 +85,7 @@ import sh.hnet.camera.capabilities.model.SessionLadder
 import sh.hnet.camera.capabilities.model.Sizes
 import sh.hnet.camera.capabilities.model.VideoChoice
 import sh.hnet.camera.capabilities.model.WhiteBalance
+import sh.hnet.camera.capabilities.model.ZoomScale
 import sh.hnet.camera.media.BurstFiles
 import sh.hnet.camera.media.LastShot
 import sh.hnet.camera.media.LocationTracker
@@ -194,6 +198,22 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _stopped = MutableSharedFlow<Stopped>(extraBufferCapacity = 2)
     val stopped: SharedFlow<Stopped> = _stopped
+
+    /** 50 MP DNGs written one at a time (each holds its 60 MB raw image until written), 12 MP ones at most two waiting (25 MB each). */
+    private val raw50Saves = Semaphore(1)
+    private val rawSaves = Semaphore(2)
+
+    private val _rawOtherLens = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+    /** A photo went without its DNG: the camera took it with another lens than the raw stream's (macro, a near subject at the tele's stop). */
+    val rawOtherLens: SharedFlow<Unit> = _rawOtherLens
+
+    /**
+     * The lens the session's raw stream is asked of when the zoom's stop doesn't say it: kept while the zoom slides, then the lens the camera reports once
+     * the zoom rests for [RAW_LENS_SETTLE_MS] (the Pixel takes the tele from about 4.9×, not at its 5× stop – diag 25 Nov 2026; one lens' raw stream per
+     * session, so the slide doesn't rebuild it at every lens). Null: the zoom's stop's lens.
+     */
+    private var rawLensPick: String? = null
+    private var rawLensJob: Job? = null
 
     private val _photoLost = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
     /** A photo the camera started taking never came (it says nothing about it otherwise). */
@@ -352,6 +372,8 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
             preferences.camera.collect { settings ->
                 val before = _ui.value.settings
                 _ui.update { it.copy(settings = settings) }
+                // 50 MP however it was set (a restored backup too): at 1×, with the session that comes
+                if (fiftyMp) toOneX()
                 configure()
                 if (settings.location != before.location) updateLocation()
             }
@@ -449,6 +471,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         _entry.value = entry
         sessionStart = System.currentTimeMillis()
         cancelTimer()
+        dropRawLensWait()
         val front = cameras.indexOfFirst { it.front }
         val back = cameras.indexOfFirst { !it.front }.coerceAtLeast(0)
         val (mode, index) = when (entry) {
@@ -487,7 +510,15 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         val capture = _entry.value as? Entry.Capture
         val video = if (capture?.lowQuality == true) VideoChoice(uhd = false, fps = 30, hdr = false, hevc = settings.videoHevc) else VideoChoice(settings.videoUhd, videoFps, settings.hdrVideo && settings.videoHevc, settings.videoHevc)
         val motion = capture == null && ui.mode == Mode.PHOTO && settings.motionPhoto != MotionPhoto.OFF
-        return camera?.let { CameraRequest(it, ui.mode, settings.aspect, video, settings.ultraHdr, motion = motion, motionFirst = settings.motionPhoto == MotionPhoto.ON) }
+        // Nor a DNG for another app (SPEC §15.3); the raw stream of the zoom's lens
+        // In Pro only (owner, 25 Nov 2026): the DNG beside each photo, or 50 MP alone
+        val raw = capture == null && ui.mode == Mode.PRO && settings.rawMode == RawMode.RAW
+        return camera?.let {
+            val rawLens = if (raw) rawLensPick ?: it.zoom.lensAt(ui.zoom) else null
+            val raw50 = capture == null && ui.mode == Mode.PRO && settings.rawMode == RawMode.MP50 && it.fiftyMp
+            // 50 MP takes no Ultra HDR photo: the plain still the session keeps for its ladder, and the 50 MP stream's confirmed sets (D22)
+            CameraRequest(it, ui.mode, settings.aspect, video, settings.ultraHdr && !raw50, motion = motion, motionFirst = settings.motionPhoto == MotionPhoto.ON, raw = raw, rawLens = rawLens, raw50 = raw50)
+        }
     }
 
     /** Whether two requests are served by one session (the square's bands slide only then). */
@@ -617,6 +648,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
 
     fun stop() {
         started = false
+        dropRawLensWait()
         proJob?.cancel()
         proJob = null
         // Leaving ends a burst (its frames taken are saved)
@@ -662,13 +694,17 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         if (mode == Mode.NIGHT && camera?.night == null) return
         if (mode == Mode.PRO && camera?.manualSensor != true) return
         cancelTimer()
+        dropRawLensWait()
         _ui.update { it.copy(mode = mode, focus = null, locked = false, exposure = 0, torch = false, pointAtCode = false) }
+        // Into Pro with 50 MP: at 1×
+        if (fiftyMp) _ui.update { it.copy(zoom = 1.0) }
         analyzer.reset()
         // After any resets still waiting (a camera switch just before, its zoom back to 1×)
         val before = onTold
         onTold = {
             before?.invoke()
             engine.setTorch(false)
+            engine.setZoom(_ui.value.zoom)
             engine.resetFocus(exposure = aeSteps(0))
         }
         configure()
@@ -692,12 +728,13 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
             else -> _ui.value.mode
         }
         // The Night suggestion only where the camera has Night
+        dropRawLensWait()
         _ui.update { it.copy(cameraIndex = next, mode = mode, zoom = 1.0, focus = null, locked = false, exposure = 0, torch = false, flashLevel = null, nightSuggested = it.nightSuggested && cameras[next].night != null) }
         val before = onTold
         onTold = {
             before?.invoke()
             engine.setTorch(false)
-            engine.setZoom(1.0)
+            engine.setZoom(_ui.value.zoom)
             engine.resetFocus(exposure = aeSteps(0))
             applyLed()
         }
@@ -833,7 +870,8 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         val stop = camera.zoom.stops.firstOrNull { abs(it.ratio - zoom) < 1e-6 }
         val target = stop?.lens
         if (focus == null || stop == null || target == null || lens == null) {
-            if (stop == null) lensNudgedFor = null
+            // Off the stop, or a new session not reporting yet (a rebuild would otherwise end the nudge for good): the stop nudges again
+            if (stop == null || lens == null) lensNudgedFor = null
             lensNudgeUntil = 0L
             return false
         }
@@ -953,6 +991,30 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch { preferences.setProPeaking(on) }
     }
 
+    /** The DNG next to each photo (Photo and Pro); kept. */
+    fun setRawMode(mode: RawMode) {
+        dropRawLensWait()
+        if (mode == RawMode.MP50 && camera?.fiftyMp == true && _ui.value.mode == Mode.PRO) toOneX()
+        viewModelScope.launch { preferences.setRawMode(mode) }
+    }
+
+    /** Pro's 50 MP is chosen and the camera has it: the main lens at 1× only (D22: the zoom row hidden, HDR off). */
+    val fiftyMp: Boolean
+        get() = _ui.value.mode == Mode.PRO && _ui.value.settings.rawMode == RawMode.MP50 && camera?.fiftyMp == true && _entry.value !is Entry.Capture
+
+    /** The zoom back at 1× for 50 MP, sent with the session that comes (the frozen frame covers the change). */
+    private fun toOneX() {
+        if (abs(_ui.value.zoom - 1.0) < 1e-6) return
+        val reset = lensOf(1.0) != lensOf(_ui.value.zoom) && (_ui.value.focus != null || _ui.value.exposure != 0)
+        _ui.update { if (reset) it.copy(zoom = 1.0, focus = null, locked = false, exposure = 0) else it.copy(zoom = 1.0) }
+        val pending = onTold
+        onTold = {
+            pending?.invoke()
+            engine.setZoom(_ui.value.zoom)
+            if (reset) engine.resetFocus(exposure = aeSteps(0))
+        }
+    }
+
     fun setProHistogram(on: Boolean) {
         viewModelScope.launch { preferences.setProHistogram(on) }
     }
@@ -976,16 +1038,96 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** A zoom value from the ruler or a stop; a different lens (another stop is the nearest one below) ends the tapped focus and the exposure compensation. */
-    fun zoomTo(ratio: Double) {
+    fun zoomTo(ratio: Double, jump: Boolean = false) {
+        // 50 MP is the main lens' whole sensor only
+        if (fiftyMp) return
         val scale = camera?.zoom ?: return
         val value = ratio.coerceIn(scale.min, scale.max.coerceAtMost(scale.end))
         val before = lensOf(_ui.value.zoom)
         _ui.update { it.copy(zoom = value) }
-        engine.setZoom(value)
-        if (lensOf(value) != before && (_ui.value.focus != null || _ui.value.exposure != 0)) {
-            _ui.update { it.copy(focus = null, locked = false, exposure = 0) }
-            engine.resetFocus(exposure = aeSteps(0))
+        val told = toldRawLens()
+        // Another lens ends the tapped focus and the exposure compensation
+        val reset = lensOf(value) != before && (_ui.value.focus != null || _ui.value.exposure != 0)
+        if (reset) _ui.update { it.copy(focus = null, locked = false, exposure = 0) }
+        when {
+            jump && told != null && scale.lensAt(value) != told -> {
+                // A stop tapped with the DNG on, another lens' raw stream: the picture covered first, the lens and its session together, then the picture
+                // back (owner, 25 Nov 2026: not the switch seen and then covered); the zoom sent then is the newest one
+                dropRawLensWait()
+                val pending = onTold
+                onTold = {
+                    pending?.invoke()
+                    engine.setZoom(_ui.value.zoom)
+                    if (reset) engine.resetFocus(exposure = aeSteps(0))
+                }
+                configure()
+            }
+            // A change being covered: the zoom goes with it (sent now it would show on the old session, or be overwritten by the change's)
+            onTold != null -> {
+                val pending = onTold
+                onTold = {
+                    pending?.invoke()
+                    engine.setZoom(_ui.value.zoom)
+                    if (reset) engine.resetFocus(exposure = aeSteps(0))
+                }
+            }
+            else -> {
+                engine.setZoom(value)
+                if (reset) engine.resetFocus(exposure = aeSteps(0))
+                followRawLens(scale)
+            }
         }
+    }
+
+    /** The lens of the raw stream the engine was last told (null: no DNG asked for, or no session told yet). */
+    private fun toldRawLens(): String? {
+        if (_ui.value.settings.rawMode != RawMode.RAW || _ui.value.mode != Mode.PRO || _entry.value is Entry.Capture) return null
+        return _shown.value?.takeIf { it.raw }?.rawLens
+    }
+
+    /**
+     * A slide with the DNG on: the session's lens is kept while the zoom moves; once it rests, the lens the camera reports for it (else the stop's), and a
+     * new session when that is another one.
+     */
+    private fun followRawLens(scale: ZoomScale) {
+        val told = toldRawLens() ?: return
+        rawLensJob?.cancel()
+        rawLensPick = told
+        rawLensJob = viewModelScope.launch {
+            delay(RAW_LENS_SETTLE_MS)
+            // Pro's manual focus: the camera's own focus lets it switch lenses for a moment; the pick waits for it to end
+            withTimeoutOrNull(LENS_NUDGE_MS + RAW_LENS_SETTLE_MS) { while (SystemClock.uptimeMillis() < lensNudgeUntil) delay(PRO_STEP_MS) }
+            pickRawLens(scale, told, freeze = true)
+            // A switch the camera makes a little later (its own focus taking its time): looked at once more
+            delay(RAW_LENS_RECHECK_MS)
+            rawLensJob = null
+            toldRawLens()?.let { now -> if (engine.activeLens != null && engine.activeLens != now && engine.activeLens in camera?.rawLenses.orEmpty()) pickRawLens(scale, now, freeze = true) }
+        }
+    }
+
+    /** The lens the camera takes the picture with now (this session's report, one of the lenses with a raw stream), else the zoom's stop's. */
+    private fun pickRawLens(scale: ZoomScale, told: String, freeze: Boolean) {
+        val camera = camera ?: return
+        val reported = engine.activeLens?.takeIf { it in camera.rawLenses }
+        val lens = reported ?: scale.lensAt(_ui.value.zoom) ?: return
+        rawLensPick = lens
+        if (lens != told) configure(freeze)
+    }
+
+    /** A lens change of the DNG's raw stream still waiting: decided now, without the frozen frame (a photo takes it: the engine must know before the shot). */
+    private fun settleRawLens() {
+        if (rawLensJob == null) return
+        rawLensJob?.cancel()
+        rawLensJob = null
+        val scale = camera?.zoom ?: return
+        toldRawLens()?.let { pickRawLens(scale, it, freeze = false) }
+    }
+
+    /** Forgets the slide's lens (a stop tapped, another camera or mode, the DNG switched: the stop's lens again). */
+    private fun dropRawLensWait() {
+        rawLensJob?.cancel()
+        rawLensJob = null
+        rawLensPick = null
     }
 
     /** The native lens a zoom value is on: the nearest stop at or below it. */
@@ -1402,6 +1544,8 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         // The front camera's screen flash in Photo, and in Pro while the camera's exposure is its own (it meters for the lit screen)
         val screenFlash = front && (ui.mode == Mode.PHOTO || (ui.mode == Mode.PRO && !proManual)) && (ui.flash == Flash.ON || (ui.flash == Flash.AUTO && engineState.value.dark))
         val place = placeNow()
+        // The DNG's lens the zoom has just moved to: its session first (the shot waits for it)
+        settleRawLens()
         // A lens switch let happen by the camera's own focus pauses for the photo (it takes the focus set by hand); unfinished, the stop nudges again after it
         lensNudgeHeld++
         if (SystemClock.uptimeMillis() < lensNudgeUntil) {
@@ -1415,9 +1559,18 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         if (long) longShot = true
         val done = AtomicBoolean(false)
         val clicked = AtomicBoolean(false)
+        // A DNG's raw image is held until it is written: at most one 50 MP (60 MB) and two 12 MP ones (25 MB each) at a time; the next shot waits its turn
+        val gate = when {
+            fiftyMp -> raw50Saves
+            ui.mode == Mode.PRO && ui.settings.rawMode == RawMode.RAW -> rawSaves
+            else -> null
+        }
+        val released = AtomicBoolean(false)
+        val release = { if (gate != null && released.compareAndSet(false, true)) gate.release() }
         // In the app's scope: a viewfinder going away right after the shutter (the lock screen's when the screen goes off) doesn't cancel the photo
         application.appScope.launch {
             shots.withLock {
+                gate?.acquire()
                 if (screenFlash) {
                     // The screen lit white at full brightness first – counted from when the overlay is really there – then the exposure metered for it (SPEC §7.2)
                     _ui.update { it.copy(screenFlash = true) }
@@ -1448,7 +1601,12 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
                     }.also {
                         // Started and never delivered: said, not lost in silence
                         if (it == null && clicked.get()) _photoLost.tryEmit(Unit)
+                        if (it?.rawOtherLens == true) _rawOtherLens.tryEmit(Unit)
                     }
+                } catch (e: Throwable) {
+                    // The turn of the DNG's memory given back however the shot ended
+                    release()
+                    throw e
                 } finally {
                     done.set(true)
                     if (screenFlash) _ui.update { it.copy(screenFlash = false) }
@@ -1460,10 +1618,30 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
                             if (configureLater) configure()
                         }
                     }
-                } ?: return@withLock
+                } ?: run {
+                    release()
+                    return@withLock
+                }
+                // Pro's 50 MP: the DNG alone, made from the raw image in the background (rearranged and written, a second or two); in the thumbnail once its
+                // turn is given back
+                photo.raw50?.let { shot ->
+                    application.appScope.launch {
+                        val uri = try {
+                            media.saveRaw50(shot, photo.takenAt)
+                        } finally {
+                            release()
+                        }
+                        if (uri == null) _photoLost.tryEmit(Unit) else media.showRaw50(uri, photo.takenAt)
+                        phone.refreshStorage()
+                    }
+                    return@withLock
+                }
                 // For another app: Review first, nothing saved here (SPEC §15.3)
                 if (_entry.value is Entry.Capture) {
                     val mirror = front && ui.settings.mirror
+                    // Another app gets no DNG (its request has none)
+                    photo.raw?.close()
+                    release()
                     _review.value = Review.Photo(photo, mirror, application.captures.preview(photo, mirror, REVIEW_PX))
                     return@withLock
                 }
@@ -1482,7 +1660,15 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
                     var waiting = wantMotion
                     val clipping = if (wantMotion) async { engine.motionClip(photo) } else null
                     val uri = try {
-                        val saved = media.savePhoto(photo.bytes, photo.takenAt, photo.crop, mirror, photo.longExposureNs)
+                        val saved = try {
+                            media.savePhoto(photo.bytes, photo.takenAt, photo.crop, mirror, photo.longExposureNs)?.also {
+                                // Its DNG beside it, named as the photo (after it: the thumbnail shows the photo at once); none without the photo
+                                photo.raw?.let { raw -> media.saveRaw(raw, photo.takenAt) }
+                            }
+                        } finally {
+                            photo.raw?.close()
+                            release()
+                        }
                         phone.refreshStorage()
                         if (clipping != null) {
                             val clip = clipping.await()
@@ -1537,6 +1723,8 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
      * upwards back to 1×.
      */
     private fun keyZoom(up: Boolean) {
+        // Not while a long exposure is taken (the zoom row is hidden then too)
+        if (_ui.value.holdingStill) return
         val scale = camera?.zoom ?: return
         val start = scale.group.firstOrNull()?.ratio ?: 1.0
         val wide = scale.ultrawide?.ratio
@@ -1547,7 +1735,8 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
             zoom <= start + 1e-6 -> wide ?: start
             else -> (zoom / KEY_ZOOM_STEP).coerceAtLeast(start)
         }
-        zoomTo(next)
+        // Between the ultrawide and 1× a jump, as its button
+        zoomTo(next, jump = (zoom < start - 1e-6) != (next < start - 1e-6))
     }
 
     /** The screen flash's overlay is on the screen at full brightness (the UI says so); the exposure is metered only then. */
@@ -1595,6 +1784,10 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         const val LONG_EXPOSURE_NS = 500_000_000L
         /** How long the camera's own focus may run to let it switch lenses at a stop (the focus set by hand then comes back). */
         const val LENS_NUDGE_MS = 1_500L
+        /** How long the zoom rests in another lens' range before the DNG's raw stream follows it (a new session). */
+        const val RAW_LENS_SETTLE_MS = 400L
+        /** After the pick, how long until the lens the camera streams from is looked at once more. */
+        const val RAW_LENS_RECHECK_MS = 1_000L
         /** Focus peaking stays this long after the focus changed or its ruler closed (SPEC §11). */
         const val PEAKING_AFTER_MS = 2_000L
         const val LAST_SECONDS = 3

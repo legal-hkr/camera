@@ -7,6 +7,7 @@ import org.junit.Test
 import sh.hnet.camera.CameraSettings
 import sh.hnet.camera.Grid
 import sh.hnet.camera.MotionPhoto
+import sh.hnet.camera.RawMode
 import sh.hnet.camera.VolumeKeys
 import sh.hnet.camera.capabilities.model.Aspect
 
@@ -14,7 +15,7 @@ class BackupTest {
     private val changed = CameraSettings(
         aspect = Aspect.SQUARE, ultraHdr = false, hdrVideo = false, location = true, grid = Grid.QUARTERS, level = true, videoUhd = false, videoFps = 60,
         timerFlash = true, volumeKeys = VolumeKeys.ZOOM, qrCodes = false, motionPhoto = MotionPhoto.ON, mirror = true, shutterSound = false, videoHevc = false, nightSuggestion = false,
-        proIso = 400, proShutterNs = 8_000_000_000L, proEvThirds = -2, proFocusDiopters = 2.0, proKelvin = 5600, proHistogram = false, proPeaking = false, moreMode = "PRO",
+        proIso = 400, proShutterNs = 8_000_000_000L, proEvThirds = -2, proFocusDiopters = 2.0, proKelvin = 5600, proHistogram = false, proPeaking = false, rawMode = RawMode.MP50, moreMode = "PRO",
     )
 
     private fun file(settings: BackupSettings) = BackupFile(appVersion = "0.1.0", appVersionCode = 1, createdAt = "2026-11-24T10:00:00Z", settings = settings)

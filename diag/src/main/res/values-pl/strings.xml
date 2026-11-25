@@ -53,4 +53,7 @@
     <string name="title_test_pro_white_balance">Pro: balans w kelwinach (HLG i SDR)</string>
     <string name="title_test_pro_long_exposure_app">Pro: naświetlanie 4 s w sesji aplikacji</string>
     <string name="title_test_pro_manual_sdr">Pro: ręczny czas bez HDR (warianty)</string>
+    <string name="title_test_pro_raw_lenses">Pro: RAW z każdego obiektywu w sesji aplikacji</string>
+    <string name="title_test_lens_by_zoom">Obiektyw przy każdym powiększeniu (celuj w coś dalekiego)</string>
+    <string name="title_test_pro_50mp_app">Pro: 50 Mpx w sesji aplikacji</string>
 </resources>

@@ -53,4 +53,7 @@
     <string name="title_test_pro_white_balance">Pro: white balance in kelvins (HLG and SDR)</string>
     <string name="title_test_pro_long_exposure_app">Pro: 4 s exposure in the app’s session</string>
     <string name="title_test_pro_manual_sdr">Pro: exposure set by hand without HDR (variants)</string>
+    <string name="title_test_pro_raw_lenses">Pro: RAW from each lens in the app’s session</string>
+    <string name="title_test_lens_by_zoom">Lens by zoom (point at something far)</string>
+    <string name="title_test_pro_50mp_app">Pro: 50 MP in the app’s session</string>
 </resources>

@@ -75,6 +75,13 @@ data class CameraSpec(
     val awbModes: Set<Int> = emptySet(),
     /** The sensor's timestamps are in the elapsed-realtime clock (else a monotonic one): a shot's start in the phone's clocks. */
     val sensorRealtime: Boolean = false,
+    /** The raw sensor image (DNG) at its normal size, null where the camera gives none; [rawShading]: its lens shading map can be had with it (the DNG's vignetting correction). */
+    val raw: PixelSize? = null,
+    val rawShading: Boolean = false,
+    /** Each physical lens' own raw image size (by id): a logical camera's raw stream is its main sensor's at any zoom, a lens' own is asked of it. */
+    val rawLenses: Map<String, PixelSize> = emptyMap(),
+    /** The 50 MP raw image (RAW10 in the maximum-resolution mode, quad Bayer on the Pixel) of the main lens, null without one (D4, D18). */
+    val raw50: PixelSize? = null,
 )
 
 /** The Night extension's sizes: the preview, the photo in Ultra HDR and in plain JPEG, and whether it gives an early postview of the photo. */
@@ -94,6 +101,9 @@ data class NightSpec(
  * calibration (null without it, or when the camera doesn't take its own color transform).
  */
 data class LensLook(val minimumFocusDiopters: Double = 0.0, val focusCalibrated: Boolean = false, val colorCalibration: ColorCalibration? = null)
+
+/** Pro's 50 MP can be had: the mode, and sessions the camera confirms before they are made (a maximum-resolution stream is never configured unasked). */
+val CameraSpec.fiftyMp: Boolean get() = raw50 != null && sessionQueries
 
 /** The lens look of the physical lens the camera reports as active ([lens]), else the logical camera's. */
 fun CameraSpec.lookOf(lens: String?): LensLook = lens?.let { lenses[it] } ?: look
@@ -157,6 +167,21 @@ object CameraCatalog {
             lenses = chars.physicalCameraIds.mapNotNull { lens -> runCatching { manager.getCameraCharacteristics(lens) }.getOrNull()?.let { lens to lensLook(it, chars) } }.toMap(),
             awbModes = chars.get(CameraCharacteristics.CONTROL_AWB_AVAILABLE_MODES)?.toSet().orEmpty(),
             sensorRealtime = chars.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE) == CameraMetadata.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME,
+            raw = sizes(map, ImageFormat.RAW_SENSOR).maxByOrNull { it.width.toLong() * it.height }.takeIf { CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_RAW in capabilities },
+            rawShading = chars.get(CameraCharacteristics.STATISTICS_INFO_AVAILABLE_LENS_SHADING_MAP_MODES)?.contains(CameraMetadata.STATISTICS_LENS_SHADING_MAP_MODE_ON) == true,
+            rawLenses = if (CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_RAW in capabilities) chars.physicalCameraIds.mapNotNull { lens ->
+                val own = runCatching { manager.getCameraCharacteristics(lens) }.getOrNull() ?: return@mapNotNull null
+                // The lens' own RAW capability, not only the logical camera's
+                if (own.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)?.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_RAW) != true) return@mapNotNull null
+                own.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)?.let { sizes(it, ImageFormat.RAW_SENSOR).maxByOrNull { size -> size.width.toLong() * size.height } }?.let { lens to it }
+            }.toMap() else emptyMap(),
+            // The back camera's only (the reference phone's main lens; a front camera's own large mode isn't "50 MP"), and only a quad Bayer sensor (binning
+            // 2 × 2, a 2 × 2 color pattern): its rearrangement to Bayer would scramble a plain Bayer raw
+            raw50 = if (CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_RAW in capabilities && facing == CameraMetadata.LENS_FACING_BACK &&
+                chars.get(CameraCharacteristics.SENSOR_INFO_BINNING_FACTOR)?.let { it.width == 2 && it.height == 2 } == true &&
+                chars.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT) in 0..3
+            ) chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP_MAXIMUM_RESOLUTION)
+                ?.let { sizes(it, ImageFormat.RAW10).maxByOrNull { size -> size.width.toLong() * size.height } } else null,
             stillStalls = listOf(ImageFormat.JPEG_R, ImageFormat.JPEG).any { format -> sizes(map, format).maxByOrNull { it.area }?.let { runCatching { map.getOutputStallDuration(format, Size(it.width, it.height)) }.getOrDefault(0L) > 0 } == true },
         )
     }

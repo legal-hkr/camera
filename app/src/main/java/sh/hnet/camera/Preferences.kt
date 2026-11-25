@@ -21,6 +21,9 @@ enum class Grid { OFF, THIRDS, QUARTERS }
 
 enum class VolumeKeys { SHUTTER, ZOOM, VOLUME }
 
+/** Pro's raw image (SPEC §8.4, D21): none, a DNG next to each photo, or a 50 MP DNG alone. */
+enum class RawMode { OFF, RAW, MP50 }
+
 /** Motion photos (SPEC §7.6): off, kept only when something moved, or always. */
 enum class MotionPhoto { OFF, AUTO, ON }
 
@@ -60,6 +63,8 @@ data class CameraSettings(
     /** Pro's histogram plate (SPEC §11, the panel), and focus peaking (the switch at the focus ruler's end). */
     val proHistogram: Boolean = true,
     val proPeaking: Boolean = true,
+    /** Pro's raw image (the panel and Pro's top row; owner, 25 Nov 2026: in Pro only, not in Photo). */
+    val rawMode: RawMode = RawMode.OFF,
     /** The mode last chosen from "More", standing in the mode row before it (SPEC §5.4); its name, null before any. */
     val moreMode: String? = null,
 )
@@ -99,6 +104,7 @@ class Preferences(private val context: Context) {
         proKelvin = this[PRO_KELVIN]?.takeIf { it > 0 },
         proHistogram = this[PRO_HISTOGRAM] ?: true,
         proPeaking = this[PRO_PEAKING] ?: true,
+        rawMode = this[RAW_MODE]?.let { name -> RawMode.entries.firstOrNull { it.name == name } } ?: RawMode.OFF,
         moreMode = this[MORE_MODE],
     )
 
@@ -125,6 +131,7 @@ class Preferences(private val context: Context) {
     suspend fun setProKelvin(kelvin: Int?) = context.settings.edit { it[PRO_KELVIN] = kelvin ?: 0 }
     suspend fun setProHistogram(value: Boolean) = context.settings.edit { it[PRO_HISTOGRAM] = value }
     suspend fun setProPeaking(value: Boolean) = context.settings.edit { it[PRO_PEAKING] = value }
+    suspend fun setRawMode(value: RawMode) = context.settings.edit { it[RAW_MODE] = value.name }
     suspend fun setMoreMode(name: String) = context.settings.edit { it[MORE_MODE] = name }
 
     /** Pro's values all at once (its reset, and its undo). */
@@ -167,6 +174,7 @@ class Preferences(private val context: Context) {
             p[PRO_KELVIN] = restored.proKelvin ?: 0
             p[PRO_HISTOGRAM] = restored.proHistogram
             p[PRO_PEAKING] = restored.proPeaking
+            p[RAW_MODE] = restored.rawMode.name
             restored.moreMode?.let { p[MORE_MODE] = it }
         }
     }
@@ -198,6 +206,7 @@ class Preferences(private val context: Context) {
         val PRO_KELVIN = intPreferencesKey("pro_kelvin")
         val PRO_HISTOGRAM = booleanPreferencesKey("pro_histogram")
         val PRO_PEAKING = booleanPreferencesKey("pro_peaking")
+        val RAW_MODE = stringPreferencesKey("raw_mode")
         val MORE_MODE = stringPreferencesKey("more_mode")
     }
 }
