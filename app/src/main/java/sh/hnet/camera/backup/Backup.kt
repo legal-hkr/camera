@@ -74,8 +74,6 @@ data class BackupSettings(
     val proPeaking: Boolean? = null,
     /** `OFF`, `RAW`, `MP50`. */
     val rawMode: String? = null,
-    /** The mode last chosen from "More" (`PRO`). */
-    val moreMode: String? = null,
 ) {
     /** [current] with every value of this backup that this version knows. */
     fun applyTo(current: CameraSettings, locationAllowed: Boolean = true): CameraSettings = current.copy(
@@ -122,7 +120,6 @@ data class BackupSettings(
         proHistogram = proHistogram ?: current.proHistogram,
         proPeaking = proPeaking ?: current.proPeaking,
         rawMode = rawMode?.let { name -> RawMode.entries.firstOrNull { it.name == name } } ?: current.rawMode,
-        moreMode = moreMode ?: current.moreMode,
     )
 
     companion object {
@@ -157,7 +154,6 @@ data class BackupSettings(
             proHistogram = settings.proHistogram,
             proPeaking = settings.proPeaking,
             rawMode = settings.rawMode.name,
-            moreMode = settings.moreMode,
         )
     }
 }

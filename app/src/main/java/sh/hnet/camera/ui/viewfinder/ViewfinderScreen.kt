@@ -507,13 +507,9 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
     val colors = MaterialTheme.colorScheme
     val problem = engine.status.takeIf { it is CameraStatus.Busy || it is CameraStatus.Blocked || it is CameraStatus.Error }
     // For another app only the mode it asked for (SPEC §15.3)
-    // The row (SPEC §5.4): Night, Photo, Video, the mode last chosen from "More", then "More" (null in the row); for another app only the mode it asked for
+    // The row: every mode the camera has, at once (owner, 26 Nov 2026: no "More" and its sheet, unlike SPEC §5.4); for another app only the mode it asked for
     val pro = ui.mode == Mode.PRO
-    val moreModes = if (capture != null) emptyList() else listOfNotNull(Mode.PRO.takeIf { camera?.manualSensor == true })
-    val chosenMore = Mode.PRO.takeIf { it in moreModes && (pro || ui.settings.moreMode == it.name) }
-    val modes = if (capture != null) listOf(ui.mode) else listOfNotNull(Mode.NIGHT.takeIf { camera?.night != null }, Mode.PHOTO, Mode.VIDEO, chosenMore)
-    val rowModes: List<Mode?> = if (moreModes.isEmpty()) modes else modes + null
-    var moreSheet by remember { mutableStateOf(false) }
+    val modes = if (capture != null) listOf(ui.mode) else listOfNotNull(Mode.NIGHT.takeIf { camera?.night != null }, Mode.PHOTO, Mode.VIDEO, Mode.PRO.takeIf { camera?.manualSensor == true })
     // Pro's ruler open (one at a time, SPEC §11); with the exposure set by hand the flash is only off or on
     var proOpen by remember { mutableStateOf<ProValue?>(null) }
     if (!pro && proOpen != null) proOpen = null
@@ -991,7 +987,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
         }
 
         if (recording == null && ui.countdown == null && !ui.holdingStill && !bursting) ModeRow(
-            modes = rowModes,
+            modes = modes,
             selected = ui.mode,
             label = {
                 stringResource(
@@ -1000,29 +996,12 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                         Mode.NIGHT -> R.string.label_mode_night
                         Mode.PHOTO -> R.string.label_mode_photo
                         Mode.PRO -> R.string.label_mode_pro
-                        null -> R.string.label_mode_more
                     },
                 )
             },
             // The row ticks for itself
-            onSelect = {
-                if (it == null) moreSheet = true else viewModel.selectMode(it)
-            },
-            // "More" opens its sheet only when tapped, never under a sliding row
-            slidable = { it != null },
+            onSelect = { viewModel.selectMode(it) },
             modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = modeBottom),
-        )
-    }
-
-    if (moreSheet) {
-        MoreModesSheet(
-            listOf(MoreMode(Mode.PRO, R.drawable.ic_shutter_speed, stringResource(R.string.label_mode_pro), stringResource(R.string.desc_mode_pro))).filter { it.mode in moreModes },
-            onChoose = {
-                moreSheet = false
-                if (it != ui.mode) haptics.mode()
-                viewModel.chooseMore(it)
-            },
-            onDismiss = { moreSheet = false },
         )
     }
 

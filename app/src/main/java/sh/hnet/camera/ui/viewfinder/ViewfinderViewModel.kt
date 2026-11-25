@@ -711,12 +711,6 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         watchPro()
     }
 
-    /** A mode chosen from "More" (SPEC §5.4, §6.2): it takes the place before "More" in the mode row, remembered. */
-    fun chooseMore(mode: Mode) {
-        selectMode(mode)
-        if (_ui.value.mode == mode) viewModelScope.launch { preferences.setMoreMode(mode.name) }
-    }
-
     fun switchCamera() {
         if (cameras.size < 2 || recording || _ui.value.holdingStill || burstJob != null) return
         cancelTimer()

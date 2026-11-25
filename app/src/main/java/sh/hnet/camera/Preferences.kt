@@ -65,8 +65,6 @@ data class CameraSettings(
     val proPeaking: Boolean = true,
     /** Pro's raw image (the panel and Pro's top row; owner, 25 Nov 2026: in Pro only, not in Photo). */
     val rawMode: RawMode = RawMode.OFF,
-    /** The mode last chosen from "More", standing in the mode row before it (SPEC §5.4); its name, null before any. */
-    val moreMode: String? = null,
 )
 
 /** Pro's values set by hand, together (its reset and the reset's undo); null: automatic. */
@@ -105,7 +103,6 @@ class Preferences(private val context: Context) {
         proHistogram = this[PRO_HISTOGRAM] ?: true,
         proPeaking = this[PRO_PEAKING] ?: true,
         rawMode = this[RAW_MODE]?.let { name -> RawMode.entries.firstOrNull { it.name == name } } ?: RawMode.OFF,
-        moreMode = this[MORE_MODE],
     )
 
     suspend fun setAspect(value: Aspect) = context.settings.edit { it[ASPECT] = value.name }
@@ -132,7 +129,6 @@ class Preferences(private val context: Context) {
     suspend fun setProHistogram(value: Boolean) = context.settings.edit { it[PRO_HISTOGRAM] = value }
     suspend fun setProPeaking(value: Boolean) = context.settings.edit { it[PRO_PEAKING] = value }
     suspend fun setRawMode(value: RawMode) = context.settings.edit { it[RAW_MODE] = value.name }
-    suspend fun setMoreMode(name: String) = context.settings.edit { it[MORE_MODE] = name }
 
     /** Pro's values all at once (its reset, and its undo). */
     suspend fun setPro(values: ProValues) = context.settings.edit {
@@ -175,7 +171,6 @@ class Preferences(private val context: Context) {
             p[PRO_HISTOGRAM] = restored.proHistogram
             p[PRO_PEAKING] = restored.proPeaking
             p[RAW_MODE] = restored.rawMode.name
-            restored.moreMode?.let { p[MORE_MODE] = it }
         }
     }
 
@@ -207,6 +202,5 @@ class Preferences(private val context: Context) {
         val PRO_HISTOGRAM = booleanPreferencesKey("pro_histogram")
         val PRO_PEAKING = booleanPreferencesKey("pro_peaking")
         val RAW_MODE = stringPreferencesKey("raw_mode")
-        val MORE_MODE = stringPreferencesKey("more_mode")
     }
 }

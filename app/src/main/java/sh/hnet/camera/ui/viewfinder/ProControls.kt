@@ -4,7 +4,6 @@ package sh.hnet.camera.ui.viewfinder
 
 import android.graphics.Matrix
 import android.graphics.Paint
-import androidx.annotation.DrawableRes
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -15,7 +14,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.selection.toggleable
@@ -26,8 +24,6 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
-import androidx.compose.material3.SegmentedListItem
 import androidx.compose.material3.Text
 import androidx.compose.material3.ripple
 import androidx.compose.runtime.Composable
@@ -64,9 +60,6 @@ import kotlinx.coroutines.flow.StateFlow
 import sh.hnet.camera.R
 import sh.hnet.camera.camera.FrameAnalyzer
 import sh.hnet.camera.capabilities.model.Point
-import sh.hnet.camera.ui.components.RowIcon
-import sh.hnet.camera.ui.components.SettingsGroup
-import sh.hnet.camera.ui.components.settingsRowColors
 
 /** Pro's values on its tiles (SPEC §11). */
 enum class ProValue { ISO, SHUTTER, FOCUS, WHITE_BALANCE, EV }
@@ -230,35 +223,6 @@ fun PeakingSwitch(on: Boolean, onChange: (Boolean) -> Unit) {
             tint = if (on) overlay.accent else MaterialTheme.colorScheme.onSurface,
             modifier = Modifier.size(20.dp),
         )
-    }
-}
-
-/** A mode of the "More modes" sheet: its icon, name and a line about it. */
-class MoreMode<T>(val mode: T, @DrawableRes val icon: Int, val name: String, val description: String)
-
-/** The "More modes" sheet (SPEC §6.2): the modes not in the row, as the family's segmented rows. */
-@Composable
-fun <T> MoreModesSheet(modes: List<MoreMode<T>>, onChoose: (T) -> Unit, onDismiss: () -> Unit) {
-    val colors = MaterialTheme.colorScheme
-    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = colors.surfaceContainerLow) {
-        Column(Modifier.padding(horizontal = 16.dp).navigationBarsPadding().padding(bottom = 16.dp)) {
-            Text(stringResource(R.string.title_more_modes), style = MaterialTheme.typography.titleLarge, modifier = Modifier.padding(bottom = 16.dp))
-            SettingsGroup {
-                modes.forEach { more ->
-                    row { shapes ->
-                        SegmentedListItem(
-                            onClick = { onChoose(more.mode) },
-                            shapes = shapes,
-                            colors = settingsRowColors(),
-                            leadingContent = { RowIcon(more.icon) },
-                            supportingContent = { Text(more.description) },
-                        ) {
-                            Text(more.name)
-                        }
-                    }
-                }
-            }
-        }
     }
 }
 
