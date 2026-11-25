@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.ImageDecoder
 import android.graphics.ImageFormat
 import android.graphics.SurfaceTexture
+import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraConstrainedHighSpeedCaptureSession
 import android.hardware.camera2.CameraDevice
@@ -11,6 +12,7 @@ import android.hardware.camera2.CameraExtensionCharacteristics
 import android.hardware.camera2.CameraExtensionSession
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
+import android.hardware.camera2.CaptureFailure
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.DngCreator
@@ -68,6 +70,7 @@ class LiveTests(context: Context, private val preview: PreviewHost) {
         LiveTest("extensions", R.string.title_test_extensions) { extensions(it) },
         LiveTest("night_queue", R.string.title_test_night_queue) { nightQueue(it) },
         LiveTest("burst_long", R.string.title_test_burst_long) { burstLong(it) },
+        LiveTest("burst_hdr_preview", R.string.title_test_burst_hdr_preview) { burstHdrPreview(it) },
         LiveTest("raw", R.string.title_test_raw) { raw(it) },
     )
 
@@ -594,6 +597,97 @@ class LiveTests(context: Context, private val preview: PreviewHost) {
         }
     }
 
+    /**
+     * A 5-second burst next to an HLG preview, as the camera app's Photo has it with Ultra HDR on: can one request hold the preview and the still, and if not,
+     * what rates do the preview and the stills get when their requests alternate ([preview, still] and [preview, still, still])? Also whether the session
+     * takes a JPEG reader beside JPEG_R (a fast plain-JPEG burst with Ultra HDR single photos), and its rates. At 30 fps: HLG sessions at 60 fps are refused.
+     */
+    private suspend fun burstHdrPreview(id: String): JsonObject {
+        val map = map(id)
+        val previewSize = previewSize(map)
+        val jpegR = largest(map, ImageFormat.JPEG_R) ?: return notOffered("JPEG_R")
+        val jpeg = largest(map, ImageFormat.JPEG) ?: return notOffered("JPEG")
+        val fps = Range(30, 30)
+        return manager.withCamera(id) { device, thread ->
+            buildJsonObject {
+                put("JPEG_R", probe { burstNextToHlg(device, thread, previewSize, listOf(ImageFormat.JPEG_R to jpegR), fps) })
+                put("JPEG_R + JPEG readers, bursting JPEG", probe { burstNextToHlg(device, thread, previewSize, listOf(ImageFormat.JPEG_R to jpegR, ImageFormat.JPEG to jpeg), fps) })
+            }
+        }
+    }
+
+    /** One session: an HLG preview and the [stills] readers (the last one bursts); the three ways of bursting, 5 s each, with the preview's and the stills' rates. */
+    private suspend fun burstNextToHlg(device: CameraDevice, thread: CameraThread, previewSize: Size, stills: List<Pair<Int, Size>>, fps: Range<Int>): JsonObject {
+        val surface = preview.surface(previewSize)
+        val readers = stills.map { (format, size) -> imageReader(size.width, size.height, format, 6) }
+        val stillTimes = mutableListOf<Long>()
+        readers.last().setOnImageAvailableListener({ r -> r.acquireNextImage()?.use { stillTimes += it.timestamp } }, thread.handler)
+        readers.dropLast(1).forEach { reader -> reader.setOnImageAvailableListener({ r -> r.acquireNextImage()?.close() }, thread.handler) }
+        val previewTimes = mutableListOf<Long>()
+        val failures = mutableListOf<String>()
+        val watch = object : CameraCaptureSession.CaptureCallback() {
+            override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+                if (request.tag == PREVIEW_TAG) result.get(CaptureResult.SENSOR_TIMESTAMP)?.let { previewTimes += it }
+            }
+
+            override fun onCaptureFailed(session: CameraCaptureSession, request: CaptureRequest, failure: CaptureFailure) {
+                if (failures.size < 5) failures += "${request.tag} reason ${failure.reason}"
+            }
+        }
+        fun rates(times: List<Long>) = buildJsonObject {
+            val t = times.sorted()
+            put("frames", t.size)
+            if (t.size > 1) {
+                put("fps", (t.size - 1) * 1e9 / (t.last() - t.first()))
+                put("maxGapMs", t.zipWithNext { a, b -> b - a }.max() / 1e6)
+            }
+        }
+        try {
+            val outputs = listOf(OutputConfiguration(surface).apply { dynamicRangeProfile = DynamicRangeProfiles.HLG10 }) + readers.map { OutputConfiguration(it.surface) }
+            val session = device.session(outputs, thread)
+            try {
+                fun request(tag: String, template: Int, vararg targets: Surface) = device.createCaptureRequest(template).apply {
+                    targets.forEach { addTarget(it) }
+                    set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fps)
+                    setTag(tag)
+                }.build()
+                val previewRequest = request(PREVIEW_TAG, CameraDevice.TEMPLATE_PREVIEW, surface)
+                val stillRequest = request("still", CameraDevice.TEMPLATE_STILL_CAPTURE, readers.last().surface)
+                val ways = listOf(
+                    "alternating [preview, still]" to { listOf(previewRequest, stillRequest) },
+                    "alternating [preview, still, still]" to { listOf(previewRequest, stillRequest, stillRequest) },
+                    // Last: if the camera refuses it badly, the other two are measured already
+                    "one request (preview + still)" to { listOf(request(PREVIEW_TAG, CameraDevice.TEMPLATE_STILL_CAPTURE, surface, readers.last().surface)) },
+                )
+                return buildJsonObject {
+                    put("session", "configured")
+                    for ((name, requests) in ways) {
+                        put(name, probe {
+                            session.setSingleRepeatingRequest(previewRequest, thread.executor, noCallback)
+                            delay(1000)
+                            stillTimes.clear()
+                            previewTimes.clear()
+                            failures.clear()
+                            session.setRepeatingBurstRequests(requests(), thread.executor, watch)
+                            delay(5000)
+                            session.stopRepeating()
+                            delay(500)
+                            buildJsonObject {
+                                put("stills", rates(stillTimes.toList()))
+                                put("preview", rates(previewTimes.toList()))
+                                if (failures.isNotEmpty()) put("failures", buildJsonArray { failures.toList().forEach { add(jsonOf(it)) } })
+                            }
+                        })
+                    }
+                }
+            } finally {
+                session.close()
+            }
+        } finally {
+            readers.forEach { it.close() }
+        }
+    }
+
     // RAW: a DNG at the default (binned) size, then RAW10 at the sensor's full resolution where it is offered only in maximum-resolution mode
     private suspend fun raw(id: String): JsonObject {
         val chars = chars(id)
@@ -671,3 +765,6 @@ class LiveTests(context: Context, private val preview: PreviewHost) {
         }
     }
 }
+
+/** The tag of the preview's requests in a burst, to count its frames apart from the stills'. */
+private const val PREVIEW_TAG = "preview"
