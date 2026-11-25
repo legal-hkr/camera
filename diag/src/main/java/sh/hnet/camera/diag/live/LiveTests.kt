@@ -740,7 +740,7 @@ class LiveTests(context: Context, private val preview: PreviewHost) {
                     manager.withCamera(id) { device, thread ->
                         ImageQueue(imageReader(size.width, size.height, format, 2), thread).use { queue ->
                             val outputs = listOf(OutputConfiguration(surface).apply { if (hlg) dynamicRangeProfile = DynamicRangeProfiles.HLG10 }, OutputConfiguration(queue.reader.surface))
-                            if (supported(id, outputs) == false) return@withCamera buildJsonObject { put("skipped", "session not supported") }
+                            if (supported(id, outputs) != true) return@withCamera buildJsonObject { put("skipped", "session not confirmed") }
                             val session = device.session(outputs, thread)
                             try {
                                 val watch = ResultWatch()
@@ -862,7 +862,7 @@ class LiveTests(context: Context, private val preview: PreviewHost) {
                                             analysis?.let { add(OutputConfiguration(it.surface).apply { if (hlg) dynamicRangeProfile = DynamicRangeProfiles.HLG10 }) }
                                             add(OutputConfiguration(stills.reader.surface))
                                         }
-                                        if (supported(id, outputs) == false) return@withCamera buildJsonObject { put("skipped", "session not supported") }
+                                        if (supported(id, outputs) != true) return@withCamera buildJsonObject { put("skipped", "session not confirmed") }
                                         val session = device.session(outputs, thread)
                                         try {
                                             val repeatTargets = listOfNotNull(surface, analysis?.surface)
@@ -981,7 +981,7 @@ class LiveTests(context: Context, private val preview: PreviewHost) {
                         val reader = imageReader(size.width, size.height, variant.format, 2)
                         try {
                             val outputs = listOf(OutputConfiguration(surface), OutputConfiguration(reader.surface))
-                            if (supported(id, outputs) == false) return@withCamera buildJsonObject { put("skipped", "session not supported") }
+                            if (supported(id, outputs) != true) return@withCamera buildJsonObject { put("skipped", "session not confirmed") }
                             val session = device.session(outputs, thread)
                             try {
                                 device.repeating(session, thread, listOf(surface))
@@ -1322,7 +1322,13 @@ class LiveTests(context: Context, private val preview: PreviewHost) {
                                         }
                                         val start = SystemClock.elapsedRealtime()
                                         val result = session.captureOnce(request.build(), thread)
-                                        val image = raws.next(10_000)
+                                        // This shot's frame: an earlier shot's image that came late is dropped
+                                        val frame = result.get(CaptureResult.SENSOR_TIMESTAMP)
+                                        var image = raws.next(10_000)
+                                        while (frame != null && image.timestamp < frame) {
+                                            image.close()
+                                            image = raws.next(10_000)
+                                        }
                                         val end = SystemClock.elapsedRealtime()
                                         image.use { img ->
                                             val physical = if (chosen.physical) result.physicalCameraTotalResults[main] ?: result else result
@@ -1389,6 +1395,8 @@ class LiveTests(context: Context, private val preview: PreviewHost) {
         return manager.withCamera(id) { device, thread ->
             ImageQueue(imageReader(size.width, size.height, format, 2), thread).use { queue ->
                 val outputs = listOf(OutputConfiguration(surface).apply { if (hlg) dynamicRangeProfile = DynamicRangeProfiles.HLG10 }, OutputConfiguration(queue.reader.surface))
+                // Configured only as the camera confirms it (an HLG preview with JPEG_R isn't a mandatory set)
+                if (supported(id, outputs) != true) return@withCamera buildJsonObject { put("skipped", "session not confirmed") }
                 val session = device.session(outputs, thread)
                 try {
                     val previewDone = mutableListOf<Long>()
@@ -1456,7 +1464,7 @@ class LiveTests(context: Context, private val preview: PreviewHost) {
                     val hlgSupported = if (hlgOffered) supported(id, outputs(true)) else false
                     val sdrSupported = supported(id, outputs(false))
                     val hlg = hlgSupported == true
-                    if (!hlg && sdrSupported == false) return@withCamera buildJsonObject { put("hlgPreview", jsonOf(hlgSupported)); put("sdrPreview", false) }
+                    if (!hlg && sdrSupported != true) return@withCamera buildJsonObject { put("hlgPreview", jsonOf(hlgSupported)); put("sdrPreview", jsonOf(sdrSupported)) }
                     val session = device.session(outputs(hlg), thread)
                     try {
                         device.repeating(session, thread, listOf(surface))
@@ -1517,6 +1525,8 @@ class LiveTests(context: Context, private val preview: PreviewHost) {
         return manager.withCamera(id) { device, thread ->
             ImageQueue(imageReader(size.width, size.height, ImageFormat.RAW10, 1), thread).use { queue ->
                 val rawOutput = OutputConfiguration(queue.reader.surface).apply { addSensorPixelModeUsed(CameraMetadata.SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION) }
+                // A refused maximum-resolution mode may restart the camera service: configured only as the camera confirms it
+                if (supported(id, listOf(OutputConfiguration(surface), rawOutput)) != true) return@withCamera buildJsonObject { put("skipped", "session not confirmed") }
                 val session = device.session(listOf(OutputConfiguration(surface), rawOutput), thread)
                 try {
                     device.repeating(session, thread, listOf(surface))
