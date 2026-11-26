@@ -26,6 +26,8 @@ class Developed(
     val stats: Map<String, Double>,
     val timesMs: Map<String, Double>,
     val merge: MergeReport?,
+    /** Each finer step's time (the GPU finished at every mark), for finding where the time goes. */
+    val profileMs: Map<String, Double> = emptyMap(),
 )
 
 /**
@@ -97,7 +99,7 @@ private class Pass(private val gpu: Gpu, private val series: List<RawFrame>, pri
     private var peakBytes = 0L
 
     private inline fun <T> timed(name: String, block: () -> T): T {
-        progress(name.removeSuffix("Ms"), gpu.liveBytes)
+        mark(name.removeSuffix("Ms"))
         val start = System.nanoTime()
         val result = block()
         gpu.finish()
@@ -120,7 +122,7 @@ private class Pass(private val gpu: Gpu, private val series: List<RawFrame>, pri
                 stats["reference"] = merged.reference.toDouble()
                 stats["otherFramesUsed"] = merged.used
                 it.close()
-                timed("unplaneMs") { unplane(merged.planes) }
+                timed("unplaneMs") { unplane(merged.parities, merged.tiles) }
             }
         }
         val (cells, cellsX, cellsY) = timed("cellsMs") { cells(normalized) }
@@ -174,9 +176,10 @@ private class Pass(private val gpu: Gpu, private val series: List<RawFrame>, pri
                 rgba to gainMap(f)
             }
         }
+        mark("end")
         stats["glError"] = gpu.error().toDouble()
         stats["gpuPeakMB"] = peakBytes / 1e6
-        return Developed(cw, ch, bytes, gainMap, stats, times, report)
+        return Developed(cw, ch, bytes, gainMap, stats, times, report, profile)
     }
 
     /** The Ultra HDR gain map of the finished SDR picture (a quarter of its size, one byte per pixel). */
@@ -222,16 +225,17 @@ private class Pass(private val gpu: Gpu, private val series: List<RawFrame>, pri
         return out
     }
 
-    /** The merged planes back into one mosaic (the planes closed). */
-    private fun unplane(planes: List<Texture>): Texture {
+    /** The merge's parity images added back into one mosaic (the images closed). */
+    private fun unplane(parities: List<Texture>, tiles: Pair<Int, Int>): Texture {
         val out = gpu.texture(width, height, GLES30.GL_R32F)
         try {
-            gpu.run(Shaders.UNPLANE, width, height, samplers = planes, images = listOf(out)) {
+            gpu.run(Shaders.UNPLANE, width, height, samplers = parities, images = listOf(out)) {
                 int("pad", Merge.PAD)
+                ints("tiles", tiles.first, tiles.second)
                 ints("size", width, height)
             }
         } finally {
-            planes.forEach { it.close() }
+            parities.forEach { it.close() }
         }
         return out
     }
@@ -428,6 +432,7 @@ private class Pass(private val gpu: Gpu, private val series: List<RawFrame>, pri
             return curve
         }
         // Python's round: half to even (81.28 → 81 here)
+        mark("curve: local contrast")
         val radius = Math.rint(look.clarityRadius * maxOf(w, h) / 1000.0).toInt()
         val means = moments.use { box(it, radius, GLES30.GL_RGBA32F) }
         val coefficients = gpu.texture(w, h, GLES30.GL_RGBA16F)
@@ -458,42 +463,65 @@ private class Pass(private val gpu: Gpu, private val series: List<RawFrame>, pri
     private fun box(src: Texture, radius: Int, format: Int): Texture {
         val name = imageFormat(format)
         val across = gpu.texture(src.width, src.height, format)
-        gpu.runLines(Shaders.boxRows(name), src.height, samplers = listOf(src), images = listOf(across)) {
-            ints("size", src.width, src.height)
-            int("radius", radius)
-        }
         val out = gpu.texture(src.width, src.height, format)
-        across.use {
-            gpu.runLines(Shaders.boxColumns(name), src.width, samplers = listOf(it), images = listOf(out)) {
+        if (radius <= 8) {
+            // A few taps: summed directly, every pixel at once
+            gpu.run(Shaders.boxDirect(name), src.width, src.height, samplers = listOf(src), images = listOf(across)) {
                 ints("size", src.width, src.height)
                 int("radius", radius)
+                int("axis", 0)
+            }
+            across.use {
+                gpu.run(Shaders.boxDirect(name), src.width, src.height, samplers = listOf(it), images = listOf(out)) {
+                    ints("size", src.width, src.height)
+                    int("radius", radius)
+                    int("axis", 1)
+                }
+            }
+        } else {
+            // Wide: running sums along pieces of rows, then of columns
+            val segment = Shaders.SEGMENT
+            gpu.run(Shaders.boxRows(name), (src.width + segment - 1) / segment, src.height, samplers = listOf(src), images = listOf(across)) {
+                ints("size", src.width, src.height)
+                int("radius", radius)
+                int("segment", segment)
+            }
+            across.use {
+                gpu.run(Shaders.boxColumns(name), src.width, (src.height + segment - 1) / segment, samplers = listOf(it), images = listOf(out)) {
+                    ints("size", src.width, src.height)
+                    int("radius", radius)
+                    int("segment", segment)
+                }
             }
         }
         trackPeak()
         return out
     }
 
-    /** A Gaussian blur (OpenCV's kernel for floats: 8σ + 1 taps), rows then columns, stored as [format] (single-channel by default). */
+    /**
+     * A Gaussian blur (OpenCV's kernel for floats: 8σ + 1 taps), rows then columns, each work group reading its piece into shared memory once; stored as
+     * [format] (single-channel by default).
+     */
     private fun gauss(src: Texture, sigma: Double, format: Int = GLES30.GL_R32F): Texture {
         val kernel = Stats.gaussianKernel(sigma)
         check(kernel.size <= 33) { "blur too wide" }
-        val program = Shaders.gauss(imageFormat(format))
-        var current = src
-        var owned = false
-        for (axis in 0..1) {
-            val out = gpu.texture(src.width, src.height, format)
-            gpu.run(program, src.width, src.height, samplers = listOf(current), images = listOf(out)) {
+        val name = imageFormat(format)
+        val across = gpu.texture(src.width, src.height, format)
+        gpu.runGroups(Shaders.gaussRows(name), (src.width + 63) / 64, (src.height + 3) / 4, samplers = listOf(src), images = listOf(across)) {
+            ints("size", src.width, src.height)
+            int("taps", kernel.size)
+            floats("kernel", kernel.copyOf(33))
+        }
+        val out = gpu.texture(src.width, src.height, format)
+        across.use {
+            gpu.runGroups(Shaders.gaussColumns(name), (src.width + 3) / 4, (src.height + 63) / 64, samplers = listOf(it), images = listOf(out)) {
                 ints("size", src.width, src.height)
-                int("axis", axis)
                 int("taps", kernel.size)
                 floats("kernel", kernel.copyOf(33))
             }
-            trackPeak()
-            if (owned) current.close()
-            current = out
-            owned = true
         }
-        return current
+        trackPeak()
+        return out
     }
 
     private fun imageFormat(format: Int) = when (format) {
@@ -506,11 +534,23 @@ private class Pass(private val gpu: Gpu, private val series: List<RawFrame>, pri
         peakBytes = maxOf(peakBytes, gpu.liveBytes)
     }
 
-    /** A finer step inside a timed one, for the progress (where a failure stopped). */
+    /**
+     * A finer step inside a timed one: for the progress (where a failure stopped) and the profile – the GPU finishes what was asked, and the time since
+     * the previous mark goes to the previous mark's name (names repeat: their times add up).
+     */
     private fun mark(name: String) {
         trackPeak()
+        gpu.finish()
+        val now = System.nanoTime()
+        segment?.let { profile[it] = (profile[it] ?: 0.0) + (now - segmentStart) / 1e6 }
+        segment = name
+        segmentStart = now
         progress(name, gpu.liveBytes)
     }
+
+    private val profile = LinkedHashMap<String, Double>()
+    private var segment: String? = null
+    private var segmentStart = 0L
 
     /**
      * Chroma denoising, saturation, luma denoising, sharpening and the hue curve, as the prototype's `finish` and `hue_curve`: the color as each
@@ -526,7 +566,7 @@ private class Pass(private val gpu: Gpu, private val series: List<RawFrame>, pri
         val inputB = gpu.texture(hw, hh, GLES30.GL_RGBA32F)
         val ratios = gpu.texture(hw, hh, GLES30.GL_RGBA32F)
         gpu.run(Shaders.CHROMA_INPUT, hw, hh, samplers = listOf(display), images = listOf(inputA, inputB, ratios)) { ints("size", hw, hh) }
-        mark("finish: color")
+        mark("finish: color boxes")
         val meanA = box(inputA, look.chromaRadius, GLES30.GL_RGBA32F)
         val meanB = inputB.use { box(it, look.chromaRadius, GLES30.GL_RGBA32F) }
         val coefficientsA = gpu.texture(hw, hh, GLES30.GL_RGBA32F)
@@ -541,6 +581,7 @@ private class Pass(private val gpu: Gpu, private val series: List<RawFrame>, pri
         }
         val boxedA = coefficientsA.use { box(it, look.chromaRadius, GLES30.GL_RGBA32F) }
         val boxedB = coefficientsB.use { box(it, look.chromaRadius, GLES30.GL_RGBA32F) }
+        mark("finish: color mix")
         val wide = gpu.texture(hw, hh, GLES30.GL_RGBA32F)
         val local = gpu.texture(hw, hh, GLES30.GL_RGBA32F)
         val apart = gpu.texture(hw, hh, GLES30.GL_R32F)
@@ -553,8 +594,10 @@ private class Pass(private val gpu: Gpu, private val series: List<RawFrame>, pri
                 }
             }
         }
+        mark("finish: blurs")
         val apartBlurred = apart.use { gauss(it, 1.0) }
         val noise2 = gauss(noise, 2.0)
+        mark("finish: color keep")
         val ratioHalf = gpu.texture(hw, hh, GLES30.GL_RGBA32F)
         wide.use { wd ->
             local.use { lc ->
@@ -573,6 +616,7 @@ private class Pass(private val gpu: Gpu, private val series: List<RawFrame>, pri
         val noise4 = noise.use { gauss(it, 4.0) }
         val moments = gpu.texture(w, h, GLES30.GL_RGBA32F)
         display.use { gpu.run(Shaders.LUMA_INPUT, w, h, samplers = listOf(it), images = listOf(moments)) { ints("size", w, h) } }
+        mark("finish: luma boxes")
         val momentMeans = box(moments, 2, GLES30.GL_RGBA32F)
         val coefficients = gpu.texture(w, h, GLES30.GL_RGBA16F)
         momentMeans.use { m ->
@@ -596,6 +640,7 @@ private class Pass(private val gpu: Gpu, private val series: List<RawFrame>, pri
         mark("finish: sharpening and hues")
         val blurred = gauss(luma, look.sharpenRadius.toDouble())
         // Full floats before the 8 bits: half floats would move values near white across a step
+        mark("finish: last pass")
         val out = gpu.texture(w, h, GLES30.GL_RGBA32F)
         val hues = look.hues ?: FloatArray(0)
         ratioHalf.use { r ->

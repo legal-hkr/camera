@@ -665,6 +665,7 @@ class QualityTests(context: Context, private val preview: PreviewHost) {
             put("size", "${developed.width}x${developed.height}")
             put("timesMs", buildJsonObject { developed.timesMs.forEach { (k, v) -> put(k, v) } })
             put("totalMs", developed.timesMs.values.sum())
+            put("profileMs", buildJsonObject { developed.profileMs.forEach { (k, v) -> put(k, v) } })
             put("stats", buildJsonObject { developed.stats.forEach { (k, v) -> put(k, v) } })
             developed.merge?.let { merge ->
                 val shiftsFile = "z1.0_ev0_shifts_gpu.bin"

@@ -8,8 +8,11 @@ import android.opengl.GLES30
  * 2 × 2 position's plane is merged in the frequency domain. The result is the merged planes (padded, one per position).
  */
 internal class Merge(private val gpu: Gpu, private val frames: List<RawFrame>, private val mark: (String) -> Unit) {
-    /** The merged series: [planes] (padded by [PAD]), the reference's index, how much of the other frames the tiles used, each other frame's shifts. */
-    class Result(val planes: List<Texture>, val reference: Int, val used: Double, val shifts: List<IntArray>, val tiles: Pair<Int, Int>, val sharpness: List<Double>)
+    /**
+     * The merged series: [parities] (four padded images, one per tile parity, the four positions' planes in their channels – [Shaders.UNPLANE] adds
+     * them), the reference's index, how much of the other frames the tiles used, each other frame's shifts.
+     */
+    class Result(val parities: List<Texture>, val reference: Int, val used: Double, val shifts: List<IntArray>, val tiles: Pair<Int, Int>, val sharpness: List<Double>)
 
     private class Level(val factor: Int, val tile: Int, val stride: Int, val radius: Int, val l2: Boolean)
 
@@ -32,25 +35,19 @@ internal class Merge(private val gpu: Gpu, private val frames: List<RawFrame>, p
             val reference = sharpness.indices.maxBy { sharpness[it] }
             val others = frames.indices.filter { it != reference }
             mark("merge: alignment")
-            val aligned = others.map { align(pyramids[reference], pyramids[it]) }
-            pyramids.flatten().forEach { it.close() }
             val (tilesX, tilesY) = grid(paddedWidth, paddedHeight, TILE, STRIDE)
-            // Every other frame's finest shifts stacked into one texture (frame a's rows from a × tilesY), for the merge
+            // Every other frame's finest shifts written straight into one texture (frame a's rows from a × tilesY), which the merge reads
             val shifts = gpu.texture(tilesX, maxOf(tilesY * others.size, 1), GLES30.GL_RGBA32F)
-            val read = ArrayList<IntArray>()
             try {
-                aligned.forEachIndexed { a, texture ->
-                    val values = texture.use { gpu.read(it, 2) }
-                    read += IntArray(values.size) { values[it].toInt() }
-                    val stacked = java.nio.ByteBuffer.allocateDirect(values.size / 2 * 16).order(java.nio.ByteOrder.nativeOrder()).asFloatBuffer()
-                    for (i in 0 until values.size / 2) stacked.put(values[i * 2]).put(values[i * 2 + 1]).put(0f).put(0f)
-                    GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, shifts.id)
-                    GLES30.glPixelStorei(GLES30.GL_UNPACK_ALIGNMENT, 4)
-                    GLES30.glTexSubImage2D(GLES30.GL_TEXTURE_2D, 0, 0, a * tilesY, tilesX, tilesY, GLES30.GL_RGBA, GLES30.GL_FLOAT, stacked.position(0))
-                }
+                others.forEachIndexed { a, other -> align(pyramids[reference], pyramids[other], shifts, a * tilesY) }
+                pyramids.flatten().forEach { it.close() }
+                mark("merge: shifts read")
+                val values = gpu.read(shifts, 2)
+                val per = tilesX * tilesY * 2
+                val read = others.indices.map { a -> IntArray(per) { values[a * per + it].toInt() } }
                 mark("merge: frequency domain")
-                val (planes, used) = merge(raws, shifts, reference, others, tilesX, tilesY)
-                return Result(planes, reference, used, read, tilesX to tilesY, sharpness)
+                val (parities, used) = merge(raws, shifts, reference, others, tilesX, tilesY)
+                return Result(parities, reference, used, read, tilesX to tilesY, sharpness)
             } finally {
                 shifts.close()
             }
@@ -61,6 +58,7 @@ internal class Merge(private val gpu: Gpu, private val frames: List<RawFrame>, p
 
     /** The frame's padded half-size gray and three coarser levels (Gaussian blur of σ = factor / 2, then the mean of factor × factor blocks). */
     private fun pyramid(raws: Texture, layer: Int): List<Texture> {
+        mark("merge: gray")
         val gray = gpu.texture(paddedWidth, paddedHeight, GLES30.GL_R32F)
         gpu.run(Shaders.GRAY_PAD, paddedWidth, paddedHeight, samplers = listOf(raws), images = listOf(gray)) {
             int("layer", layer)
@@ -71,6 +69,7 @@ internal class Merge(private val gpu: Gpu, private val frames: List<RawFrame>, p
             ints("outSize", paddedWidth, paddedHeight)
         }
         val levels = mutableListOf(gray)
+        mark("merge: pyramid levels")
         for (level in LEVELS.drop(1)) {
             val below = levels.last()
             val blurred = blur(below, 0.5 * level.factor)
@@ -89,19 +88,16 @@ internal class Merge(private val gpu: Gpu, private val frames: List<RawFrame>, p
 
     private fun blur(src: Texture, sigma: Double): Texture {
         val kernel = Stats.gaussianKernel(sigma)
-        val program = Shaders.gauss("r32f")
         val across = gpu.texture(src.width, src.height, GLES30.GL_R32F)
-        gpu.run(program, src.width, src.height, samplers = listOf(src), images = listOf(across)) {
+        gpu.runGroups(Shaders.gaussRows("r32f"), (src.width + 63) / 64, (src.height + 3) / 4, samplers = listOf(src), images = listOf(across)) {
             ints("size", src.width, src.height)
-            int("axis", 0)
             int("taps", kernel.size)
             floats("kernel", kernel.copyOf(33))
         }
         val out = gpu.texture(src.width, src.height, GLES30.GL_R32F)
         across.use {
-            gpu.run(program, src.width, src.height, samplers = listOf(it), images = listOf(out)) {
+            gpu.runGroups(Shaders.gaussColumns("r32f"), (src.width + 3) / 4, (src.height + 63) / 64, samplers = listOf(it), images = listOf(out)) {
                 ints("size", src.width, src.height)
-                int("axis", 1)
                 int("taps", kernel.size)
                 floats("kernel", kernel.copyOf(33))
             }
@@ -126,19 +122,20 @@ internal class Merge(private val gpu: Gpu, private val frames: List<RawFrame>, p
         }
     }
 
-    /** The alternate's shift for every finest tile, coarse to fine (texture of the finest grid: shift y, shift x). */
-    private fun align(reference: List<Texture>, alternate: List<Texture>): Texture {
+    /** The alternate's shift for every finest tile, coarse to fine, written into [shifts] from row [row] on (shift y, shift x). */
+    private fun align(reference: List<Texture>, alternate: List<Texture>, shifts: Texture, row: Int) {
         var coarse: Texture? = null
         var coarseGrid = 0 to 0
         for (index in LEVELS.indices.reversed()) {
+            mark("merge: align level $index")
             val level = LEVELS[index]
             val factorUp = if (index + 1 < LEVELS.size) LEVELS[index + 1].factor else 1
             val r = reference[index]
             val (tilesX, tilesY) = grid(r.width, r.height, level.tile, level.stride)
-            val out = gpu.texture(tilesX, tilesY, GLES30.GL_RGBA32F)
+            val out = if (index == 0) shifts else gpu.texture(tilesX, tilesY, GLES30.GL_RGBA32F)
             val prior = coarse ?: gpu.texture(1, 1, GLES30.GL_RGBA32F)
             try {
-                gpu.run(Shaders.ALIGN, tilesX, tilesY, samplers = listOf(r, alternate[index], prior), images = listOf(out)) {
+                gpu.runGroups(Shaders.ALIGN, tilesX, tilesY, samplers = listOf(r, alternate[index], prior), images = listOf(out)) {
                     ints("levelSize", r.width, r.height)
                     ints("tiles", tilesX, tilesY)
                     int("tile", level.tile)
@@ -151,54 +148,49 @@ internal class Merge(private val gpu: Gpu, private val frames: List<RawFrame>, p
                     int("coarseTile", if (index + 1 < LEVELS.size) LEVELS[index + 1].tile else 1)
                     int("coarseStride", if (index + 1 < LEVELS.size) LEVELS[index + 1].stride else 1)
                     int("factorUp", factorUp)
+                    int("outRow", if (index == 0) row else 0)
                 }
             } finally {
                 prior.close()
             }
-            coarse = out
+            coarse = out.takeIf { index > 0 }
             coarseGrid = tilesX to tilesY
         }
-        return checkNotNull(coarse)
     }
 
     private fun merge(raws: Texture, shifts: Texture, reference: Int, others: List<Int>, tilesX: Int, tilesY: Int): Pair<List<Texture>, Double> {
-        val planes = ArrayList<Texture>()
-        var usedSum = 0.0
+        val parities = ArrayList<Texture>()
+        val used = gpu.texture(tilesX, tilesY, GLES30.GL_R32F)
         try {
-            for (position in 0 until 4) {
-                val plane = gpu.texture(paddedWidth, paddedHeight, GLES30.GL_R32F)
-                planes += plane
-                gpu.run(Shaders.CLEAR, paddedWidth, paddedHeight, images = listOf(plane)) { ints("size", paddedWidth, paddedHeight) }
-                val used = gpu.texture(tilesX, tilesY, GLES30.GL_R32F)
-                used.use {
-                    for (parity in listOf(0 to 0, 1 to 0, 0 to 1, 1 to 1)) {
-                        gpu.runGroups(Shaders.MERGE, (tilesX + 1) / 2, (tilesY + 1) / 2, samplers = listOf(raws, shifts), images = listOf(plane, it)) {
-                            int("position", position)
-                            ints("parity", parity.first, parity.second)
-                            ints("tiles", tilesX, tilesY)
-                            ints("planeSize", planeWidth, planeHeight)
-                            ints("padded", paddedWidth, paddedHeight)
-                            int("pad", PAD)
-                            int("count", frames.size)
-                            int("referenceLayer", reference)
-                            ints("order", *IntArray(8) { others.getOrElse(it) { 0 } })
-                            vec4s("blacks", FloatArray(32) { frames.getOrNull(it / 4)?.meta?.black?.get(it % 4) ?: 0f })
-                            floats("ranges", FloatArray(8) { if (it < frames.size) range(it) else 1f })
-                            // The reference's noise profile, as the prototype's merge takes it
-                            float("noiseS", frames[reference].meta.noiseS.toFloat())
-                            float("noiseO", frames[reference].meta.noiseO.toFloat())
-                            float("temporal", TEMPORAL)
-                            float("spatial", SPATIAL)
-                        }
-                    }
-                    usedSum += gpu.read(it, 1).average()
+            for (parity in listOf(0 to 0, 1 to 0, 0 to 1, 1 to 1)) {
+                mark("merge: parity")
+                val out = gpu.texture(paddedWidth, paddedHeight, GLES30.GL_RGBA32F)
+                parities += out
+                gpu.runGroups(Shaders.MERGE, (tilesX + 1) / 2, (tilesY + 1) / 2, samplers = listOf(raws, shifts), images = listOf(out, used)) {
+                    ints("parity", parity.first, parity.second)
+                    ints("tiles", tilesX, tilesY)
+                    ints("planeSize", planeWidth, planeHeight)
+                    ints("padded", paddedWidth, paddedHeight)
+                    int("pad", PAD)
+                    int("count", frames.size)
+                    int("referenceLayer", reference)
+                    ints("order", *IntArray(8) { others.getOrElse(it) { 0 } })
+                    vec4s("blacks", FloatArray(32) { frames.getOrNull(it / 4)?.meta?.black?.get(it % 4) ?: 0f })
+                    floats("ranges", FloatArray(8) { if (it < frames.size) range(it) else 1f })
+                    // The reference's noise profile, as the prototype's merge takes it
+                    float("noiseS", frames[reference].meta.noiseS.toFloat())
+                    float("noiseO", frames[reference].meta.noiseO.toFloat())
+                    float("temporal", TEMPORAL)
+                    float("spatial", SPATIAL)
                 }
             }
+            return parities to gpu.read(used, 1).average()
         } catch (e: Throwable) {
-            planes.forEach { it.close() }
+            parities.forEach { it.close() }
             throw e
+        } finally {
+            used.close()
         }
-        return planes to usedSum / 4
     }
 
     private fun grid(w: Int, h: Int, tile: Int, stride: Int) = ((w - tile) / stride + 1) to ((h - tile) / stride + 1)

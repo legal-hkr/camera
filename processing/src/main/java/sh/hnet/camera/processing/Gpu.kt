@@ -170,7 +170,12 @@ internal class Gpu : AutoCloseable {
             val mapped = GLES30.glMapBufferRange(GLES31.GL_SHADER_STORAGE_BUFFER, 0, count * 16, GLES30.GL_MAP_READ_BIT) as ByteBuffer
             val floats = mapped.order(ByteOrder.nativeOrder()).asFloatBuffer()
             val out = FloatArray(count * channels)
-            for (i in 0 until count) for (c in 0 until channels) out[i * channels + c] = floats.get(i * 4 + c)
+            if (channels == 4) {
+                floats.get(out)
+            } else {
+                val all = FloatArray(count * 4).also { floats.get(it) }
+                for (i in 0 until count) for (c in 0 until channels) out[i * channels + c] = all[i * 4 + c]
+            }
             GLES30.glUnmapBuffer(GLES31.GL_SHADER_STORAGE_BUFFER)
             return out
         } finally {
