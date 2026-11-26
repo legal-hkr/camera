@@ -757,6 +757,32 @@ void main() {
 }
 """
 
+    /**
+     * The Ultra HDR gain map (one 8-bit channel at a quarter of the size): each 4 × 4 block's mean linear luminance Y of the finished SDR picture,
+     * log2 boost = a·Y + b·Y² up to [maxStops], stored as boost / maxStops (gain map min 0, gamma 1).
+     */
+    const val GAIN_MAP = HEAD + GRID + """
+layout(binding = 0) uniform sampler2D src;
+layout(rgba8, binding = 0) writeonly uniform highp image2D dst;
+uniform ivec2 outSize;
+uniform float a;
+uniform float b;
+uniform float maxStops;
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= outSize.x || p.y >= outSize.y) return;
+    float sum = 0.0;
+    for (int y = 0; y < 4; y++) for (int x = 0; x < 4; x++) {
+        vec3 c = texelFetch(src, p * 4 + ivec2(x, y), 0).rgb;
+        sum += dot(vec3(linearFromSrgb(c.r), linearFromSrgb(c.g), linearFromSrgb(c.b)), LUMA);
+    }
+    float luminance = sum / 16.0;
+    float stops = min(a * luminance + b * luminance * luminance, maxStops);
+    float g = floor(clamp(stops / maxStops, 0.0, 1.0) * 255.0 + 0.5) / 255.0;
+    imageStore(dst, p, vec4(g, g, g, 1.0));
+}
+"""
+
     /** 0..1 to 8 bits as the prototype saves (× 255 + ½, cut), for the JPEG. */
     const val TO_BYTES = HEAD + GRID + """
 layout(binding = 0) uniform sampler2D src;

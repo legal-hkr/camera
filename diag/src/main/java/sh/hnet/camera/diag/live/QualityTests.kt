@@ -2,6 +2,7 @@ package sh.hnet.camera.diag.live
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.Gainmap
 import android.graphics.ImageFormat
 import android.graphics.SurfaceTexture
 import android.hardware.Sensor
@@ -45,6 +46,8 @@ import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import androidx.core.content.edit
+import androidx.core.graphics.createBitmap
 import sh.hnet.camera.capabilities.Names
 import sh.hnet.camera.capabilities.area
 import sh.hnet.camera.capabilities.jsonOf
@@ -550,7 +553,7 @@ class QualityTests(context: Context, private val preview: PreviewHost) {
     private suspend fun process(id: String): JsonObject {
         // The previous run ended the app during the GPU development: this run only says where (the report is written when a test returns)
         processSteps.getString("step", null)?.let { step ->
-            processSteps.edit().clear().commit()
+            processSteps.edit(commit = true) { clear() }
             return buildJsonObject {
                 put("previousRunStoppedAt", step)
                 put("note", "the app closed during this step of the GPU development; run the test again for a new attempt")
@@ -592,7 +595,7 @@ class QualityTests(context: Context, private val preview: PreviewHost) {
             throw e
         } catch (e: Throwable) {
             // Out of memory is an Error, which probe would let through and close the app with
-            processSteps.edit().clear().commit()
+            processSteps.edit(commit = true) { clear() }
             buildJsonObject { put("error", "${e.javaClass.simpleName}: ${e.message}") }
         }
         return buildJsonObject {
@@ -611,18 +614,18 @@ class QualityTests(context: Context, private val preview: PreviewHost) {
         // On Android a direct buffer is on the Java heap: the 8 frames' copies take 200 MB of it (the app's large heap), so each picture is saved and
         // let go before the next development
         val renderer = withContext(Dispatchers.Default) {
-            processSteps.edit().putString("step", "GPU context").commit()
+            processSteps.edit(commit = true) { putString("step", "GPU context") }
             Developer().use { developer ->
                 listOf(frames.take(1), frames).forEachIndexed { index, series ->
                     val developed = developer.develop(series) { step, bytes ->
-                        processSteps.edit().putString("step", "${series.size} frames: $step (GPU memory held: ${bytes / 1_000_000} MB)").commit()
+                        processSteps.edit(commit = true) { putString("step", "${series.size} frames: $step (GPU memory held: ${bytes / 1_000_000} MB)") }
                     }
-                    parts += (if (index == 0) "single" else "merged") to saveDeveloped(developed, folder, names[index], numbers)
+                    parts += (if (index == 0) "single" else "merged") to saveDeveloped(developed, folder, names[index], numbers, frames.first().meta.orientation)
                 }
                 developer.renderer
             }
         }
-        processSteps.edit().clear().commit()
+        processSteps.edit(commit = true) { clear() }
         return buildJsonObject {
             put("renderer", renderer)
             put("frames", frames.size)
@@ -633,16 +636,32 @@ class QualityTests(context: Context, private val preview: PreviewHost) {
     }
 
     /** A developed picture saved as a PNG (and a series' tile shifts as a binary file); its numbers for the report. */
-    private suspend fun saveDeveloped(developed: Developed, folder: String, name: String, numbers: List<Int>): JsonObject {
-        processSteps.edit().putString("step", "saving $name").commit()
-        val bitmap = Bitmap.createBitmap(developed.width, developed.height, Bitmap.Config.ARGB_8888)
+    private suspend fun saveDeveloped(developed: Developed, folder: String, name: String, numbers: List<Int>, orientation: Int): JsonObject {
+        processSteps.edit(commit = true) { putString("step", "saving $name") }
+        val bitmap = createBitmap(developed.width, developed.height, Bitmap.Config.ARGB_8888)
         bitmap.copyPixelsFromBuffer(developed.rgba.position(0))
         withContext(Dispatchers.IO) {
-            Media.writeDownload(resolver, folder, name, "image/png") { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+            Media.writeDownload(resolver, folder, name, "image/png") { check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, it)) { "PNG not written" } }
         }
         bitmap.recycle()
+        val gainName = name.replace("_gpu.png", "_gainmap.pgm")
+        val ultraName = name.replace("_gpu.png", "_ultrahdr.jpg")
+        processSteps.edit(commit = true) { putString("step", "saving $ultraName") }
+        withContext(Dispatchers.IO) {
+            val map = developed.gainMap
+            // The gain map as a plain gray PGM (Android's PNG encoder takes no ALPHA_8 bitmap: it returns false and writes nothing)
+            Media.writeDownload(resolver, folder, gainName, "image/x-portable-graymap") { out ->
+                out.write("P5\n${map.width} ${map.height}\n255\n".toByteArray())
+                out.write(map.values)
+            }
+            val upright = ultraHdr(developed, orientation)
+            Media.writeDownload(resolver, folder, ultraName, "image/jpeg") { check(upright.compress(Bitmap.CompressFormat.JPEG, 95, it)) { "JPEG not written" } }
+            upright.recycle()
+        }
         return buildJsonObject {
             put("file", name)
+            put("gainMap", gainName)
+            put("ultraHdr", ultraName)
             put("size", "${developed.width}x${developed.height}")
             put("timesMs", buildJsonObject { developed.timesMs.forEach { (k, v) -> put(k, v) } })
             put("totalMs", developed.timesMs.values.sum())
@@ -664,6 +683,69 @@ class QualityTests(context: Context, private val preview: PreviewHost) {
                 put("shiftsFile", shiftsFile)
             }
         }
+    }
+
+    /** One byte per pixel laid out with a bitmap's row length. */
+    private fun rows(values: ByteArray, width: Int, height: Int, rowBytes: Int): ByteBuffer {
+        val out = ByteBuffer.allocate(rowBytes * height)
+        for (y in 0 until height) {
+            out.position(y * rowBytes)
+            out.put(values, y * width, width)
+        }
+        out.position(0)
+        return out
+    }
+
+    /**
+     * The developed picture as Ultra HDR, turned upright by its EXIF [orientation] (6: a quarter clockwise, 3: half, 8: a quarter counter-clockwise),
+     * its gain map turned with it: the base and the map as Android writes them (`Bitmap` + `Gainmap`), to look at in a gallery next to the camera's.
+     * Row by row with plain index math (no per-pixel objects: 12 Mpx).
+     */
+    private fun ultraHdr(developed: Developed, orientation: Int): Bitmap {
+        val turn = when (orientation) {
+            6 -> 1
+            3 -> 2
+            8 -> 3
+            else -> 0
+        }
+        val w = developed.width
+        val h = developed.height
+        val rgba = developed.rgba
+        val (ow, oh) = if (turn % 2 == 1) h to w else w to h
+        val base = createBitmap(ow, oh, Bitmap.Config.ARGB_8888)
+        val row = IntArray(ow)
+        for (y in 0 until oh) {
+            for (x in 0 until ow) {
+                val i = (sourceIndex(turn, x, y, w, h)) * 4
+                row[x] = (0xFF shl 24) or ((rgba.get(i).toInt() and 0xFF) shl 16) or ((rgba.get(i + 1).toInt() and 0xFF) shl 8) or (rgba.get(i + 2).toInt() and 0xFF)
+            }
+            base.setPixels(row, 0, ow, 0, y, ow, 1)
+        }
+        val map = developed.gainMap
+        val (mw, mh) = if (turn % 2 == 1) map.height to map.width else map.width to map.height
+        val values = ByteArray(mw * mh)
+        for (y in 0 until mh) for (x in 0 until mw) values[y * mw + x] = map.values[sourceIndex(turn, x, y, map.width, map.height)]
+        val gain = createBitmap(mw, mh, Bitmap.Config.ALPHA_8)
+        gain.copyPixelsFromBuffer(rows(values, mw, mh, gain.rowBytes))
+        val ratio = 2f.pow(map.maxStops)
+        base.gainmap = Gainmap(gain).apply {
+            setRatioMin(1f, 1f, 1f)
+            setRatioMax(ratio, ratio, ratio)
+            setGamma(1f, 1f, 1f)
+            setEpsilonSdr(1f / 2048, 1f / 2048, 1f / 2048)
+            setEpsilonHdr(1f / 2048, 1f / 2048, 1f / 2048)
+            minDisplayRatioForHdrTransition = 1f
+            displayRatioForFullHdr = ratio
+        }
+        return base
+    }
+
+    /** The index (row by row) in a [width] × [height] picture of the pixel shown at (x, y) once it is turned [turn] quarters clockwise. */
+    private fun sourceIndex(turn: Int, x: Int, y: Int, width: Int, height: Int): Int = when (turn) {
+        1 -> (height - 1 - x) * width + y
+        2 -> (height - 1 - y) * width + (width - 1 - x)
+        3 -> x * width + (width - 1 - y)
+        else -> y * width + x
     }
 
     /** A RAW image's samples copied out (rows packed) with its metadata, or null without a Bayer pattern. */

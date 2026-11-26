@@ -14,10 +14,25 @@ import kotlin.math.pow
 import kotlin.math.sqrt
 
 /**
- * A developed picture: [rgba] (8 bits per channel, row by row, not yet turned by the frame's orientation), the numbers the development measured and how
- * long each step took. For a series also its [merge]: the reference frame, the share of the other frames used, each other frame's tile shifts.
+ * A developed picture: [rgba] (8 bits per channel, row by row, not yet turned by the frame's orientation), its Ultra HDR [gainMap], the numbers the
+ * development measured and how long each step took. For a series also its [merge]: the reference frame, the share of the other frames used, each other
+ * frame's tile shifts.
  */
-class Developed(val width: Int, val height: Int, val rgba: ByteBuffer, val stats: Map<String, Double>, val timesMs: Map<String, Double>, val merge: MergeReport?)
+class Developed(
+    val width: Int,
+    val height: Int,
+    val rgba: ByteBuffer,
+    val gainMap: GainMap,
+    val stats: Map<String, Double>,
+    val timesMs: Map<String, Double>,
+    val merge: MergeReport?,
+)
+
+/**
+ * An Ultra HDR gain map (ISO 21496-1 / Android's `Gainmap`): [values] one byte per pixel, [width] × [height] (a quarter of the picture), encoded as
+ * log2 boost / [maxStops] – gain map min 0 stops, max [maxStops], gamma 1, offsets 1/2048 for SDR and HDR, HDR capacity 0 to [maxStops].
+ */
+class GainMap(val width: Int, val height: Int, val values: ByteArray, val maxStops: Float)
 
 /**
  * How a series was merged: [reference] (index in the series), [used] (0..1), [shifts] per other frame (in the series' order, the reference left out):
@@ -149,18 +164,36 @@ private class Pass(private val gpu: Gpu, private val series: List<RawFrame>, pri
             }
         }
         val finished = timed("finishMs") { finish(display, noise) }
-        val bytes = timed("outputMs") {
+        val (bytes, gainMap) = timed("outputMs") {
             finished.use { f ->
                 val out = gpu.texture(cw, ch, GLES30.GL_RGBA8)
-                out.use {
+                val rgba = out.use {
                     gpu.run(Shaders.TO_BYTES, cw, ch, samplers = listOf(f), images = listOf(it)) { ints("size", cw, ch) }
                     gpu.readRgba8(it)
                 }
+                rgba to gainMap(f)
             }
         }
         stats["glError"] = gpu.error().toDouble()
         stats["gpuPeakMB"] = peakBytes / 1e6
-        return Developed(cw, ch, bytes, stats, times, report)
+        return Developed(cw, ch, bytes, gainMap, stats, times, report)
+    }
+
+    /** The Ultra HDR gain map of the finished SDR picture (a quarter of its size, one byte per pixel). */
+    private fun gainMap(finished: Texture): GainMap {
+        val w = finished.width / 4
+        val h = finished.height / 4
+        val out = gpu.texture(w, h, GLES30.GL_RGBA8)
+        return out.use {
+            gpu.run(Shaders.GAIN_MAP, w, h, samplers = listOf(finished), images = listOf(it)) {
+                ints("outSize", w, h)
+                float("a", look.gainLinear)
+                float("b", look.gainQuadratic)
+                float("maxStops", look.gainMaxStops)
+            }
+            val rgba = gpu.readRgba8(it)
+            GainMap(w, h, ByteArray(w * h) { i -> rgba.get(i * 4) }, look.gainMaxStops)
+        }
     }
 
     /**

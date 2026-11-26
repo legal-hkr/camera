@@ -58,6 +58,14 @@ data class Look(
     val lumaEdge: Float = 0.04f,
     val sharpen: Float = 1f,
     val sharpenRadius: Float = 1f,
+    /**
+     * The Ultra HDR gain map as the Pixel's camera makes it (measured on its photos, 26 Nov 2026: one channel at a quarter of the size, the boost a
+     * function of the SDR picture's own brightness): log2 boost = [gainLinear]·Y + [gainQuadratic]·Y² for the linear luminance Y of each 4 × 4 block,
+     * up to [gainMaxStops] (D32 A: the HDR headroom of the camera's photos, 2.3 stops ≈ 4.9×).
+     */
+    val gainLinear: Float = 2.0f,
+    val gainQuadratic: Float = 0.324f,
+    val gainMaxStops: Float = 2.30045f,
 ) {
     // A data class of arrays: equality by content, as the look is compared and copied
     override fun equals(other: Any?): Boolean = other is Look && toString() == other.toString()
@@ -67,6 +75,6 @@ data class Look(
     override fun toString(): String = listOf(
         color?.contentToString(), hues?.contentToString(), neutralize, green, key, keyEv, keyDark, blackDark, whitePercentile, white, maxRatio, fuseBias, fuseHigh,
         fuseSoft, stretchPercentile, stretchWhite, maxStretch, blackPercentile, contrast, midtones, clarity, clarityLow, clarityRadius, clarityEdge, saturation,
-        chromaRadius, chromaEdge, chromaKeep, lumaDenoise, lumaNoise, lumaEdge, sharpen, sharpenRadius,
+        chromaRadius, chromaEdge, chromaKeep, lumaDenoise, lumaNoise, lumaEdge, sharpen, sharpenRadius, gainLinear, gainQuadratic, gainMaxStops,
     ).joinToString(prefix = "Look(", postfix = ")")
 }
