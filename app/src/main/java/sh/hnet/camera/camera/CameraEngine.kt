@@ -183,6 +183,8 @@ data class Controls(
     /** Pro's white balance set by hand; null for the camera's own. On a camera without its color calibration, one of the camera's own presets instead. */
     val whiteBalance: ManualWhiteBalance? = null,
     val whiteBalancePreset: Int? = null,
+    /** The optical stabilization off: a still phone's long exposure (it drifts by itself over seconds), where the camera lets it be switched. */
+    val stabilizationOff: Boolean = false,
 )
 
 /** A Night photo on its way: its frames gathered (true) or not, the extension's progress (0–100) while it puts the photo together, and the photo. */
@@ -462,6 +464,13 @@ class CameraEngine(context: Context) {
     }
 
     /** The flashlight in Video mode. */
+    /** The optical stabilization off for a long exposure on a still phone, and on again after (where the camera can switch it). */
+    fun setStabilizationOff(off: Boolean) = scope.launch {
+        if (controls.stabilizationOff == off) return@launch
+        controls = controls.copy(stabilizationOff = off)
+        repeat()
+    }
+
     fun setTorch(on: Boolean) = scope.launch {
         controls = controls.copy(torch = on)
         repeat()
@@ -1591,6 +1600,8 @@ class CameraEngine(context: Context) {
         builder.set(CaptureRequest.CONTROL_ZOOM_RATIO, controls.zoom.toFloat())
         builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, controls.exposure.coerceIn(spec.exposureSteps))
         builder.set(CaptureRequest.CONTROL_AE_LOCK, controls.locked)
+        // Off only for a still phone's long exposure (the preview too, so the lens has settled before the photo)
+        if (controls.stabilizationOff && spec.stabilizationSwitchable) builder.set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF)
         if (spec.faceDetection) builder.set(CaptureRequest.STATISTICS_FACE_DETECT_MODE, CameraMetadata.STATISTICS_FACE_DETECT_MODE_SIMPLE)
         _state.value.video?.let { video ->
             if (video.fps in spec.fixedFps) builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(video.fps, video.fps))

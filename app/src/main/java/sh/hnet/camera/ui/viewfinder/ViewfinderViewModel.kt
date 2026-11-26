@@ -70,6 +70,7 @@ import sh.hnet.camera.camera.MAX_BURST
 import sh.hnet.camera.camera.Mode
 import sh.hnet.camera.camera.PhoneState
 import sh.hnet.camera.camera.PhoneStates
+import sh.hnet.camera.camera.Steadiness
 import sh.hnet.camera.capabilities.CameraSpec
 import sh.hnet.camera.capabilities.LensLook
 import sh.hnet.camera.capabilities.fiftyMp
@@ -125,6 +126,8 @@ data class ViewfinderUi(
     val nightGathering: Boolean = false,
     /** Pro's long exposure under way (SPEC §11): the shutter counts its time down, the mode row is hidden; null when none. */
     val exposing: Exposing? = null,
+    /** A long exposure pressed and waiting for the phone to be still (the tap's shake past) before it starts. */
+    val steadying: Boolean = false,
     /** The Night photo gathering its frames: the extension's progress (0–1) on the shutter; null when it gives none. */
     val gatherProgress: Float? = null,
     /** The newest Night photo being put together: its progress (0–1) at the thumbnail; null when it gives none. */
@@ -158,7 +161,7 @@ data class Tilt(val x: Float, val y: Float, val z: Float)
 data class Exposing(val startMs: Long, val durationMs: Long)
 
 /** A still the phone must be held for is under way (a Night photo gathering its frames, a long exposure): what would end it waits. */
-val ViewfinderUi.holdingStill: Boolean get() = nightGathering || exposing != null
+val ViewfinderUi.holdingStill: Boolean get() = nightGathering || exposing != null || steadying
 
 class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     private val application = app as CameraApplication
@@ -319,6 +322,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         }
 
     private val sound = MediaActionSound().apply { load(MediaActionSound.SHUTTER_CLICK) }
+    private val steadiness = Steadiness(application)
     private val beep = runCatching { ToneGenerator(AudioManager.STREAM_NOTIFICATION, BEEP_VOLUME) }.getOrNull()
     private val shots = Mutex()
     private var timerJob: Job? = null
@@ -1588,6 +1592,17 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         application.appScope.launch {
             shots.withLock {
                 gate?.acquire()
+                // A long exposure set by hand starts once the tap's shake has passed (the owner's 4 s photo on a support had a moved copy of the picture in
+                // it); a phone lying still takes it without the optical stabilization, settled first
+                if (long) {
+                    _ui.update { it.copy(steadying = true) }
+                    val still = steadiness.awaitStill(STEADY_WAIT_MS)
+                    if (still && camera?.stabilizationSwitchable == true) {
+                        engine.setStabilizationOff(true)
+                        delay(STABILIZATION_SETTLE_MS)
+                    }
+                    _ui.update { it.copy(steadying = false) }
+                }
                 if (screenFlash) {
                     // The screen lit white at full brightness first – counted from when the overlay is really there – then the exposure metered for it (SPEC §7.2)
                     _ui.update { it.copy(screenFlash = true) }
@@ -1626,6 +1641,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
                     throw e
                 } finally {
                     done.set(true)
+                    if (long) engine.setStabilizationOff(false)
                     if (screenFlash) _ui.update { it.copy(screenFlash = false) }
                     if (long || _ui.value.exposing != null) {
                         _ui.update { it.copy(exposing = null) }
@@ -1801,6 +1817,10 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         const val LONG_EXPOSURE_NS = 500_000_000L
         /** How long the camera's own focus may run to let it switch lenses at a stop (the focus set by hand then comes back). */
         const val LENS_NUDGE_MS = 1_500L
+        /** A long exposure waits this long at most for the phone to be still after the tap, and the lens this long to settle with its stabilization off. */
+        const val STEADY_WAIT_MS = 1_500L
+        const val STABILIZATION_SETTLE_MS = 300L
+
         /** How long the zoom rests in another lens' range before the DNG's raw stream follows it (a new session). */
         const val RAW_LENS_SETTLE_MS = 400L
         /** After the pick, how long until the lens the camera streams from is looked at once more. */

@@ -82,6 +82,8 @@ data class CameraSpec(
     val rawLenses: Map<String, PixelSize> = emptyMap(),
     /** The 50 MP raw image (RAW10 in the maximum-resolution mode, quad Bayer on the Pixel) of the main lens, null without one (D4, D18). */
     val raw50: PixelSize? = null,
+    /** The optical stabilization can be switched off and on per request. */
+    val stabilizationSwitchable: Boolean = false,
 )
 
 /** The Night extension's sizes: the preview, the photo in Ultra HDR and in plain JPEG, and whether it gives an early postview of the photo. */
@@ -177,6 +179,9 @@ object CameraCatalog {
             }.toMap() else emptyMap(),
             // The back camera's only (the reference phone's main lens; a front camera's own large mode isn't "50 MP"), and only a quad Bayer sensor (binning
             // 2 × 2, a 2 × 2 color pattern): its rearrangement to Bayer would scramble a plain Bayer raw
+            stabilizationSwitchable = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)?.let {
+                CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF in it && CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON in it
+            } == true,
             raw50 = if (CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_RAW in capabilities && facing == CameraMetadata.LENS_FACING_BACK &&
                 chars.get(CameraCharacteristics.SENSOR_INFO_BINNING_FACTOR)?.let { it.width == 2 && it.height == 2 } == true &&
                 chars.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT) in 0..3
