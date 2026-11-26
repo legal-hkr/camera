@@ -46,6 +46,7 @@ android {
 
 dependencies {
     implementation(project(":capabilities"))
+    implementation(project(":processing"))
 
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.activity.compose)
