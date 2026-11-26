@@ -56,4 +56,6 @@
     <string name="title_test_pro_raw_lenses">Pro: RAW z każdego obiektywu w sesji aplikacji</string>
     <string name="title_test_lens_by_zoom">Obiektyw przy każdym powiększeniu (celuj w coś dalekiego)</string>
     <string name="title_test_pro_50mp_app">Pro: 50 Mpx w sesji aplikacji</string>
+    <string name="title_test_raw_ring">Przetwarzanie zdjęć: bufor RAW w sesji aplikacji</string>
+    <string name="title_test_gpu_align">Przetwarzanie zdjęć: wyrównanie na GPU (OpenGL ES 3.1)</string>
 </resources>

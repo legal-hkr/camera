@@ -56,4 +56,6 @@
     <string name="title_test_pro_raw_lenses">Pro: RAW from each lens in the app’s session</string>
     <string name="title_test_lens_by_zoom">Lens by zoom (point at something far)</string>
     <string name="title_test_pro_50mp_app">Pro: 50 MP in the app’s session</string>
+    <string name="title_test_raw_ring">Photo processing: RAW ring buffer in the app’s session</string>
+    <string name="title_test_gpu_align">Photo processing: alignment on the GPU (OpenGL ES 3.1)</string>
 </resources>

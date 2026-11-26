@@ -27,6 +27,7 @@ import android.hardware.camera2.params.SessionConfiguration
 import android.hardware.camera2.params.StreamConfigurationMap
 import android.media.Image
 import android.os.Build
+import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Range
 import android.util.Size
@@ -75,6 +76,7 @@ class LiveTests(context: Context, private val preview: PreviewHost) {
 
     private val manager = context.getSystemService(CameraManager::class.java)
     private val resolver = context.contentResolver
+    private val power = context.getSystemService(PowerManager::class.java)
 
     val all = listOf(
         LiveTest("ultra_hdr", R.string.title_test_ultra_hdr) { ultraHdr(it) },
@@ -98,6 +100,8 @@ class LiveTests(context: Context, private val preview: PreviewHost) {
         LiveTest("pro_raw_lenses", R.string.title_test_pro_raw_lenses) { proRawLenses(it) },
         LiveTest("lens_by_zoom", R.string.title_test_lens_by_zoom) { lensByZoom(it) },
         LiveTest("pro_50mp_app", R.string.title_test_pro_50mp_app) { pro50mpApp(it) },
+        LiveTest("raw_ring", R.string.title_test_raw_ring) { rawRing(it) },
+        LiveTest("gpu_align", R.string.title_test_gpu_align) { GpuAlign.run(manager, preview, id = it) },
         LiveTest("raw", R.string.title_test_raw) { raw(it) },
     )
 
@@ -1359,6 +1363,122 @@ class LiveTests(context: Context, private val preview: PreviewHost) {
         }
     }
 
+    /**
+     * The RAW ring buffer of the app's own processing (LOGIKA §33, §36.2) in the Photo session it would run in: preview, analysis stream, photo (JPEG_R next to
+     * an HLG preview, JPEG next to SDR) and the RAW stream always on, its last 7 frames kept as a ring would (8 buffers). 20 s each way: with an SDR preview
+     * the RAW in the preview's own request, with an HLG one alternating with it (one request mixes no HLG and plain streams on the Pixel); a photo taken half
+     * way. The RAW, preview and analysis rates and longest gaps, the photo's delay, and the phone's heat before and after. Nothing unconfirmed is configured.
+     */
+    private suspend fun rawRing(id: String): JsonObject {
+        val chars = chars(id)
+        val map = map(id)
+        val raw = largest(map, ImageFormat.RAW_SENSOR) ?: return notOffered("RAW_SENSOR")
+        val hlgOffered = largest(map, ImageFormat.JPEG_R) != null && chars.get(CameraCharacteristics.REQUEST_AVAILABLE_DYNAMIC_RANGE_PROFILES)?.supportedProfiles?.contains(DynamicRangeProfiles.HLG10) == true
+        val surface = preview.surface(previewSize(map))
+        return buildJsonObject {
+            put("raw", sizeText(raw))
+            for (hlg in listOf(true, false)) {
+                if (hlg && !hlgOffered) continue
+                val stillFormat = if (hlg) ImageFormat.JPEG_R else ImageFormat.JPEG
+                val still = largest(map, stillFormat) ?: continue
+                val analysisFormat = if (hlg) ImageFormat.YCBCR_P010 else ImageFormat.YUV_420_888
+                val analysisSize = map.getOutputSizes(analysisFormat)?.filter { it.width >= 640 && abs(it.width * 3 - it.height * 4) <= it.width / 20 }?.minByOrNull { area(it) }
+                val profile = if (hlg) DynamicRangeProfiles.HLG10 else DynamicRangeProfiles.STANDARD
+                put(if (hlg) "hlg" else "sdr", probe {
+                    manager.withCamera(id) { device, thread ->
+                        val ring = ArrayDeque<Image>()
+                        val rawTimes = mutableListOf<Long>()
+                        val raws = imageReader(raw.width, raw.height, ImageFormat.RAW_SENSOR, RING_BUFFERS)
+                        raws.setOnImageAvailableListener({ r ->
+                            val image = runCatching { r.acquireNextImage() }.getOrNull() ?: return@setOnImageAvailableListener
+                            rawTimes += image.timestamp
+                            ring.addLast(image)
+                            // One buffer always free for the camera
+                            while (ring.size > RING_BUFFERS - 1) ring.removeFirst().close()
+                        }, thread.handler)
+                        val analysisTimes = mutableListOf<Long>()
+                        val analysis = analysisSize?.let { a -> imageReader(a.width, a.height, analysisFormat, 4).also { reader -> reader.setOnImageAvailableListener({ r -> runCatching { r.acquireLatestImage() }.getOrNull()?.use { analysisTimes += it.timestamp } }, thread.handler) } }
+                        val stills = ImageQueue(imageReader(still.width, still.height, stillFormat, 2), thread)
+                        try {
+                            val outputs = listOfNotNull(
+                                OutputConfiguration(surface).apply { dynamicRangeProfile = profile },
+                                analysis?.let { OutputConfiguration(it.surface).apply { dynamicRangeProfile = profile } },
+                                OutputConfiguration(stills.reader.surface),
+                                OutputConfiguration(raws.surface),
+                            )
+                            if (supported(id, outputs) != true) return@withCamera buildJsonObject { put("skipped", "session not confirmed") }
+                            val session = device.session(outputs, thread)
+                            try {
+                                val previewTimes = mutableListOf<Long>()
+                                val failures = mutableListOf<String>()
+                                val watch = object : CameraCaptureSession.CaptureCallback() {
+                                    override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+                                        if (request.tag == PREVIEW_TAG) result.get(CaptureResult.SENSOR_TIMESTAMP)?.let { previewTimes += it }
+                                    }
+
+                                    override fun onCaptureFailed(session: CameraCaptureSession, request: CaptureRequest, failure: CaptureFailure) {
+                                        if (failures.size < 5) failures += "${request.tag} reason ${failure.reason}"
+                                    }
+                                }
+                                fun request(tag: String, vararg targets: Surface) = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                                    targets.forEach { addTarget(it) }
+                                    set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(30, 30))
+                                    setTag(tag)
+                                }.build()
+                                val previewTargets = listOfNotNull(surface, analysis?.surface).toTypedArray()
+                                val requests = if (hlg) listOf(request(PREVIEW_TAG, *previewTargets), request("raw", raws.surface)) else listOf(request(PREVIEW_TAG, *previewTargets, raws.surface))
+                                val heatBefore = power?.currentThermalStatus
+                                val start = SystemClock.elapsedRealtimeNanos()
+                                session.setRepeatingBurstRequests(requests, thread.executor, watch)
+                                delay(10_000)
+                                // A photo half way: how long it takes, and whether the ring stalls around it
+                                val stillRequest = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                                    addTarget(stills.reader.surface)
+                                    still(id)
+                                }.build()
+                                val asked = SystemClock.elapsedRealtime()
+                                session.capture(stillRequest, watch, thread.handler)
+                                val photo = withTimeoutOrNull(5_000) { stills.next(6_000) }
+                                val photoMs = SystemClock.elapsedRealtime() - asked
+                                photo?.close()
+                                delay(10_000)
+                                session.stopRepeating()
+                                delay(300)
+                                val heatAfter = power?.currentThermalStatus
+                                fun rates(times: List<Long>) = buildJsonObject {
+                                    val t = synchronized(times) { times.filter { it >= start }.sorted() }
+                                    put("frames", t.size)
+                                    if (t.size > 1) {
+                                        put("fps", (t.size - 1) * 1e9 / (t.last() - t.first()))
+                                        put("maxGapMs", t.zipWithNext { a, b -> b - a }.max() / 1e6)
+                                    }
+                                }
+                                buildJsonObject {
+                                    put("requests", if (hlg) "alternating [preview + analysis, raw]" else "one request (preview + analysis + raw)")
+                                    put("raw", rates(rawTimes))
+                                    put("preview", rates(previewTimes))
+                                    put("analysis", rates(analysisTimes))
+                                    put("photoMs", if (photo != null) JsonPrimitive(photoMs) else JsonPrimitive("none within 5 s"))
+                                    put("thermalBefore", jsonOf(heatBefore))
+                                    put("thermalAfter", jsonOf(heatAfter))
+                                    if (failures.isNotEmpty()) put("failures", JsonArray(failures.map { JsonPrimitive(it) }))
+                                }
+                            } finally {
+                                session.close()
+                            }
+                        } finally {
+                            ring.forEach { it.close() }
+                            ring.clear()
+                            raws.close()
+                            analysis?.close()
+                            stills.close()
+                        }
+                    }
+                })
+            }
+        }
+    }
+
     /** The mean RGB of a photo's middle half (decoded small): the color cast to compare. */
     private fun meanColor(bytes: ByteArray): Triple<Double, Double, Double>? {
         val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, BitmapFactory.Options().apply { inSampleSize = 8 }) ?: return null
@@ -1682,3 +1802,6 @@ class LiveTests(context: Context, private val preview: PreviewHost) {
 
 /** The tag of the preview's requests in a burst, to count its frames apart from the stills'. */
 private const val PREVIEW_TAG = "preview"
+
+/** A RAW ring buffer's buffers: seven frames kept, one free for the camera. */
+private const val RING_BUFFERS = 8
