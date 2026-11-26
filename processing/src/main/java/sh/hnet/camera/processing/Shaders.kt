@@ -11,6 +11,7 @@ precision highp float;
 precision highp int;
 precision highp sampler2D;
 precision highp usampler2D;
+precision highp usampler2DArray;
 const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 int mirror(int i, int n) {
     if (n == 1) return 0;
@@ -42,15 +43,68 @@ void main() {
 """
 
     /**
-     * The raw samples to the white-balanced mosaic: black taken off, 0..1 by the white level, the lens shading gain of the sample's 2 × 2 position
-     * (bilinear on its grid, as the DNG GainMap), each color by its balance, clipped at 1 where the least sensitive channel saturates.
+     * A frame's raw samples (one layer of the frames' array) to the normalized mosaic: black taken off, 0..1 by the white level (the prototype's
+     * `dng.read`).
      */
-    const val PREPARE = HEAD + GRID + """
-layout(binding = 0) uniform usampler2D raw;
-layout(binding = 1) uniform sampler2D shading;
+    const val NORMALIZE = HEAD + GRID + """
+layout(binding = 0) uniform usampler2DArray raws;
 layout(r32f, binding = 0) writeonly uniform highp image2D dst;
+uniform int layer;
 uniform vec4 black;
 uniform float range;
+uniform ivec2 size;
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= size.x || p.y >= size.y) return;
+    int position = (p.y & 1) * 2 + (p.x & 1);
+    imageStore(dst, p, vec4((float(texelFetch(raws, ivec3(p, layer), 0).r) - black[position]) / range));
+}
+"""
+
+    /** The merged planes (padded, one per 2 × 2 position) back into the normalized mosaic. */
+    const val UNPLANE = HEAD + GRID + """
+layout(binding = 0) uniform sampler2D plane0;
+layout(binding = 1) uniform sampler2D plane1;
+layout(binding = 2) uniform sampler2D plane2;
+layout(binding = 3) uniform sampler2D plane3;
+layout(r32f, binding = 0) writeonly uniform highp image2D dst;
+uniform int pad;
+uniform ivec2 size;
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= size.x || p.y >= size.y) return;
+    int position = (p.y & 1) * 2 + (p.x & 1);
+    ivec2 q = p / 2 + ivec2(pad);
+    float v = position == 0 ? texelFetch(plane0, q, 0).r : position == 1 ? texelFetch(plane1, q, 0).r : position == 2 ? texelFetch(plane2, q, 0).r : texelFetch(plane3, q, 0).r;
+    imageStore(dst, p, vec4(v));
+}
+"""
+
+    /**
+     * The normalized mosaic sampled as the scene statistics read it: every fourth cell of each 2 × 2 position's plane (the prototype's
+     * `mosaic[dy::2, dx::2][::4, ::4]`), the four positions in the four channels.
+     */
+    const val SUBSAMPLE = HEAD + GRID + """
+layout(binding = 0) uniform sampler2D mosaic;
+layout(rgba32f, binding = 0) writeonly uniform highp image2D dst;
+uniform ivec2 outSize;
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= outSize.x || p.y >= outSize.y) return;
+    ivec2 q = p * 8;
+    imageStore(dst, p, vec4(texelFetch(mosaic, q, 0).r, texelFetch(mosaic, q + ivec2(1, 0), 0).r, texelFetch(mosaic, q + ivec2(0, 1), 0).r,
+        texelFetch(mosaic, q + ivec2(1, 1), 0).r));
+}
+"""
+
+    /**
+     * The normalized mosaic to the white-balanced one: the lens shading gain of the sample's 2 × 2 position (bilinear on its grid, as the DNG
+     * GainMap), each color by its balance, clipped at 1 where the least sensitive channel saturates.
+     */
+    const val PREPARE = HEAD + GRID + """
+layout(binding = 0) uniform sampler2D normalized;
+layout(binding = 1) uniform sampler2D shading;
+layout(r32f, binding = 0) writeonly uniform highp image2D dst;
 uniform ivec4 cfa;
 uniform vec3 balance;
 uniform int hasShading;
@@ -75,7 +129,7 @@ void main() {
     ivec2 p = ivec2(gl_GlobalInvocationID.xy);
     if (p.x >= size.x || p.y >= size.y) return;
     int position = (p.y & 1) * 2 + (p.x & 1);
-    float v = (float(texelFetch(raw, p, 0).r) - black[position]) / range;
+    float v = texelFetch(normalized, p, 0).r;
     if (hasShading != 0) v *= gainAt(position, p);
     v *= balance[cfa[position]];
     imageStore(dst, p, vec4(min(v, 1.0)));
@@ -179,9 +233,9 @@ void main() {
      * The mean over [factor] × [factor] blocks (OpenCV's area resize by a whole factor): of the luminance (≥ 0) of RGB, or of the first channel. OpenCV
      * weighs partly covered pixels when the size doesn't divide; the crops here (the pre-correction array less 16) divide on the phones we know.
      */
-    const val DOWN_MEAN = HEAD + GRID + """
+    private const val DOWN_MEAN_TEMPLATE = HEAD + GRID + """
 layout(binding = 0) uniform sampler2D src;
-layout(rgba32f, binding = 0) writeonly uniform highp image2D dst;
+layout(FORMAT, binding = 0) writeonly uniform highp image2D dst;
 uniform int factor;
 uniform int luminance;
 uniform ivec2 outSize;
@@ -196,6 +250,10 @@ void main() {
     imageStore(dst, p, sum / float(factor * factor));
 }
 """
+
+    /** [DOWN_MEAN_TEMPLATE] writing four channels, or one ([DOWN_MEAN_SINGLE], for the alignment's pyramid). */
+    val DOWN_MEAN: String = DOWN_MEAN_TEMPLATE.replace("FORMAT", "rgba32f")
+    val DOWN_MEAN_SINGLE: String = DOWN_MEAN_TEMPLATE.replace("FORMAT", "r32f")
 
     /**
      * The fusion's inputs: up to three exposures of the luminance (from the highlights' gain up, sRGB-encoded) and their weights – where each neither
@@ -711,4 +769,327 @@ void main() {
     imageStore(dst, p, vec4(c, 1.0));
 }
 """
+
+    /**
+     * A frame's half-size gray (the mean of each 2 × 2 cell of the normalized mosaic) padded by [pad] on every side and further on the bottom and right
+     * to [outSize], mirrored (OpenCV's copyMakeBorder, BORDER_REFLECT_101): the alignment's level 0 and its grid.
+     */
+    const val GRAY_PAD = HEAD + GRID + """
+layout(binding = 0) uniform usampler2DArray raws;
+layout(r32f, binding = 0) writeonly uniform highp image2D dst;
+uniform int layer;
+uniform vec4 black;
+uniform float range;
+uniform int pad;
+uniform ivec2 planeSize;
+uniform ivec2 outSize;
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= outSize.x || p.y >= outSize.y) return;
+    ivec2 q = ivec2(mirror(p.x - pad, planeSize.x), mirror(p.y - pad, planeSize.y)) * 2;
+    float sum = 0.0;
+    for (int position = 0; position < 4; position++) {
+        ivec2 at = q + ivec2(position & 1, position >> 1);
+        sum += (float(texelFetch(raws, ivec3(at, layer), 0).r) - black[position]) / range;
+    }
+    imageStore(dst, p, vec4(sum * 0.25));
+}
+"""
+
+    /** How sharp a frame is: the squared Sobel gradient (OpenCV's 3 × 3) of the unpadded gray, read inside the padded one. */
+    const val SOBEL = HEAD + GRID + """
+layout(binding = 0) uniform sampler2D gray;
+layout(r32f, binding = 0) writeonly uniform highp image2D dst;
+uniform int pad;
+uniform ivec2 size;
+float at(ivec2 p, int dx, int dy) { return texelFetch(gray, p + ivec2(pad + dx, pad + dy), 0).r; }
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= size.x || p.y >= size.y) return;
+    float gx = at(p, 1, -1) + 2.0 * at(p, 1, 0) + at(p, 1, 1) - at(p, -1, -1) - 2.0 * at(p, -1, 0) - at(p, -1, 1);
+    float gy = at(p, -1, 1) + 2.0 * at(p, 0, 1) + at(p, 1, 1) - at(p, -1, -1) - 2.0 * at(p, 0, -1) - at(p, 1, -1);
+    imageStore(dst, p, vec4(gx * gx + gy * gy));
+}
+"""
+
+    /** Each row's sum (one invocation per row), into a one-pixel-wide column. */
+    const val ROW_SUM = HEAD + """
+layout(local_size_x = 64) in;
+layout(binding = 0) uniform sampler2D src;
+layout(r32f, binding = 0) writeonly uniform highp image2D dst;
+uniform ivec2 size;
+void main() {
+    int y = int(gl_GlobalInvocationID.x);
+    if (y >= size.y) return;
+    float sum = 0.0;
+    for (int x = 0; x < size.x; x++) sum += texelFetch(src, ivec2(x, y), 0).r;
+    imageStore(dst, ivec2(0, y), vec4(sum));
+}
+"""
+
+    /**
+     * One pyramid level of HDR+'s tile alignment (the prototype's `align`), one invocation per tile: the starting shift is the best of three candidates
+     * from the coarser level (the tile under this one's center and its two neighbours toward it, scaled up and rounded half to even), then every shift
+     * within ±[radius] around it is tried (L1 or L2 over the tile, the alternate's reads clamped to the level), the least cost wins (the first on ties,
+     * rows of the search outermost); on the coarse L2 levels a parabola through the best and its neighbours gives the sub-pixel part (±½). Writes
+     * (shift y, shift x, cost, 0).
+     */
+    const val ALIGN = HEAD + GRID + """
+layout(binding = 0) uniform sampler2D reference;
+layout(binding = 1) uniform sampler2D alternate;
+layout(binding = 2) uniform sampler2D coarse;
+layout(rgba32f, binding = 0) writeonly uniform highp image2D dst;
+uniform ivec2 levelSize;
+uniform ivec2 tiles;
+uniform int tile;
+uniform int stride;
+uniform int radius;
+uniform int l2;
+uniform int subpixel;
+uniform int hasPrior;
+uniform ivec2 coarseTiles;
+uniform int coarseTile;
+uniform int coarseStride;
+uniform int factorUp;
+float cost(ivec2 origin, ivec2 shift) {
+    float sum = 0.0;
+    for (int j = 0; j < tile; j++) for (int i = 0; i < tile; i++) {
+        ivec2 a = origin + ivec2(i, j);
+        ivec2 b = clamp(a + shift, ivec2(0), levelSize - 1);
+        float d = texelFetch(alternate, b, 0).r - texelFetch(reference, a, 0).r;
+        sum += l2 != 0 ? d * d : abs(d);
+    }
+    return sum;
+}
+void main() {
+    ivec2 t = ivec2(gl_GlobalInvocationID.xy);
+    if (t.x >= tiles.x || t.y >= tiles.y) return;
+    ivec2 origin = t * stride;
+    ivec2 prior = ivec2(0);
+    if (hasPrior != 0) {
+        float middle = float(tile) / 2.0;
+        float cy = (float(origin.y) + middle) / float(factorUp);
+        float cx = (float(origin.x) + middle) / float(factorUp);
+        float ch = float(coarseTile) / 2.0;
+        int iy = clamp(int(roundEven((cy - ch) / float(coarseStride))), 0, coarseTiles.y - 1);
+        int ix = clamp(int(roundEven((cx - ch) / float(coarseStride))), 0, coarseTiles.x - 1);
+        int ny = clamp(iy + (cy >= float(iy * coarseStride) + ch ? 1 : -1), 0, coarseTiles.y - 1);
+        int nx = clamp(ix + (cx >= float(ix * coarseStride) + ch ? 1 : -1), 0, coarseTiles.x - 1);
+        ivec2 candidates[3] = ivec2[3](ivec2(ix, iy), ivec2(ix, ny), ivec2(nx, iy));
+        float best = 0.0;
+        for (int c = 0; c < 3; c++) {
+            vec2 s = texelFetch(coarse, candidates[c], 0).xy * float(factorUp);
+            ivec2 shift = ivec2(int(roundEven(s.y)), int(roundEven(s.x)));
+            float v = cost(origin, shift);
+            if (c == 0 || v < best) {
+                best = v;
+                prior = shift;
+            }
+        }
+    }
+    int size = 2 * radius + 1;
+    float costs[81];
+    int bestIndex = 0;
+    for (int dy = -radius; dy <= radius; dy++) for (int dx = -radius; dx <= radius; dx++) {
+        int k = (dy + radius) * size + (dx + radius);
+        costs[k] = cost(origin, prior + ivec2(dx, dy));
+        if (costs[k] < costs[bestIndex]) bestIndex = k;
+    }
+    int by = bestIndex / size;
+    int bx = bestIndex - by * size;
+    float best = costs[bestIndex];
+    vec2 shift = vec2(float(prior.y + by - radius), float(prior.x + bx - radius));
+    if (l2 != 0 && subpixel != 0) {
+        bool inside = by > 0 && by < size - 1 && bx > 0 && bx < size - 1;
+        float ym = costs[clamp(by - 1, 0, size - 1) * size + bx];
+        float yp = costs[clamp(by + 1, 0, size - 1) * size + bx];
+        float xm = costs[by * size + clamp(bx - 1, 0, size - 1)];
+        float xp = costs[by * size + clamp(bx + 1, 0, size - 1)];
+        float curveY = ym - 2.0 * best + yp;
+        float curveX = xm - 2.0 * best + xp;
+        float subY = inside && curveY > 0.0 ? 0.5 * (ym - yp) / max(curveY, 1e-12) : 0.0;
+        float subX = inside && curveX > 0.0 ? 0.5 * (xm - xp) / max(curveX, 1e-12) : 0.0;
+        shift += vec2(clamp(subY, -0.5, 0.5), clamp(subX, -0.5, 0.5));
+    }
+    imageStore(dst, t, vec4(shift, best, 0.0));
+}
+"""
+
+    /** Clears a single-channel image to 0. */
+    const val CLEAR = HEAD + GRID + """
+layout(r32f, binding = 0) writeonly uniform highp image2D dst;
+uniform ivec2 size;
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= size.x || p.y >= size.y) return;
+    imageStore(dst, p, vec4(0.0));
+}
+"""
+
+    /**
+     * HDR+'s robust merge of one mosaic position's plane (the prototype's `merge`), one 16 × 16 work group per tile of one parity (tiles two apart don't
+     * overlap, so four passes add them without races): the reference's tile and each alternate's (moved by its shift, reads clamped to the padded plane)
+     * to the frequency domain (a 16 × 16 DFT in shared memory); where a coefficient differs from the reference's by more than the noise explains the
+     * reference's wins; the mean of all, HDR+'s spatial shrinkage of what the merged tile's remaining noise explains, back to pixels, the sin² window,
+     * added into the plane. Also how much of the other frames the tile used.
+     *
+     * GLSL ES 3.10 allows `barrier()` only outside any control flow and before any return in `main`, so the frames' loop is written out here for the
+     * reference and seven alternates (series of up to 8), unused ones weighed 0, and groups beyond the grid read a valid tile and store nothing.
+     */
+    val MERGE: String = HEAD + """
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(binding = 0) uniform usampler2DArray raws;
+layout(binding = 1) uniform sampler2D shifts;
+layout(r32f, binding = 0) uniform highp image2D plane;
+layout(r32f, binding = 1) writeonly uniform highp image2D used;
+uniform int position;
+uniform ivec2 parity;
+uniform ivec2 tiles;
+uniform ivec2 planeSize;
+uniform ivec2 padded;
+uniform int pad;
+uniform int count;
+uniform int referenceLayer;
+uniform int order[8];
+uniform vec4 blacks[8];
+uniform float ranges[8];
+uniform float noiseS;
+uniform float noiseO;
+uniform float temporal;
+uniform float spatial;
+shared float sRe[16][16];
+shared float sIm[16][16];
+shared float sSum[256];
+shared float sMean;
+shared float sWeight;
+// cos and sin of 2πk/16: every angle of a 16-point DFT is one of them (k = product mod 16)
+const float C16[16] = float[16](1.0, 0.9238795325, 0.7071067812, 0.3826834324, 0.0, -0.3826834324, -0.7071067812, -0.9238795325, -1.0, -0.9238795325,
+    -0.7071067812, -0.3826834324, 0.0, 0.3826834324, 0.7071067812, 0.9238795325);
+const float S16[16] = float[16](0.0, 0.3826834324, 0.7071067812, 0.9238795325, 1.0, 0.9238795325, 0.7071067812, 0.3826834324, 0.0, -0.3826834324,
+    -0.7071067812, -0.9238795325, -1.0, -0.9238795325, -0.7071067812, -0.3826834324);
+float sampleAt(int layer, int py, int px) {
+    py = clamp(py, 0, padded.y - 1);
+    px = clamp(px, 0, padded.x - 1);
+    int sy = mirror(py - pad, planeSize.y);
+    int sx = mirror(px - pad, planeSize.x);
+    ivec2 at = ivec2(sx * 2 + (position & 1), sy * 2 + (position >> 1));
+    return (float(texelFetch(raws, ivec3(at, layer), 0).r) - blacks[layer][position]) / ranges[layer];
+}
+void main() {
+    ivec2 tile = ivec2(gl_WorkGroupID.xy) * 2 + parity;
+    bool inside = tile.x < tiles.x && tile.y < tiles.y;
+    ivec2 safe = min(tile, tiles - 1);
+    int i = int(gl_LocalInvocationID.x);
+    int j = int(gl_LocalInvocationID.y);
+    int index = j * 16 + i;
+    int ys = safe.y * 8;
+    int xs = safe.x * 8;
+    sSum[index] = sampleAt(referenceLayer, ys + j, xs + i);
+    barrier();
+    if (index == 0) {
+        float sum = 0.0;
+        for (int k = 0; k < 256; k++) sum += sSum[k];
+        sMean = sum / 256.0;
+        sWeight = 0.0;
+    }
+    barrier();
+    float variance = max(noiseS * max(sMean, 0.0) + noiseO, 1e-10) * 256.0;
+    vec2 reference = vec2(0.0);
+    vec2 total = vec2(0.0);
+""" + (-1..6).joinToString("") { slot -> mergeSlot(slot) } + """
+    float n = float(count);
+    total /= n;
+    if (spatial > 0.0) {
+        float fy = float(j < 8 ? j : j - 16) / 16.0;
+        float fx = float(i < 8 ? i : i - 16) / 16.0;
+        float radius = sqrt(fy * fy + fx * fx) * 16.0;
+        float power = dot(total, total);
+        float residual = spatial * variance / n * (radius / 16.0 * 4.0 + 0.25);
+        total *= power / (power + residual);
+    }
+    // Back to pixels: along columns (row frequencies), then along rows; the real part, over 256
+    sRe[j][i] = total.x;
+    sIm[j][i] = total.y;
+    barrier();
+    float re = 0.0;
+    float im = 0.0;
+    for (int l = 0; l < 16; l++) {
+        int k = (l * j) & 15;
+        re += sRe[l][i] * C16[k] - sIm[l][i] * S16[k];
+        im += sRe[l][i] * S16[k] + sIm[l][i] * C16[k];
+    }
+    barrier();
+    sRe[j][i] = re;
+    sIm[j][i] = im;
+    barrier();
+    float value = 0.0;
+    for (int f = 0; f < 16; f++) {
+        int k = (f * i) & 15;
+        value += sRe[j][f] * C16[k] - sIm[j][f] * S16[k];
+    }
+    value /= 256.0;
+    float wy = sin(3.141592653589793 * (float(j) + 0.5) / 16.0);
+    float wx = sin(3.141592653589793 * (float(i) + 0.5) / 16.0);
+    ivec2 at = ivec2(xs + i, ys + j);
+    if (inside) {
+        imageStore(plane, at, imageLoad(plane, at) + vec4(value * wy * wy * wx * wx));
+        if (index == 0) imageStore(used, tile, vec4(count > 1 ? sWeight / float(count - 1) : 0.0));
+    }
+}
+"""
+
+    /**
+     * One frame of the merge's loop ([slot] −1 the reference, 0..6 the alternates in [order]), at the top level of `main` (barriers allowed): its tile,
+     * the tile's 16 × 16 DFT (rows, then columns; this thread keeps coefficient (row frequency j, column frequency i)), and its part of the sum.
+     */
+    private fun mergeSlot(slot: Int): String {
+        val n = if (slot < 0) "R" else "$slot"
+        val read = if (slot < 0) {
+            "    float v$n = sampleAt(referenceLayer, ys + j, xs + i);\n    float active$n = 1.0;\n"
+        } else {
+            "    float active$n = $slot < count - 1 ? 1.0 : 0.0;\n" +
+                "    vec2 shift$n = texelFetch(shifts, ivec2(safe.x, safe.y + min($slot, max(count - 2, 0)) * tiles.y), 0).xy;\n" +
+                "    float v$n = sampleAt(order[$slot], ys + j + int(shift$n.x), xs + i + int(shift$n.y));\n"
+        }
+        val combine = if (slot < 0) {
+            "    reference = c$n;\n    total = c$n;\n    float weight$n = 0.0;\n"
+        } else {
+            "    vec2 d$n = reference - c$n;\n" +
+                "    float power$n = dot(d$n, d$n);\n" +
+                "    float weight$n = active$n * power$n / (power$n + temporal * variance);\n" +
+                "    total += active$n * (c$n + weight$n * d$n);\n"
+        }
+        val share = if (slot < 0) "" else """
+    // The share of the other frame used, over the coefficients numpy's rfft2 keeps (column frequencies 0..8)
+    sSum[index] = i <= 8 ? weight$n : 0.0;
+    barrier();
+    if (index == 0 && active$n > 0.5) {
+        float sum = 0.0;
+        for (int k = 0; k < 256; k++) sum += sSum[k];
+        sWeight += 1.0 - sum / 144.0;
+    }
+    barrier();
+"""
+        return read + """
+    sRe[j][i] = v$n;
+    barrier();
+    float rowRe$n = 0.0;
+    float rowIm$n = 0.0;
+    for (int x = 0; x < 16; x++) {
+        int k = (i * x) & 15;
+        rowRe$n += sRe[j][x] * C16[k];
+        rowIm$n -= sRe[j][x] * S16[k];
+    }
+    barrier();
+    sRe[j][i] = rowRe$n;
+    sIm[j][i] = rowIm$n;
+    barrier();
+    vec2 c$n = vec2(0.0);
+    for (int y = 0; y < 16; y++) {
+        int k = (j * y) & 15;
+        c$n += vec2(sRe[y][i] * C16[k] + sIm[y][i] * S16[k], sIm[y][i] * C16[k] - sRe[y][i] * S16[k]);
+    }
+    barrier();
+""" + combine + share
+    }
 }

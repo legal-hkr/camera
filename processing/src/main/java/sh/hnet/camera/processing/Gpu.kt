@@ -62,14 +62,31 @@ internal class Gpu : AutoCloseable {
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_NEAREST)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
-        return Texture(id[0], width, height, format) { live -= it }.also { live += it }
+        return Texture(id[0], width, height, format, onClose = { live -= it }).also { live += it }
+    }
+
+    /** An array of [layers] textures of one size (the frames of a series), each filled by [uploadLayer]. */
+    fun textureArray(width: Int, height: Int, layers: Int, format: Int): Texture {
+        val id = IntArray(1)
+        GLES20.glGenTextures(1, id, 0)
+        GLES20.glBindTexture(GLES30.GL_TEXTURE_2D_ARRAY, id[0])
+        GLES30.glTexStorage3D(GLES30.GL_TEXTURE_2D_ARRAY, 1, format, width, height, layers)
+        GLES20.glTexParameteri(GLES30.GL_TEXTURE_2D_ARRAY, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_NEAREST)
+        GLES20.glTexParameteri(GLES30.GL_TEXTURE_2D_ARRAY, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_NEAREST)
+        return Texture(id[0], width, height, format, layers, GLES30.GL_TEXTURE_2D_ARRAY, onClose = { live -= it }).also { live += it }
+    }
+
+    fun uploadLayer(texture: Texture, layer: Int, format: Int, type: Int, data: Buffer, alignment: Int = 4) {
+        GLES20.glBindTexture(GLES30.GL_TEXTURE_2D_ARRAY, texture.id)
+        GLES20.glPixelStorei(GLES20.GL_UNPACK_ALIGNMENT, alignment)
+        GLES30.glTexSubImage3D(GLES30.GL_TEXTURE_2D_ARRAY, 0, 0, 0, layer, texture.width, texture.height, 1, format, type, data.position(0))
     }
 
     /** Closes every texture still open (after a failed development). */
     fun closeAll() = live.toList().forEach { it.close() }
 
     /** The bytes the open textures take (for reports: how close a development comes to the phone's memory). */
-    val liveBytes: Long get() = live.sumOf { it.width.toLong() * it.height * bytesPerPixel(it.format) }
+    val liveBytes: Long get() = live.sumOf { it.width.toLong() * it.height * it.layers * bytesPerPixel(it.format) }
 
     private fun bytesPerPixel(format: Int) = when (format) {
         GLES30.GL_R16UI -> 2
@@ -101,12 +118,26 @@ internal class Gpu : AutoCloseable {
         GLES20.glUseProgram(program)
         samplers.forEachIndexed { unit, texture ->
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0 + unit)
-            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texture.id)
+            GLES20.glBindTexture(texture.target, texture.id)
         }
         images.forEachIndexed { unit, texture -> GLES31.glBindImageTexture(unit, texture.id, 0, false, 0, GLES31.GL_READ_WRITE, texture.format) }
         Uniforms(program).uniforms()
         GLES31.glDispatchCompute((width + 7) / 8, (height + 7) / 8, 1)
         GLES31.glMemoryBarrier(GLES31.GL_SHADER_IMAGE_ACCESS_BARRIER_BIT or GLES31.GL_TEXTURE_FETCH_BARRIER_BIT or GLES31.GL_SHADER_STORAGE_BARRIER_BIT)
+    }
+
+    /** Runs a program in [groupsX] × [groupsY] work groups (the program's own group size, e.g. one 16 × 16 group per tile). */
+    fun runGroups(source: String, groupsX: Int, groupsY: Int, samplers: List<Texture>, images: List<Texture>, uniforms: Uniforms.() -> Unit = {}) {
+        val program = program(source)
+        GLES20.glUseProgram(program)
+        samplers.forEachIndexed { unit, texture ->
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE0 + unit)
+            GLES20.glBindTexture(texture.target, texture.id)
+        }
+        images.forEachIndexed { unit, texture -> GLES31.glBindImageTexture(unit, texture.id, 0, false, 0, GLES31.GL_READ_WRITE, texture.format) }
+        Uniforms(program).uniforms()
+        GLES31.glDispatchCompute(groupsX, groupsY, 1)
+        GLES31.glMemoryBarrier(GLES31.GL_SHADER_IMAGE_ACCESS_BARRIER_BIT or GLES31.GL_TEXTURE_FETCH_BARRIER_BIT)
     }
 
     /** Runs a program with one invocation per row or column (a running sum along it): [count] invocations in groups of 64. */
@@ -115,7 +146,7 @@ internal class Gpu : AutoCloseable {
         GLES20.glUseProgram(program)
         samplers.forEachIndexed { unit, texture ->
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0 + unit)
-            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texture.id)
+            GLES20.glBindTexture(texture.target, texture.id)
         }
         images.forEachIndexed { unit, texture -> GLES31.glBindImageTexture(unit, texture.id, 0, false, 0, GLES31.GL_READ_WRITE, texture.format) }
         Uniforms(program).uniforms()
@@ -202,8 +233,16 @@ internal class Gpu : AutoCloseable {
     }
 }
 
-/** A GPU texture; deleted by [close] (once). */
-internal class Texture(val id: Int, val width: Int, val height: Int, val format: Int, private val onClose: (Texture) -> Unit) : AutoCloseable {
+/** A GPU texture (or an array of [layers]); deleted by [close] (once). */
+internal class Texture(
+    val id: Int,
+    val width: Int,
+    val height: Int,
+    val format: Int,
+    val layers: Int = 1,
+    val target: Int = GLES20.GL_TEXTURE_2D,
+    private val onClose: (Texture) -> Unit,
+) : AutoCloseable {
     private var closed = false
 
     override fun close() {
@@ -236,6 +275,9 @@ internal class Uniforms(private val program: Int) {
     }
 
     fun floats(name: String, values: FloatArray) = GLES20.glUniform1fv(at(name), values.size, values, 0)
+
+    /** An array of vec4 given as 4 × n floats. */
+    fun vec4s(name: String, values: FloatArray) = GLES20.glUniform4fv(at(name), values.size / 4, values, 0)
 
     /** A 3 × 3 matrix given row by row. */
     fun mat3(name: String, rows: FloatArray) = GLES20.glUniformMatrix3fv(at(name), 1, true, rows, 0)

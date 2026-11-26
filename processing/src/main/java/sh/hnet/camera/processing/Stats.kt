@@ -69,52 +69,37 @@ internal object Stats {
         return short to (long / short).coerceIn(1.0, look.maxRatio.toDouble())
     }
 
-    /** A sample of the mosaic, black taken off and scaled to 0..1 (the frame's white level 1); [range] is white − the mean black. */
-    private fun level(frame: RawFrame, x: Int, y: Int, range: Float): Float {
-        val position = (y and 1) * 2 + (x and 1)
-        val raw = frame.samples.get(y * frame.width + x).toInt() and 0xFFFF
-        return (raw - frame.meta.black[position]) / range
-    }
-
-    private fun range(meta: FrameMeta) = meta.white - meta.black.average().toFloat()
-
     /**
-     * The scene's brightness in stops: the raw green's log-average (every fourth 2 × 2 cell) over exposure time × ISO / 100, against 0.001. A dimmer scene
-     * keeps a darker key and a deeper black (a lamp-lit evening's mood).
+     * The scene's brightness in stops: the normalized mosaic's green log-average ([cells]: every fourth cell of each position's plane, the four
+     * positions per cell) over exposure time × ISO / 100, against 0.001. A dimmer scene keeps a darker key and a deeper black (a lamp-lit evening's mood).
      */
-    fun sceneEv(frame: RawFrame): Double? {
-        val meta = frame.meta
+    fun sceneEv(cells: FloatArray, meta: FrameMeta): Double? {
         if (meta.exposureNs <= 0 || meta.iso <= 0) return null
         val greens = (0 until 4).filter { meta.cfa[it] == Cfa.GREEN }
         if (greens.size < 2) return null
-        val range = range(meta)
         var sum = 0.0
-        var count = 0
-        for (cy in 0 until frame.height / 2 step 4) for (cx in 0 until frame.width / 2 step 4) {
-            val g = 0.5 * greens.sumOf { level(frame, cx * 2 + it % 2, cy * 2 + it / 2, range).toDouble() }
-            sum += ln(maxOf(g, 1e-5))
-            count++
-        }
+        val count = cells.size / 4
+        for (k in 0 until count) sum += ln(maxOf(0.5 * (cells[k * 4 + greens[0]] + cells[k * 4 + greens[1]]), 1e-5))
         val average = exp(sum / count)
         return log2(maxOf(average / (meta.exposureNs / 1e9 * meta.iso / 100), 1e-9) / 0.001)
     }
 
     /**
-     * The light's color as the picture itself says it (shades of gray, p = 4: the p-norm mean of each color plane over every fourth 2 × 2 cell, lens
-     * shading applied, clipped and near-black cells left out), in camera space with green at 1; null with too few cells.
+     * The light's color as the picture itself says it (shades of gray, p = 4: the p-norm mean of each color plane over [cells] – [cellsX] × [cellsY],
+     * cell (i, j) holding the four positions at (8i + dx, 8j + dy) – lens shading applied, clipped and near-black cells left out), in camera space with
+     * green at 1; null with too few cells.
      */
-    fun sceneNeutral(frame: RawFrame, shading: (position: Int, x: Int, y: Int) -> Float): DoubleArray? {
-        val meta = frame.meta
+    fun sceneNeutral(cells: FloatArray, cellsX: Int, cellsY: Int, meta: FrameMeta, shading: (position: Int, x: Int, y: Int) -> Float): DoubleArray? {
         val sums = DoubleArray(3)
         var count = 0
         val counts = IntArray(3).also { c -> meta.cfa.forEach { c[it]++ } }
-        val range = range(meta)
-        for (cy in 0 until frame.height / 2 step 4) for (cx in 0 until frame.width / 2 step 4) {
+        for (cy in 0 until cellsY) for (cx in 0 until cellsX) {
             val rgb = DoubleArray(3)
+            val k = cy * cellsX + cx
             for (position in 0 until 4) {
-                val x = cx * 2 + position % 2
-                val y = cy * 2 + position / 2
-                rgb[meta.cfa[position]] += level(frame, x, y, range) * shading(position, x, y).toDouble() / counts[meta.cfa[position]]
+                val x = cx * 8 + position % 2
+                val y = cy * 8 + position / 2
+                rgb[meta.cfa[position]] += cells[k * 4 + position] * shading(position, x, y).toDouble() / counts[meta.cfa[position]]
             }
             if (rgb.max() >= 0.9 || rgb.min() <= 0.002) continue
             for (c in 0 until 3) sums[c] += rgb[c].pow(4)

@@ -51,6 +51,7 @@ import sh.hnet.camera.capabilities.jsonOf
 import sh.hnet.camera.capabilities.probe
 import sh.hnet.camera.capabilities.sizeText
 import sh.hnet.camera.diag.R
+import sh.hnet.camera.processing.Developed
 import sh.hnet.camera.processing.Developer
 import sh.hnet.camera.processing.FrameMeta
 import sh.hnet.camera.processing.RawFrame
@@ -559,7 +560,9 @@ class QualityTests(context: Context, private val preview: PreviewHost) {
         val lenses = lenses(id)
         val folder = "process_${Media.stamp()}_cam$id"
         val surface = preview.surface(previewSize(map(chars)))
-        var kept: RawFrame? = null
+        val kept = ArrayList<RawFrame>()
+        // Each kept frame's DNG number (a frame without its capture result has no DNG and isn't kept)
+        val numbers = ArrayList<Int>()
         var metadata: JsonObject? = null
         val captured = manager.withCamera(id) { device, thread ->
             buildJsonObject {
@@ -569,19 +572,22 @@ class QualityTests(context: Context, private val preview: PreviewHost) {
                 val active = reference["activePhysicalId"]?.let { (it as? JsonPrimitive)?.content }
                 val lens = lenses.firstOrNull { it.id == active } ?: lenses.minBy { abs(ln(it.zoom)) }
                 put("raw", probe {
-                    rawBursts(device, thread, surface, lens, 1f, 8, listOf(0), folder, "z1.0") { image, result ->
-                        kept = rawFrame(image, result, lens)
-                        metadata = camera2Metadata(lens.chars, result)
+                    rawBursts(device, thread, surface, lens, 1f, 8, listOf(0), folder, "z1.0") { index, image, result ->
+                        rawFrame(image, result, lens)?.let {
+                            kept += it
+                            numbers += index
+                        }
+                        if (index == 1) metadata = camera2Metadata(lens.chars, result)
                     }
                 })
             }
         }
-        val frame = kept ?: return buildJsonObject {
+        if (kept.isEmpty()) return buildJsonObject {
             captured.forEach { (k, v) -> put(k, v) }
             put("gpu", buildJsonObject { put("skipped", "no RAW frame with Bayer metadata") })
         }
         val gpu = try {
-            gpuDevelopment(frame, folder, metadata)
+            gpuDevelopment(kept, numbers, folder, metadata)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Throwable) {
@@ -595,34 +601,68 @@ class QualityTests(context: Context, private val preview: PreviewHost) {
         }
     }
 
-    /** The GPU development of the series' first frame, its PNG and its numbers; errors (out of memory too) go to the report. */
-    private suspend fun gpuDevelopment(frame: RawFrame, folder: String, metadata: JsonObject?): JsonObject {
-        val (developed, renderer) = withContext(Dispatchers.Default) {
+    /**
+     * The GPU development of the series' first frame alone and of the whole series merged: both PNGs, their numbers and times, the merge's reference and
+     * tile shifts (a binary file: int16 y, x per tile, frame after frame); errors (out of memory too) go to the report.
+     */
+    private suspend fun gpuDevelopment(frames: List<RawFrame>, numbers: List<Int>, folder: String, metadata: JsonObject?): JsonObject {
+        val names = listOf(String.format(Locale.ROOT, "z1.0_ev0_%02d_gpu.png", numbers.first()), "z1.0_ev0_merged_gpu.png")
+        val parts = ArrayList<Pair<String, JsonObject>>()
+        // On Android a direct buffer is on the Java heap: the 8 frames' copies take 200 MB of it (the app's large heap), so each picture is saved and
+        // let go before the next development
+        val renderer = withContext(Dispatchers.Default) {
             processSteps.edit().putString("step", "GPU context").commit()
             Developer().use { developer ->
-                developer.develop(frame) { step, bytes ->
-                    processSteps.edit().putString("step", "$step (GPU memory held: ${bytes / 1_000_000} MB)").commit()
-                } to developer.renderer
+                listOf(frames.take(1), frames).forEachIndexed { index, series ->
+                    val developed = developer.develop(series) { step, bytes ->
+                        processSteps.edit().putString("step", "${series.size} frames: $step (GPU memory held: ${bytes / 1_000_000} MB)").commit()
+                    }
+                    parts += (if (index == 0) "single" else "merged") to saveDeveloped(developed, folder, names[index], numbers)
+                }
+                developer.renderer
             }
         }
-        processSteps.edit().putString("step", "saving the PNG").commit()
-        val bitmap = Bitmap.createBitmap(developed.width, developed.height, Bitmap.Config.ARGB_8888)
-        bitmap.copyPixelsFromBuffer(developed.rgba.position(0))
-        withContext(Dispatchers.IO) {
-            Media.writeDownload(resolver, folder, "z1.0_ev0_01_gpu.png", "image/png") { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
-        }
-        bitmap.recycle()
         processSteps.edit().clear().commit()
         return buildJsonObject {
             put("renderer", renderer)
-            put("developed", "z1.0_ev0_01.dng")
-            put("file", "z1.0_ev0_01_gpu.png")
+            put("frames", frames.size)
+            parts.forEach { (key, value) -> put(key, value) }
+            put("meta", metaJson(frames.first().meta))
+            metadata?.let { put("camera2", it) }
+        }
+    }
+
+    /** A developed picture saved as a PNG (and a series' tile shifts as a binary file); its numbers for the report. */
+    private suspend fun saveDeveloped(developed: Developed, folder: String, name: String, numbers: List<Int>): JsonObject {
+        processSteps.edit().putString("step", "saving $name").commit()
+        val bitmap = Bitmap.createBitmap(developed.width, developed.height, Bitmap.Config.ARGB_8888)
+        bitmap.copyPixelsFromBuffer(developed.rgba.position(0))
+        withContext(Dispatchers.IO) {
+            Media.writeDownload(resolver, folder, name, "image/png") { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+        }
+        bitmap.recycle()
+        return buildJsonObject {
+            put("file", name)
             put("size", "${developed.width}x${developed.height}")
             put("timesMs", buildJsonObject { developed.timesMs.forEach { (k, v) -> put(k, v) } })
             put("totalMs", developed.timesMs.values.sum())
             put("stats", buildJsonObject { developed.stats.forEach { (k, v) -> put(k, v) } })
-            put("meta", metaJson(frame.meta))
-            metadata?.let { put("camera2", it) }
+            developed.merge?.let { merge ->
+                val shiftsFile = "z1.0_ev0_shifts_gpu.bin"
+                withContext(Dispatchers.IO) {
+                    Media.writeDownload(resolver, folder, shiftsFile, "application/octet-stream") { out ->
+                        val bytes = ByteBuffer.allocate(merge.shifts.sumOf { it.size } * 2).order(ByteOrder.LITTLE_ENDIAN)
+                        merge.shifts.forEach { frame -> frame.forEach { bytes.putShort(it.toShort()) } }
+                        out.write(bytes.array())
+                    }
+                }
+                put("reference", merge.reference)
+                put("referenceFile", String.format(Locale.ROOT, "z1.0_ev0_%02d.dng", numbers[merge.reference]))
+                put("otherFramesUsed", merge.used)
+                put("sharpness", jsonOf(merge.sharpness))
+                put("tiles", "${merge.tilesX}x${merge.tilesY}")
+                put("shiftsFile", shiftsFile)
+            }
         }
     }
 
@@ -678,7 +718,7 @@ class QualityTests(context: Context, private val preview: PreviewHost) {
 
     private suspend fun rawBursts(
         device: CameraDevice, thread: CameraThread, surface: Surface, lens: Lens, zoom: Float, frames: Int, evs: List<Int>, folder: String, tag: String,
-        keep: ((Image, CaptureResult) -> Unit)? = null,
+        keep: ((Int, Image, CaptureResult) -> Unit)? = null,
     ): JsonObject {
         val size = largest(lens.chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP), ImageFormat.RAW_SENSOR) ?: return buildJsonObject { put("skipped", "no RAW_SENSOR") }
         // Room for a whole burst: the frames wait in the reader while the DNGs are written, and a reader that is full drops what the camera sends
@@ -714,7 +754,7 @@ class QualityTests(context: Context, private val preview: PreviewHost) {
 
     private suspend fun burst(
         device: CameraDevice, session: CameraCaptureSession, thread: CameraThread, surface: Surface, queue: ImageQueue, lens: Lens, zoom: Float, frames: Int,
-        exposure: Long, iso: Int, focus: Float?, folder: String, name: String, keep: ((Image, CaptureResult) -> Unit)? = null,
+        exposure: Long, iso: Int, focus: Float?, folder: String, name: String, keep: ((Int, Image, CaptureResult) -> Unit)? = null,
     ): JsonObject {
         val results = ConcurrentLinkedQueue<TotalCaptureResult>()
         val lost = AtomicInteger()
@@ -755,8 +795,8 @@ class QualityTests(context: Context, private val preview: PreviewHost) {
                         add(buildJsonObject { put("timestampNs", it.timestamp); put("error", "no capture result with this timestamp") })
                     } else {
                         writeDng(folder, file, lens.chars, result, it)
-                        // The series' first frame handed on while its buffer is still there (the GPU development in "process")
-                        if (i == 1) keep?.invoke(it, result)
+                        // Each frame handed on while its buffer is still there (the GPU development in "process")
+                        keep?.invoke(i, it, result)
                         add(buildJsonObject {
                             put("file", file)
                             put("timestampNs", it.timestamp)

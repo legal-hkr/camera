@@ -15,9 +15,15 @@ import kotlin.math.sqrt
 
 /**
  * A developed picture: [rgba] (8 bits per channel, row by row, not yet turned by the frame's orientation), the numbers the development measured and how
- * long each step took.
+ * long each step took. For a series also its [merge]: the reference frame, the share of the other frames used, each other frame's tile shifts.
  */
-class Developed(val width: Int, val height: Int, val rgba: ByteBuffer, val stats: Map<String, Double>, val timesMs: Map<String, Double>)
+class Developed(val width: Int, val height: Int, val rgba: ByteBuffer, val stats: Map<String, Double>, val timesMs: Map<String, Double>, val merge: MergeReport?)
+
+/**
+ * How a series was merged: [reference] (index in the series), [used] (0..1), [shifts] per other frame (in the series' order, the reference left out):
+ * each finest tile's (y, x) shift in half-size pixels, [tilesX] × [tilesY] tiles row by row; [sharpness] of the first frames.
+ */
+class MergeReport(val reference: Int, val used: Double, val shifts: List<IntArray>, val tilesX: Int, val tilesY: Int, val sharpness: List<Double>)
 
 /**
  * Develops RAW frames on the GPU (OpenGL ES 3.1 compute) the way the computer prototype does (`develop.py`, the owner's accepted look). One GPU context
@@ -36,13 +42,16 @@ class Developer : AutoCloseable {
     val renderer: String get() = executor.submit(Callable { gpu.renderer }).get()
 
     /**
-     * [frame] developed with [look]; [frames]: how many frames were merged into it (the noise it carries). [progress] hears each step's name and the GPU
-     * memory the development holds as it starts (on the GPU's thread).
+     * [frames] (one, or a series of the same size and exposure) developed with [look]: a series is merged first (the sharpest of its first three the
+     * reference, whose metadata the development takes). [progress] hears each step's name and the GPU memory the development holds as it starts (on the
+     * GPU's thread).
      */
-    fun develop(frame: RawFrame, look: Look = Look(), frames: Int = 1, progress: (step: String, gpuBytes: Long) -> Unit = { _, _ -> }): Developed = try {
+    fun develop(frames: List<RawFrame>, look: Look = Look(), progress: (step: String, gpuBytes: Long) -> Unit = { _, _ -> }): Developed = try {
+        require(frames.isNotEmpty() && frames.size <= 8) { "1 to 8 frames" }
+        require(frames.all { it.width == frames[0].width && it.height == frames[0].height }) { "frames of different sizes" }
         executor.submit(Callable {
             try {
-                Pass(gpu, frame, look, frames, progress).run()
+                Pass(gpu, frames, look, progress).run()
             } catch (e: Throwable) {
                 // Whatever the failed step left on the GPU goes now, not with the context
                 gpu.closeAll()
@@ -60,10 +69,15 @@ class Developer : AutoCloseable {
 }
 
 /** One development, step by step; every texture is closed as soon as the next step has what it needs. */
-private class Pass(private val gpu: Gpu, private val frame: RawFrame, private val look: Look, private val frames: Int, private val progress: (String, Long) -> Unit) {
+private class Pass(private val gpu: Gpu, private val series: List<RawFrame>, private val look: Look, private val progress: (String, Long) -> Unit) {
     private val times = LinkedHashMap<String, Double>()
     private val stats = LinkedHashMap<String, Double>()
-    private val meta = frame.meta
+    private val width = series[0].width
+    private val height = series[0].height
+
+    /** The frame whose metadata the development takes: the series' reference once it is known. */
+    private var meta = series[0].meta
+    private val frames = series.size
 
     private var peakBytes = 0L
 
@@ -77,17 +91,33 @@ private class Pass(private val gpu: Gpu, private val frame: RawFrame, private va
     }
 
     fun run(): Developed {
-        val width = frame.width
-        val height = frame.height
-        val neutral = timed("neutralMs") { neutral() }
+        // The frames as raw 16-bit layers; a series merged into one normalized mosaic, a single frame only normalized
+        val raws = gpu.textureArray(width, height, frames, GLES30.GL_R16UI)
+        var report: MergeReport? = null
+        val normalized = raws.use {
+            timed("uploadMs") { series.forEachIndexed { layer, frame -> gpu.uploadLayer(it, layer, GLES30.GL_RED_INTEGER, GLES30.GL_UNSIGNED_SHORT, frame.samples, alignment = 2) } }
+            if (frames == 1) {
+                timed("normalizeMs") { normalize(it) }
+            } else {
+                val merged = timed("mergeMs") { Merge(gpu, series, ::mark).run(it) }
+                meta = series[merged.reference].meta
+                report = MergeReport(merged.reference, merged.used, merged.shifts, merged.tiles.first, merged.tiles.second, merged.sharpness)
+                stats["reference"] = merged.reference.toDouble()
+                stats["otherFramesUsed"] = merged.used
+                it.close()
+                timed("unplaneMs") { unplane(merged.planes) }
+            }
+        }
+        val (cells, cellsX, cellsY) = timed("cellsMs") { cells(normalized) }
+        val neutral = timed("neutralMs") { neutral(cells, cellsX, cellsY) }
         val balance = DoubleArray(3) { 1 / neutral[it] }.also { it[1] *= look.green.toDouble() }
         val matrix = ColorMath.cameraToSrgb(meta, neutral, look)
-        val rgbFull = timed("demosaicMs") { demosaic(balance, matrix) }
+        val rgbFull = timed("demosaicMs") { normalized.use { demosaic(it, balance, matrix) } }
         val (cx, cy, cw, ch) = meta.crop.toList()
         val rgb = timed("warpMs") { rgbFull.use { warp(it, cx, cy, cw, ch) } }
 
         // The scene's brightness: a dimmer scene keeps a darker key and a deeper black
-        val ev = Stats.sceneEv(frame)
+        val ev = Stats.sceneEv(cells, meta)
         val dim = if (ev == null) 0.0 else (look.keyEv - ev).coerceIn(0.0, 1.0)
         val key = look.key + (look.keyDark - look.key) * dim
         val blackPercentile = look.blackPercentile + (look.blackDark - look.blackPercentile) * dim
@@ -130,21 +160,58 @@ private class Pass(private val gpu: Gpu, private val frame: RawFrame, private va
         }
         stats["glError"] = gpu.error().toDouble()
         stats["gpuPeakMB"] = peakBytes / 1e6
-        return Developed(cw, ch, bytes, stats, times)
+        return Developed(cw, ch, bytes, stats, times, report)
     }
 
     /**
      * The neutral the picture is balanced to (green 1): the camera's, moved part of the way toward the picture's own where the two clearly disagree (a
      * lamp's warmth the camera keeps: from 4 % apart, fully from 8 %).
      */
-    private fun neutral(): DoubleArray {
+    private fun neutral(cells: FloatArray, cellsX: Int, cellsY: Int): DoubleArray {
         val shot = DoubleArray(3) { meta.neutral[it] / meta.neutral[1] }
         if (look.neutralize <= 0f) return shot
-        val own = Stats.sceneNeutral(frame) { position, x, y -> shading(position, x, y) } ?: return shot
+        val own = Stats.sceneNeutral(cells, cellsX, cellsY, meta) { position, x, y -> shading(position, x, y) } ?: return shot
         val apart = (0 until 3).maxOf { abs(ln(own[it] / shot[it])) }
         val weight = look.neutralize * ((apart - 0.04) / 0.04).coerceIn(0.0, 1.0)
         stats["neutralWeight"] = weight
         return DoubleArray(3) { shot[it] * (own[it] / shot[it]).pow(weight) }
+    }
+
+    /** One frame's normalized mosaic (black off, 0..1). */
+    private fun normalize(raws: Texture): Texture {
+        val out = gpu.texture(width, height, GLES30.GL_R32F)
+        gpu.run(Shaders.NORMALIZE, width, height, samplers = listOf(raws), images = listOf(out)) {
+            int("layer", 0)
+            vec("black", *meta.black)
+            float("range", meta.white - meta.black.average().toFloat())
+            ints("size", width, height)
+        }
+        return out
+    }
+
+    /** The merged planes back into one mosaic (the planes closed). */
+    private fun unplane(planes: List<Texture>): Texture {
+        val out = gpu.texture(width, height, GLES30.GL_R32F)
+        try {
+            gpu.run(Shaders.UNPLANE, width, height, samplers = planes, images = listOf(out)) {
+                int("pad", Merge.PAD)
+                ints("size", width, height)
+            }
+        } finally {
+            planes.forEach { it.close() }
+        }
+        return out
+    }
+
+    /** Every fourth cell of each position's plane, read back for the scene's statistics: (values, cells across, cells down). */
+    private fun cells(normalized: Texture): Triple<FloatArray, Int, Int> {
+        val cellsX = (width / 2 + 3) / 4
+        val cellsY = (height / 2 + 3) / 4
+        val out = gpu.texture(cellsX, cellsY, GLES30.GL_RGBA32F)
+        return out.use {
+            gpu.run(Shaders.SUBSAMPLE, cellsX, cellsY, samplers = listOf(normalized), images = listOf(it)) { ints("outSize", cellsX, cellsY) }
+            Triple(gpu.read(it, 4), cellsX, cellsY)
+        }
     }
 
     /** The lens shading gain of a 2 × 2 position's pixel, as the GPU's PREPARE takes it. */
@@ -152,8 +219,8 @@ private class Pass(private val gpu: Gpu, private val frame: RawFrame, private va
         val map = meta.shading ?: return 1f
         val dy = y and 1
         val dx = x and 1
-        val gv = ((y - dy).toFloat() / (frame.height - dy) * (map.rows - 1)).coerceIn(0f, (map.rows - 1).toFloat())
-        val gu = ((x - dx).toFloat() / (frame.width - dx) * (map.columns - 1)).coerceIn(0f, (map.columns - 1).toFloat())
+        val gv = ((y - dy).toFloat() / (height - dy) * (map.rows - 1)).coerceIn(0f, (map.rows - 1).toFloat())
+        val gu = ((x - dx).toFloat() / (width - dx) * (map.columns - 1)).coerceIn(0f, (map.columns - 1).toFloat())
         val v0 = gv.toInt()
         val u0 = gu.toInt()
         val v1 = minOf(v0 + 1, map.rows - 1)
@@ -165,10 +232,7 @@ private class Pass(private val gpu: Gpu, private val frame: RawFrame, private va
         return a + (b - a) * (gv - v0)
     }
 
-    private fun demosaic(balance: DoubleArray, matrix: DoubleArray): Texture {
-        val width = frame.width
-        val height = frame.height
-        val raw = gpu.texture(width, height, GLES30.GL_R16UI)
+    private fun demosaic(normalized: Texture, balance: DoubleArray, matrix: DoubleArray): Texture {
         val mosaic = gpu.texture(width, height, GLES30.GL_R32F)
         val map = meta.shading
         val shading = if (map == null) gpu.texture(1, 1, GLES30.GL_RGBA32F) else gpu.texture(map.columns, map.rows, GLES30.GL_RGBA32F).also { t ->
@@ -176,20 +240,14 @@ private class Pass(private val gpu: Gpu, private val frame: RawFrame, private va
             for (i in 0 until map.rows * map.columns) for (p in 0 until 4) data.put(map.gains[p][i])
             gpu.upload(t, GLES30.GL_RGBA, GLES30.GL_FLOAT, data)
         }
-        try {
-            gpu.upload(raw, GLES30.GL_RED_INTEGER, GLES30.GL_UNSIGNED_SHORT, frame.samples, alignment = 2)
-            gpu.run(Shaders.PREPARE, width, height, samplers = listOf(raw, shading), images = listOf(mosaic)) {
-                vec("black", *meta.black)
-                float("range", meta.white - meta.black.average().toFloat())
+        shading.use {
+            gpu.run(Shaders.PREPARE, width, height, samplers = listOf(normalized, it), images = listOf(mosaic)) {
                 ints("cfa", *meta.cfa)
                 vec("balance", balance[0].toFloat(), balance[1].toFloat(), balance[2].toFloat())
                 int("hasShading", if (map == null) 0 else 1)
                 ints("mapSize", map?.columns ?: 1, map?.rows ?: 1)
                 ints("size", width, height)
             }
-        } finally {
-            raw.close()
-            shading.close()
         }
         // Half floats: a relative step of 1/2048 at every level (down to 6e-8 absolute), far finer than the sensor's noise
         val rgb = gpu.texture(width, height, GLES30.GL_RGBA16F)
