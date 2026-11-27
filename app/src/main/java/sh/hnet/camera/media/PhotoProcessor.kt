@@ -12,6 +12,7 @@ import android.util.Log
 import androidx.core.graphics.createBitmap
 import androidx.exifinterface.media.ExifInterface
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.nio.ByteBuffer
 import java.time.Instant
 import java.time.ZoneId
@@ -124,8 +125,8 @@ class PhotoProcessor(private val context: Context) {
                 Log.w(TAG, "Series not developed: ${e.javaClass.simpleName}")
                 null
             } finally {
+                // The queue's place stays until the photo is saved ([close], after the saving): the badge and the service last as long
                 into.close()
-                close()
             }
         }
 
@@ -157,9 +158,25 @@ class PhotoProcessor(private val context: Context) {
     /** A developed photo: the JPEG, its size and the EXIF tags to write into its file. */
     class Processed(val bytes: ByteArray, val size: PixelSize, val exif: Map<String, String>)
 
+    /** Whether the GPU's programs were made ready ([warmUp]) in this process. */
+    @Volatile
+    private var warmed = false
+
+    /**
+     * Gets the GPU ready before the first photo (once a Photo session with the raw stream is there): its contexts made and every program compiled or
+     * loaded from the cache, on a synthetic series developed and thrown away.
+     */
+    suspend fun warmUp() = withContext(Dispatchers.IO) {
+        if (warmed) return@withContext
+        warmed = true
+        val gpu = developer() ?: return@withContext
+        runCatching { gpu.warmUp() }.onFailure { Log.w(TAG, "GPU not warmed up: ${it.javaClass.simpleName}") }
+    }
+
     private suspend fun developer(): Developer? = made.withLock {
         if (unusable) return null
-        developer ?: runCatching { Developer() }.onFailure {
+        // The programs' binaries kept across processes (cache: the system may clear it, they are compiled again then)
+        developer ?: runCatching { Developer(File(context.cacheDir, "gpu-programs")) }.onFailure {
             unusable = true
             Log.w(TAG, "No GPU processing: ${it.javaClass.simpleName}")
         }.getOrNull()?.also { developer = it }

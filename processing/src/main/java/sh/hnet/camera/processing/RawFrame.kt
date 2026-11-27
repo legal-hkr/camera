@@ -53,6 +53,26 @@ class FrameMeta(
     companion object
 }
 
+/** A plausible frame's metadata (the Pixel 9 Pro main camera's calibration) for [Developer.warmUp]'s synthetic 1024 × 768 frames. */
+internal fun FrameMeta.Companion.synthetic() = FrameMeta(
+    cfa = intArrayOf(Cfa.GREEN, Cfa.BLUE, Cfa.RED, Cfa.GREEN),
+    black = floatArrayOf(64f, 64f, 64f, 64f),
+    white = 1023f,
+    neutral = doubleArrayOf(0.59, 1.0, 0.56),
+    colorMatrix = listOf(doubleArrayOf(1.119, -0.4931, -0.063, -0.3865, 1.4026, 0.0617, -0.0325, 0.2082, 0.7151), doubleArrayOf(0.7002, -0.0849, -0.1246, -0.5989, 1.571, -0.0016, -0.2134, 0.4452, 0.4157)),
+    calibration = listOf(null, null),
+    forwardMatrix = listOf(doubleArrayOf(0.6116, 0.1737, 0.179, 0.1363, 0.8365, 0.0272, -0.0417, -0.5848, 1.4516), doubleArrayOf(0.7144, -0.0009, 0.2507, 0.2755, 0.6223, 0.1022, 0.0513, -0.506, 1.2799)),
+    illuminantK = doubleArrayOf(2856.0, 6504.0),
+    noiseS = 2.4e-4,
+    noiseO = 1.8e-6,
+    shading = null,
+    warp = null,
+    crop = intArrayOf(8, 8, 1008, 752),
+    orientation = 1,
+    exposureNs = 33_000_000,
+    iso = 100,
+)
+
 /**
  * The lens shading gains, one grid per 2 × 2 position ([gains] row by row, `rows × columns` each, in the order of [FrameMeta.cfa]'s positions), spanning
  * the frame as a DNG GainMap does: position (dy, dx)'s pixel at row y lies at grid row (y − dy) / (height − dy) · (rows − 1).

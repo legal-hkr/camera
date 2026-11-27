@@ -304,9 +304,10 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
     // A burst's count and its frames being saved change many times a second: read as states where they are shown, here only whether there are any
     val burstCount = viewModel.burstCount.collectAsStateWithLifecycle()
     val burstsSaving = viewModel.burstsSaving.collectAsStateWithLifecycle()
+    val seriesQueued by viewModel.seriesQueued.collectAsStateWithLifecycle()
     val bursting by remember { derivedStateOf { burstCount.value != null } }
     val saving by remember { derivedStateOf { burstsSaving.value > 0 } }
-    val busy = engine.recording != null || ui.countdown != null || ui.motionWaiting > 0 || reviewing != null || ui.holdingStill || ui.processing > 0 || bursting || saving
+    val busy = engine.recording != null || ui.countdown != null || ui.motionWaiting > 0 || reviewing != null || ui.holdingStill || ui.processing > 0 || seriesQueued > 0 || bursting || saving
     var keepOn by remember { mutableStateOf(true) }
     // A tapped focus that ends because the phone turned isn't use either
     // Use is what the user changes: not what the scene or the phone changes by itself (a dark scene's suggestion coming and going, a code found, progress)
@@ -947,7 +948,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                 if (capture != null) {
                     RowButton(R.drawable.ic_close, stringResource(R.string.button_cancel), turn, Modifier.align(Alignment.CenterStart).padding(start = 34.dp)) { onCancel?.invoke() }
                 } else {
-                    Thumbnail(last, ui.pendingThumbnail, turn, { ui.processing + burstsSaving.value }, ui.processProgress, Modifier.align(Alignment.CenterStart).padding(start = 34.dp)) { shot ->
+                    Thumbnail(last, ui.pendingThumbnail, turn, { ui.processing + seriesQueued + burstsSaving.value }, ui.processProgress, Modifier.align(Alignment.CenterStart).padding(start = 34.dp)) { shot ->
                         if (entry.locked) reviewSecure(context, activity, viewModel.sessionShots(), shot) else openInGallery(context, shot)
                     }
                 }

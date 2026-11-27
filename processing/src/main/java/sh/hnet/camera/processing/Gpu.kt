@@ -6,16 +6,18 @@ import android.opengl.EGLExt
 import android.opengl.GLES20
 import android.opengl.GLES30
 import android.opengl.GLES31
+import java.io.File
 import java.nio.Buffer
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.security.MessageDigest
 
 /**
  * An OpenGL ES 3.1 context of its own (no window: a 1 × 1 pbuffer) for compute shaders, used from one thread only – the one that made it. Programs are
  * compiled once and kept; textures are made and deleted by the caller ([Texture.close]). With [share], its textures are the other context's too (a series'
  * frames uploaded on one thread while another develops); what one context wrote is seen by the other once it has finished ([finish]).
  */
-internal class Gpu(share: Gpu? = null) : AutoCloseable {
+internal class Gpu(share: Gpu? = null, private val cache: File? = null) : AutoCloseable {
     private val display = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
     private val context: android.opengl.EGLContext
     private val surface: android.opengl.EGLSurface
@@ -215,9 +217,95 @@ internal class Gpu(share: Gpu? = null) : AutoCloseable {
     /** Waits until the GPU has done everything asked so far (for timing). */
     fun finish() = GLES20.glFinish()
 
-    fun error(): Int = GLES20.glGetError()
+    /** The first GL error since the last call, including one set aside while a program was loaded or stored ([pending]). */
+    fun error(): Int {
+        val first = pending
+        pending = GLES20.GL_NO_ERROR
+        return if (first != GLES20.GL_NO_ERROR) first else GLES20.glGetError()
+    }
 
+    /** An error the development left before a program's binary was handled: kept, so [error] still reports it after that handling clears its own. */
+    private var pending = GLES20.GL_NO_ERROR
+
+    private fun setAsidePendingError() {
+        val now = GLES20.glGetError()
+        if (pending == GLES20.GL_NO_ERROR) pending = now
+    }
+
+    /**
+     * Lets go of every binding this context holds: a texture another context deletes stays allocated while it is bound here (the upload context had kept
+     * a whole series' frames, 200 MB, through the development).
+     */
+    fun unbind() {
+        for (unit in 0 until BOUND_UNITS) {
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE0 + unit)
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+            GLES20.glBindTexture(GLES30.GL_TEXTURE_2D_ARRAY, 0)
+        }
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        for (unit in 0 until BOUND_UNITS) GLES31.glBindImageTexture(unit, 0, 0, false, 0, GLES31.GL_READ_ONLY, GLES30.GL_R32F)
+    }
+
+    /**
+     * A program: compiled once per context, and kept on disk in [cache] as the driver's binary (keyed by the source, the GPU and the driver's version), so
+     * a new process loads it instead of compiling again (the first photo after a start paid for every program's compilation).
+     */
     private fun program(source: String): Int = programs.getOrPut(source) {
+        val file = cache?.let { File(it, key(source) + ".bin") }
+        file?.let { loaded(it) } ?: compiled(source).also { program -> file?.let { store(program, it) } }
+    }
+
+    private fun key(source: String): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        for (part in listOf(source, renderer, GLES20.glGetString(GLES20.GL_VERSION).orEmpty())) digest.update(part.toByteArray())
+        return java.util.HexFormat.of().formatHex(digest.digest())
+    }
+
+    /** A program from its stored binary; null when there is none or the driver refuses it (another driver version: compiled again). */
+    private fun loaded(file: File): Int? {
+        if (!file.isFile) return null
+        setAsidePendingError()
+        val bytes = runCatching { file.readBytes() }.getOrNull()?.takeIf { it.size > 4 } ?: return null
+        val format = ByteBuffer.wrap(bytes, 0, 4).order(ByteOrder.LITTLE_ENDIAN).int
+        val binary = ByteBuffer.allocateDirect(bytes.size - 4).order(ByteOrder.nativeOrder()).put(bytes, 4, bytes.size - 4).position(0)
+        val program = GLES20.glCreateProgram()
+        GLES30.glProgramBinary(program, format, binary, bytes.size - 4)
+        val ok = IntArray(1)
+        GLES20.glGetProgramiv(program, GLES20.GL_LINK_STATUS, ok, 0)
+        // A refused binary leaves an error behind: cleared, it isn't the development's
+        GLES20.glGetError()
+        if (ok[0] == 0) {
+            GLES20.glDeleteProgram(program)
+            file.delete()
+            return null
+        }
+        return program
+    }
+
+    private fun store(program: Int, file: File) {
+        setAsidePendingError()
+        runCatching {
+            val length = IntArray(1)
+            GLES20.glGetProgramiv(program, GLES30.GL_PROGRAM_BINARY_LENGTH, length, 0)
+            if (length[0] <= 0) return
+            val binary = ByteBuffer.allocateDirect(length[0]).order(ByteOrder.nativeOrder())
+            val written = IntArray(1)
+            val format = IntArray(1)
+            GLES30.glGetProgramBinary(program, length[0], written, 0, format, 0, binary)
+            if (GLES20.glGetError() != GLES20.GL_NO_ERROR || written[0] <= 0) return@runCatching
+            val bytes = ByteArray(4 + written[0])
+            ByteBuffer.wrap(bytes, 0, 4).order(ByteOrder.LITTLE_ENDIAN).putInt(format[0])
+            binary.position(0)
+            binary.get(bytes, 4, written[0])
+            file.parentFile?.mkdirs()
+            // Whole or not at all: another process may read it meanwhile, and the other context may be writing the same program now
+            val part = File(file.path + "." + System.nanoTime() + ".part")
+            part.writeBytes(bytes)
+            if (!part.renameTo(file)) part.delete()
+        }
+    }
+
+    private fun compiled(source: String): Int {
         val shader = GLES20.glCreateShader(GLES31.GL_COMPUTE_SHADER)
         GLES20.glShaderSource(shader, source)
         GLES20.glCompileShader(shader)
@@ -230,11 +318,17 @@ internal class Gpu(share: Gpu? = null) : AutoCloseable {
         }
         val program = GLES20.glCreateProgram()
         GLES20.glAttachShader(program, shader)
+        if (cache != null) GLES30.glProgramParameteri(program, GLES30.GL_PROGRAM_BINARY_RETRIEVABLE_HINT, GLES20.GL_TRUE)
         GLES20.glLinkProgram(program)
         GLES20.glDeleteShader(shader)
         GLES20.glGetProgramiv(program, GLES20.GL_LINK_STATUS, ok, 0)
         check(ok[0] != 0) { "program: " + GLES20.glGetProgramInfoLog(program) }
-        program
+        return program
+    }
+
+    private companion object {
+        /** Texture and image units the programs bind (at most four samplers, two images). */
+        const val BOUND_UNITS = 4
     }
 
     override fun close() {

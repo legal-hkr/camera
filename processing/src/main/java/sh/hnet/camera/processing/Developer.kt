@@ -1,6 +1,7 @@
 package sh.hnet.camera.processing
 
 import android.opengl.GLES30
+import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.Callable
@@ -51,15 +52,17 @@ class MergeReport(val reference: Int, val used: Double, val shifts: List<IntArra
  * sharing their textures, each on a thread of its own: one takes a series' frames as they come ([series], [Series.add]), the other develops ([develop]) –
  * so a new series' frames go to the GPU while an earlier one is still being developed. Its programs stay compiled while it lives; close it to free both.
  */
-class Developer : AutoCloseable {
+class Developer(private val cache: File? = null) : AutoCloseable {
     private val executor: ExecutorService = Executors.newSingleThreadExecutor { Thread(it, "processing-gpu") }
     private val uploader: ExecutorService = Executors.newSingleThreadExecutor { Thread(it, "processing-upload") }
     private val gpu: Gpu
     private val uploads: Gpu
 
     init {
+        // Binaries a killed process left half-written
+        cache?.listFiles { file -> file.name.endsWith(".part") }?.forEach { it.delete() }
         val made = try {
-            executor.submit(Callable { Gpu() }).get()
+            executor.submit(Callable { Gpu(cache = cache) }).get()
         } catch (e: ExecutionException) {
             executor.shutdown()
             uploader.shutdown()
@@ -67,7 +70,7 @@ class Developer : AutoCloseable {
         }
         gpu = made
         uploads = try {
-            uploader.submit(Callable { Gpu(share = made) }).get()
+            uploader.submit(Callable { Gpu(share = made, cache = cache) }).get()
         } catch (e: ExecutionException) {
             runCatching { executor.submit { made.close() }.get() }
             executor.shutdown()
@@ -85,14 +88,27 @@ class Developer : AutoCloseable {
      */
     fun series(count: Int, width: Int, height: Int): Series {
         require(count in 1..8) { "1 to 8 frames" }
-        return Series(count, width, height)
+        // Its pyramids built as the frames come only when nothing else waits or develops: a queued series would hold them (130 MB) until its turn,
+        // and the GPU's time goes to the development then
+        val alone = waiting.getAndIncrement() == 0
+        return Series(count, width, height, pyramidsNow = alone && count > 1)
     }
+
+    /** Series made and not yet developed or closed (each counted once). */
+    private val waiting = java.util.concurrent.atomic.AtomicInteger()
 
     /**
      * A series on its way to the GPU: [add] uploads a frame (blocking until the GPU has its copy: the caller's buffer may go back right after), [develop]
      * takes the frames added so far.
      */
-    inner class Series internal constructor(val capacity: Int, val width: Int, val height: Int) : AutoCloseable {
+    inner class Series internal constructor(val capacity: Int, val width: Int, val height: Int, private val pyramidsNow: Boolean) : AutoCloseable {
+        private val done = java.util.concurrent.atomic.AtomicBoolean(false)
+
+        /** No longer waiting (developed or closed), once. */
+        internal fun finished() {
+            if (done.compareAndSet(false, true)) waiting.decrementAndGet()
+        }
+
         internal val raws: Texture = onUploader {
             uploads.textureArray(width, height, capacity, GLES30.GL_R16UI).also { made ->
                 // Out of memory shows only as the GL's error
@@ -104,6 +120,9 @@ class Developer : AutoCloseable {
         }
         internal val metas = ArrayList<FrameMeta>()
 
+        /** Each frame's alignment pyramid, built as the frame came (the merge's first step, done while the series is still being taken). */
+        internal val pyramids = ArrayList<List<Texture>>()
+
         /** Frames added so far. */
         val frames: Int get() = synchronized(metas) { metas.size }
 
@@ -113,7 +132,13 @@ class Developer : AutoCloseable {
             require(rowStride >= width * 2 && rowStride % 2 == 0) { "row stride $rowStride" }
             onUploader {
                 uploads.uploadLayer(raws, layer, GLES30.GL_RED_INTEGER, GLES30.GL_UNSIGNED_SHORT, samples, alignment = 2, rowLength = rowStride / 2)
-                // Finished here before the developing context reads it
+                // A series is merged: its frame's pyramid now, while the next frame is still on its way
+                if (pyramidsNow) {
+                    val pyramid = Merge.pyramid(uploads, raws, layer, meta, width, height)
+                    synchronized(metas) { pyramids += pyramid }
+                }
+                // Nothing of the series stays bound here (the developing context deletes it), finished before that context reads it
+                uploads.unbind()
                 uploads.finish()
                 uploads.error().takeIf { it != GLES30.GL_NO_ERROR }?.let { error("frame not uploaded (GL 0x${Integer.toHexString(it)})") }
             }
@@ -121,8 +146,18 @@ class Developer : AutoCloseable {
             return true
         }
 
+        /** The pyramids handed over (the merge closes them), or closed when none will be. */
+        internal fun takePyramids(): List<List<Texture>> = synchronized(metas) { pyramids.toList().also { pyramids.clear() } }
+
         override fun close() {
-            if (!raws.closed) runCatching { onUploader { raws.close() } }
+            finished()
+            val left = takePyramids()
+            if (!raws.closed || left.isNotEmpty()) runCatching {
+                onUploader {
+                    raws.close()
+                    left.flatten().forEach { it.close() }
+                }
+            }
         }
     }
 
@@ -134,9 +169,13 @@ class Developer : AutoCloseable {
     fun develop(series: Series, look: Look = Look(), progress: (step: String, gpuBytes: Long) -> Unit = { _, _ -> }): Developed = try {
         executor.submit(Callable {
             val metas = synchronized(series.metas) { series.metas.toList() }
+            // Every frame's pyramid, or none (the merge builds them itself then)
+            val taken = series.takePyramids()
+            val pyramids = taken.takeIf { it.size == metas.size && it.isNotEmpty() }
+            if (pyramids == null) taken.flatten().forEach { it.close() }
             try {
                 require(metas.isNotEmpty()) { "no frames" }
-                val pass = Pass(gpu, series.raws, metas, series.width, series.height, look, progress)
+                val pass = Pass(gpu, series.raws, metas, series.width, series.height, look, progress, pyramids = pyramids, otherBytes = { uploads.liveBytes })
                 try {
                     // A GL error (out of memory most likely) leaves a broken picture without an exception: a failure as any other
                     pass.run().also { check(it.stats["glError"] == 0.0) { "GL error 0x${Integer.toHexString(it.stats["glError"]?.toInt() ?: 0)}" } }
@@ -158,11 +197,39 @@ class Developer : AutoCloseable {
                     }
                 }
             } finally {
+                series.finished()
                 series.raws.close()
+                // Whatever the merge didn't take (a single frame's, a failure before it)
+                pyramids?.flatten()?.forEach { it.close() }
+                series.takePyramids().flatten().forEach { it.close() }
             }
         }).get()
     } catch (e: ExecutionException) {
         throw e.cause ?: e
+    }
+
+    /**
+     * Compiles (or loads from the cache) every program a development uses, by developing a small synthetic series of two frames and throwing it away:
+     * the first photo then doesn't wait for it.
+     */
+    fun warmUp() {
+        val width = WARM_WIDTH
+        val height = WARM_HEIGHT
+        val samples = ByteBuffer.allocateDirect(width * height * 2).order(ByteOrder.nativeOrder())
+        // A gentle gradient (a flat picture would leave every percentile equal)
+        val shorts = samples.asShortBuffer()
+        for (y in 0 until height) for (x in 0 until width) shorts.put((80 + (x + y) % 600).toShort())
+        // A series (the merge, the pyramids on the upload's context) and a single frame (its own normalization)
+        for (frames in listOf(2, 1)) {
+            val series = series(frames, width, height)
+            try {
+                repeat(frames) { series.add(samples, width * 2, FrameMeta.synthetic()) }
+            } catch (e: Throwable) {
+                series.close()
+                throw e
+            }
+            develop(series)
+        }
     }
 
     /** [frames] (one, or a series of the same size) uploaded and developed: the computer comparison's way in (packed rows). */
@@ -189,6 +256,12 @@ class Developer : AutoCloseable {
         throw e.cause ?: e
     }
 
+    private companion object {
+        /** The warm-up's frames: big enough for every pyramid level and filter radius to be the real ones' kind. */
+        const val WARM_WIDTH = 1024
+        const val WARM_HEIGHT = 768
+    }
+
     override fun close() {
         runCatching { uploader.submit { uploads.close() }.get() }
         runCatching { executor.submit { gpu.close() }.get() }
@@ -210,6 +283,9 @@ private class Pass(
     private val look: Look,
     private val progress: (String, Long) -> Unit,
     private val layer: Int = 0,
+    private val pyramids: List<List<Texture>>? = null,
+    /** The GPU memory the upload's context holds meanwhile (the next series' frames and pyramids), for the peak. */
+    private val otherBytes: () -> Long = { 0L },
 ) {
     private val times = LinkedHashMap<String, Double>()
     private val stats = LinkedHashMap<String, Double>()
@@ -239,7 +315,7 @@ private class Pass(
         val normalized = if (frames == 1) {
             timed("normalizeMs") { normalize(raws) }
         } else {
-            val merged = timed("mergeMs") { Merge(gpu, series, width, height, ::mark).run(raws) { reference = it } }
+            val merged = timed("mergeMs") { Merge(gpu, series, width, height, ::mark).run(raws, pyramids) { reference = it } }
             meta = series[merged.reference]
             val report = MergeReport(merged.reference, merged.used, merged.shifts, merged.tiles.first, merged.tiles.second, merged.sharpness)
             this.report = report
@@ -657,7 +733,7 @@ private class Pass(
     }
 
     private fun trackPeak() {
-        peakBytes = maxOf(peakBytes, gpu.liveBytes)
+        peakBytes = maxOf(peakBytes, gpu.liveBytes + otherBytes())
     }
 
     /**
@@ -671,7 +747,7 @@ private class Pass(
         segment?.let { profile[it] = (profile[it] ?: 0.0) + (now - segmentStart) / 1e6 }
         segment = name
         segmentStart = now
-        progress(name, gpu.liveBytes)
+        progress(name, gpu.liveBytes + otherBytes())
     }
 
     private val profile = LinkedHashMap<String, Double>()

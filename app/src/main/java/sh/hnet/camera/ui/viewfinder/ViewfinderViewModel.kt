@@ -134,7 +134,7 @@ data class ViewfinderUi(
     val gatherProgress: Float? = null,
     /** The newest photo being put together (Night's, or a series of Photo's own processing): its progress (0–1) at the thumbnail; null when it gives none. */
     val processProgress: Float? = null,
-    /** Photos being put together after their frames were gathered (SPEC §8.2; Night, Photo's own processing): the queue at the thumbnail. */
+    /** Night photos being put together after their frames were gathered (SPEC §8.2): with [seriesQueued], the queue at the thumbnail. */
     val processing: Int = 0,
     /** The newest series being developed: a copy of the live picture in the thumbnail until its photo is saved (D25). */
     val pendingThumbnail: Bitmap? = null,
@@ -305,6 +305,17 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
 
     /** A burst's frames put aside and not in the gallery yet: the thumbnail shows them as being processed. */
     val burstsSaving: StateFlow<Int> = application.bursts.pending
+
+    /** Photo's series in the process' queue, whichever viewfinder took them (the lock screen's sees the ones taken before it). */
+    val seriesQueued: StateFlow<Int> = application.processor.queued
+
+    init {
+        // The GPU made ready once a session can take series: the first photo doesn't wait for its programs (once per process)
+        viewModelScope.launch {
+            engineState.first { it.processing }
+            application.appScope.launch { application.processor.warmUp() }
+        }
+    }
 
     private var burstJob: Job? = null
     /** The shutter (or a volume key) is held: a burst starting after it was let go stops at once. */
@@ -1768,7 +1779,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
                 if (series != null) {
                     newestSeries = seriesId
                     val picture = livePicture(photo.orientation, mirror, front)
-                    _ui.update { it.copy(processing = it.processing + 1, processProgress = 0f, pendingThumbnail = picture ?: it.pendingThumbnail) }
+                    _ui.update { it.copy(processProgress = 0f, pendingThumbnail = picture ?: it.pendingThumbnail) }
                 }
                 application.appScope.launch {
                     // The photo is saved at once; its video is added when the 1.5 s after it are there, gathered meanwhile (the ring keeps only a few seconds)
@@ -1794,7 +1805,6 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
                                 _ui.update {
                                     val newest = newestSeries == seriesId
                                     it.copy(
-                                        processing = (it.processing - 1).coerceAtLeast(0),
                                         processProgress = if (newest) null else it.processProgress,
                                         pendingThumbnail = if (newest) null else it.pendingThumbnail,
                                     )

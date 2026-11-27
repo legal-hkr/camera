@@ -18,15 +18,18 @@ internal class Merge(private val gpu: Gpu, private val frames: List<FrameMeta>, 
 
     private val planeWidth = width / 2
     private val planeHeight = height / 2
-    private val paddedWidth = planeWidth + 2 * PAD + Math.floorMod(-(planeWidth + 2 * PAD), STRIDE)
-    private val paddedHeight = planeHeight + 2 * PAD + Math.floorMod(-(planeHeight + 2 * PAD), STRIDE)
+    private val paddedWidth = padded(planeWidth)
+    private val paddedHeight = padded(planeHeight)
     /** Each frame's own black level and range (the prototype normalizes each DNG by its own tags). */
     private fun range(layer: Int) = frames[layer].let { it.white - it.black.average().toFloat() }
 
-    /** [chosen] hears the reference as soon as it is known (a failure after it develops that frame alone). */
-    fun run(raws: Texture, chosen: (Int) -> Unit = {}): Result {
+    /**
+     * [chosen] hears the reference as soon as it is known (a failure after it develops that frame alone). [made]: each frame's pyramid already built as
+     * it came ([pyramid] on the upload's context); the merge closes them.
+     */
+    fun run(raws: Texture, made: List<List<Texture>>? = null, chosen: (Int) -> Unit = {}): Result {
         mark("merge: pyramids")
-        val pyramids = frames.indices.map { pyramid(raws, it) }
+        val pyramids = made?.takeIf { it.size == frames.size } ?: frames.indices.map { pyramid(gpu, raws, it, frames[it], width, height, mark) }
         try {
             mark("merge: reference")
             val sharpness = (0 until minOf(3, frames.size)).map { sharpness(pyramids[it][0]) }
@@ -53,55 +56,6 @@ internal class Merge(private val gpu: Gpu, private val frames: List<FrameMeta>, 
         } finally {
             pyramids.flatten().forEach { it.close() }
         }
-    }
-
-    /** The frame's padded half-size gray and three coarser levels (Gaussian blur of σ = factor / 2, then the mean of factor × factor blocks). */
-    private fun pyramid(raws: Texture, layer: Int): List<Texture> {
-        mark("merge: gray")
-        val gray = gpu.texture(paddedWidth, paddedHeight, GLES30.GL_R32F)
-        gpu.run(Shaders.GRAY_PAD, paddedWidth, paddedHeight, samplers = listOf(raws), images = listOf(gray)) {
-            int("layer", layer)
-            vec("black", *frames[layer].black)
-            float("range", range(layer))
-            int("pad", PAD)
-            ints("planeSize", planeWidth, planeHeight)
-            ints("outSize", paddedWidth, paddedHeight)
-        }
-        val levels = mutableListOf(gray)
-        mark("merge: pyramid levels")
-        for (level in LEVELS.drop(1)) {
-            val below = levels.last()
-            val blurred = blur(below, 0.5 * level.factor)
-            val out = gpu.texture(below.width / level.factor, below.height / level.factor, GLES30.GL_R32F)
-            blurred.use {
-                gpu.run(Shaders.DOWN_MEAN_SINGLE, out.width, out.height, samplers = listOf(it), images = listOf(out)) {
-                    int("factor", level.factor)
-                    int("luminance", 0)
-                    ints("outSize", out.width, out.height)
-                }
-            }
-            levels += out
-        }
-        return levels
-    }
-
-    private fun blur(src: Texture, sigma: Double): Texture {
-        val kernel = Stats.gaussianKernel(sigma)
-        val across = gpu.texture(src.width, src.height, GLES30.GL_R32F)
-        gpu.runGroups(Shaders.gaussRows("r32f"), (src.width + 63) / 64, (src.height + 3) / 4, samplers = listOf(src), images = listOf(across)) {
-            ints("size", src.width, src.height)
-            int("taps", kernel.size)
-            floats("kernel", kernel.copyOf(33))
-        }
-        val out = gpu.texture(src.width, src.height, GLES30.GL_R32F)
-        across.use {
-            gpu.runGroups(Shaders.gaussColumns("r32f"), (src.width + 3) / 4, (src.height + 63) / 64, samplers = listOf(it), images = listOf(out)) {
-                ints("size", src.width, src.height)
-                int("taps", kernel.size)
-                floats("kernel", kernel.copyOf(33))
-            }
-        }
-        return out
     }
 
     /** The mean squared Sobel gradient of the frame's (unpadded) gray: HDR+ takes the sharpest of the first frames as the reference. */
@@ -195,6 +149,68 @@ internal class Merge(private val gpu: Gpu, private val frames: List<FrameMeta>, 
     private fun grid(w: Int, h: Int, tile: Int, stride: Int) = ((w - tile) / stride + 1) to ((h - tile) / stride + 1)
 
     companion object {
+        /** The frame's padded half-size gray and three coarser levels (Gaussian blur of σ = factor / 2, then the mean of factor × factor blocks). */
+        fun pyramid(gpu: Gpu, raws: Texture, layer: Int, meta: FrameMeta, width: Int, height: Int, mark: (String) -> Unit = {}): List<Texture> {
+            val planeWidth = width / 2
+            val planeHeight = height / 2
+            val paddedWidth = padded(planeWidth)
+            val paddedHeight = padded(planeHeight)
+            mark("merge: gray")
+            val gray = gpu.texture(paddedWidth, paddedHeight, GLES30.GL_R32F)
+            gpu.run(Shaders.GRAY_PAD, paddedWidth, paddedHeight, samplers = listOf(raws), images = listOf(gray)) {
+                int("layer", layer)
+                vec("black", *meta.black)
+                float("range", meta.white - meta.black.average().toFloat())
+                int("pad", PAD)
+                ints("planeSize", planeWidth, planeHeight)
+                ints("outSize", paddedWidth, paddedHeight)
+            }
+            val levels = mutableListOf(gray)
+            mark("merge: pyramid levels")
+            try {
+                for (level in LEVELS.drop(1)) {
+                    val below = levels.last()
+                    val blurred = blur(gpu, below, 0.5 * level.factor)
+                    val out = gpu.texture(below.width / level.factor, below.height / level.factor, GLES30.GL_R32F)
+                    levels += out
+                    blurred.use {
+                        gpu.run(Shaders.DOWN_MEAN_SINGLE, out.width, out.height, samplers = listOf(it), images = listOf(out)) {
+                            int("factor", level.factor)
+                            int("luminance", 0)
+                            ints("outSize", out.width, out.height)
+                        }
+                    }
+                }
+            } catch (e: Throwable) {
+                // On the upload's context nothing else would close them
+                levels.forEach { it.close() }
+                throw e
+            }
+            return levels
+        }
+
+        private fun blur(gpu: Gpu, src: Texture, sigma: Double): Texture {
+            val kernel = Stats.gaussianKernel(sigma)
+            val across = gpu.texture(src.width, src.height, GLES30.GL_R32F)
+            gpu.runGroups(Shaders.gaussRows("r32f"), (src.width + 63) / 64, (src.height + 3) / 4, samplers = listOf(src), images = listOf(across)) {
+                ints("size", src.width, src.height)
+                int("taps", kernel.size)
+                floats("kernel", kernel.copyOf(33))
+            }
+            val out = gpu.texture(src.width, src.height, GLES30.GL_R32F)
+            across.use {
+                gpu.runGroups(Shaders.gaussColumns("r32f"), (src.width + 3) / 4, (src.height + 63) / 64, samplers = listOf(it), images = listOf(out)) {
+                    ints("size", src.width, src.height)
+                    int("taps", kernel.size)
+                    floats("kernel", kernel.copyOf(33))
+                }
+            }
+            return out
+        }
+
+        /** A plane padded by [PAD] on every side and further to a whole number of strides. */
+        fun padded(plane: Int) = plane + 2 * PAD + Math.floorMod(-(plane + 2 * PAD), STRIDE)
+
         const val TILE = 16
         const val STRIDE = 8
         const val PAD = 8
