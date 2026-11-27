@@ -3,6 +3,7 @@ package sh.hnet.camera.ui.viewfinder
 import android.app.Application
 import android.content.Intent
 import android.graphics.Bitmap
+import android.graphics.Matrix
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
@@ -14,6 +15,7 @@ import android.media.ToneGenerator
 import android.os.SystemClock
 import android.view.KeyEvent
 import android.view.Surface
+import androidx.exifinterface.media.ExifInterface
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import java.io.File
@@ -130,10 +132,12 @@ data class ViewfinderUi(
     val steadying: Boolean = false,
     /** The Night photo gathering its frames: the extension's progress (0–1) on the shutter; null when it gives none. */
     val gatherProgress: Float? = null,
-    /** The newest Night photo being put together: its progress (0–1) at the thumbnail; null when it gives none. */
-    val nightProgress: Float? = null,
-    /** Night photos being put together after their frames were gathered (SPEC §8.2): the queue at the thumbnail. */
+    /** The newest photo being put together (Night's, or a series of Photo's own processing): its progress (0–1) at the thumbnail; null when it gives none. */
+    val processProgress: Float? = null,
+    /** Photos being put together after their frames were gathered (SPEC §8.2; Night, Photo's own processing): the queue at the thumbnail. */
     val processing: Int = 0,
+    /** The newest series being developed: a copy of the live picture in the thumbnail until its photo is saved (D25). */
+    val pendingThumbnail: Bitmap? = null,
     /** The scene has been dark for a while in Photo: the "Night mode" suggestion (SPEC §9.1). */
     val nightSuggested: Boolean = false,
     val settings: CameraSettings = CameraSettings(),
@@ -521,11 +525,13 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         // Nor a DNG for another app (SPEC §15.3); the raw stream of the zoom's lens
         // In Pro only (owner, 25 Nov 2026): the DNG beside each photo, or 50 MP alone
         val raw = capture == null && ui.mode == Mode.PRO && settings.rawMode == RawMode.RAW
+        // Photo's own processing (LOGIKA §38): the raw stream of the zoom's lens, as the DNG's in Pro; not for another app (its photo is the camera's)
+        val processing = capture == null && ui.mode == Mode.PHOTO
         return camera?.let {
-            val rawLens = if (raw) rawLensPick ?: it.zoom.lensAt(ui.zoom) else null
+            val rawLens = if (raw || processing) rawLensPick ?: it.zoom.lensAt(ui.zoom) else null
             val raw50 = capture == null && ui.mode == Mode.PRO && settings.rawMode == RawMode.MP50 && it.fiftyMp
             // 50 MP takes no Ultra HDR photo: the plain still the session keeps for its ladder, and the 50 MP stream's confirmed sets (D22)
-            CameraRequest(it, ui.mode, settings.aspect, video, settings.ultraHdr && !raw50, motion = motion, motionFirst = settings.motionPhoto == MotionPhoto.ON, raw = raw, rawLens = rawLens, raw50 = raw50)
+            CameraRequest(it, ui.mode, settings.aspect, video, settings.ultraHdr && !raw50, motion = motion, motionFirst = settings.motionPhoto == MotionPhoto.ON, raw = raw, rawLens = rawLens, raw50 = raw50, processing = processing)
         }
     }
 
@@ -1098,10 +1104,13 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** The lens of the raw stream the engine was last told (null: no DNG asked for, or no session told yet). */
+    /** The lens of the raw stream the engine was last told (null: no DNG nor Photo's own processing asked for, or no session told yet). */
     private fun toldRawLens(): String? {
-        if (_ui.value.settings.rawMode != RawMode.RAW || _ui.value.mode != Mode.PRO || _entry.value is Entry.Capture) return null
-        return _shown.value?.takeIf { it.raw }?.rawLens
+        if (_entry.value is Entry.Capture) return null
+        val dng = _ui.value.settings.rawMode == RawMode.RAW && _ui.value.mode == Mode.PRO
+        val processing = _ui.value.mode == Mode.PHOTO
+        if (!dng && !processing) return null
+        return _shown.value?.takeIf { it.raw || it.processing }?.rawLens
     }
 
     /**
@@ -1249,6 +1258,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
                 return@launch
             }
             val target = media.newVideo(System.currentTimeMillis()) ?: return@launch
+            withContext(Dispatchers.Main) { dropPendingThumbnail() }
             engine.startRecording(target, rotation, place?.let { it.latitude to it.longitude })
         }
     }
@@ -1312,6 +1322,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
      */
     fun shutterHeld(): Boolean {
         if (_review.value != null) return false
+        dropPendingThumbnail()
         held = true
         // A change waiting for its frozen frame first (the burst would go to the old session); let go meanwhile, nothing starts
         freezing?.let { job ->
@@ -1489,6 +1500,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         val place = placeNow()
         val front = camera?.front == true
         val id = ++nightShots
+        dropPendingThumbnail()
         _ui.update { it.copy(nightGathering = true, gatherProgress = null, nightSuggested = false) }
         application.appScope.launch {
             shots.withLock {
@@ -1506,13 +1518,13 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
                 val progress = launch {
                     shot.progress.collect { value ->
                         val share = value / 100f
-                        _ui.update { if (gathering.get()) it.copy(gatherProgress = share) else if (newestNight == id) it.copy(nightProgress = share) else it }
+                        _ui.update { if (gathering.get()) it.copy(gatherProgress = share) else if (newestNight == id) it.copy(processProgress = share) else it }
                     }
                 }
                 shot.gathered.await()
                 gathering.set(false)
                 newestNight = id
-                _ui.update { it.copy(nightGathering = false, gatherProgress = null, nightProgress = null, processing = it.processing + 1) }
+                _ui.update { it.copy(nightGathering = false, gatherProgress = null, processProgress = null, processing = it.processing + 1) }
                 // A change put off by the gathering
                 withContext(Dispatchers.Main) { if (configureLater) configure() }
                 // Put together and saved outside the lock: the next Night photo may start meanwhile. Waited for even when the extension didn't say its frames
@@ -1527,13 +1539,55 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
                         }
                     } finally {
                         progress.cancel()
-                        _ui.update { it.copy(processing = (it.processing - 1).coerceAtLeast(0), nightProgress = if (newestNight == id) null else it.nightProgress) }
+                        _ui.update { it.copy(processing = (it.processing - 1).coerceAtLeast(0), processProgress = if (newestNight == id) null else it.processProgress) }
                         // The postview stays a moment once the photo is out, then the thumbnail has it (SPEC §9.2)
                         delay(POSTVIEW_HOLD_MS)
                         if (_ui.value.processing == 0 && !_ui.value.nightGathering) engine.clearPostview()
                     }
                 }
             }
+        }
+    }
+
+    /** A newer shot than the series being developed (a photo, Night's, a burst, a video): the thumbnail is about it, the queue's count stays. */
+    private fun dropPendingThumbnail() {
+        if (newestSeries == 0L) return
+        newestSeries = 0L
+        _ui.update { it.copy(pendingThumbnail = null, processProgress = null) }
+    }
+
+    /** Photo's series taken, and the newest one being developed (whose progress and live picture the thumbnail shows). */
+    private var seriesShots = 0L
+
+    @Volatile
+    private var newestSeries = 0L
+
+    /**
+     * The live picture as the photo will lie (its EXIF's turn [orientation], [mirror]ed where the photo is), small: the thumbnail while the photo is
+     * developed (D25). Null when the surface gives no copy.
+     */
+    private suspend fun livePicture(orientation: Int, mirror: Boolean, front: Boolean): Bitmap? {
+        val surface = withContext(Dispatchers.Main) { surface?.takeIf { it.isValid } } ?: return null
+        val sensor = camera?.sensorOrientation ?: 0
+        val copy = withTimeoutOrNull(FREEZE_WAIT_MS) {
+            suspendCancellableCoroutine<Bitmap?> { cont -> FrozenFrame.copy(surface, application.mainExecutor) { cont.resume(it) { _, bitmap, _ -> bitmap?.recycle() } } }
+        } ?: return null
+        return try {
+            // The copy lies as the sensor does (sideways), or already as the screen shows it (turned, and mirrored for the front camera)
+            val sideways = copy.width > copy.height
+            val turn = if (sideways) orientation else Math.floorMod(orientation - sensor, 360)
+            val flip = if (sideways) mirror else front && !mirror
+            val scale = PENDING_THUMBNAIL_PX.toFloat() / maxOf(copy.width, copy.height)
+            val matrix = Matrix().apply {
+                postScale(scale, scale)
+                postRotate(turn.toFloat())
+                if (flip) postScale(-1f, 1f)
+            }
+            Bitmap.createBitmap(copy, 0, 0, copy.width, copy.height, matrix, true)
+        } catch (e: Exception) {
+            null
+        } finally {
+            copy.recycle()
         }
     }
 
@@ -1588,6 +1642,17 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
         }
         val released = AtomicBoolean(false)
         val release = { if (gate != null && released.compareAndSet(false, true)) gate.release() }
+        // Photo's own processing (LOGIKA §38): a series developed by the app where the session has its raw stream, not with the screen as the flash (its
+        // metering is one lit frame), not for another app, and only while the phone allows it (queue, heat, battery); else the camera's own photo
+        val processor = application.processor
+        val photoMode = ui.mode == Mode.PHOTO && _entry.value !is Entry.Capture
+        val notOwn = when {
+            !photoMode -> null
+            screenFlash -> "screen flash"
+            !engineState.value.processing -> "session without raw"
+            else -> processor.unavailable()
+        }
+        val own = photoMode && notOwn == null
         // In the app's scope: a viewfinder going away right after the shutter (the lock screen's when the screen goes off) doesn't cancel the photo
         application.appScope.launch {
             shots.withLock {
@@ -1609,8 +1674,9 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
                     withTimeoutOrNull(SCREEN_FLASH_WAIT_MS) { screenLit.first { it } }
                     delay(SCREEN_FLASH_WARM_MS)
                 }
+                val sink = if (own) processor.shot() else null
                 val photo = try {
-                    engine.takePhoto(rotation, place, precapture = screenFlash) { start ->
+                    engine.takePhoto(rotation, place, precapture = screenFlash, series = sink) { start ->
                         val longNs = start.exposureNs?.takeIf { it >= LONG_EXPOSURE_NS }
                         // The request's word only for a long time: a shorter one clicks when the camera starts it (a click before it would let the phone go
                         // down while the request still waits behind the preview's)
@@ -1638,6 +1704,7 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
                 } catch (e: Throwable) {
                     // The turn of the DNG's memory given back however the shot ended
                     release()
+                    sink?.close()
                     throw e
                 } finally {
                     done.set(true)
@@ -1653,7 +1720,15 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
                     }
                 } ?: run {
                     release()
+                    sink?.close()
                     return@withLock
+                }
+                // The camera's own photo after all (the lens, the flash, no frame came): the series' place in the queue goes
+                val series = photo.series?.let { taken -> sink?.let { taken to it } }
+                if (series == null) {
+                    sink?.close()
+                    // A newer photo than the series being developed: the thumbnail is about it (the queue's count stays, without the older one's progress)
+                    dropPendingThumbnail()
                 }
                 // Pro's 50 MP: the DNG alone, made from the raw image in the background (rearranged and written, a second or two); in the thumbnail once its
                 // turn is given back
@@ -1688,13 +1763,47 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
                 val mirror = front && ui.settings.mirror
                 val wantMotion = !timed && !flashFired && !mirror && state.motion && (motionMode == MotionPhoto.ON || (motionMode == MotionPhoto.AUTO && state.analysis))
                 if (wantMotion) _ui.update { it.copy(motionWaiting = it.motionWaiting + 1) }
+                // A series: in the queue at the thumbnail, its live picture there until the photo is saved
+                val seriesId = if (series != null) ++seriesShots else 0L
+                if (series != null) {
+                    newestSeries = seriesId
+                    val picture = livePicture(photo.orientation, mirror, front)
+                    _ui.update { it.copy(processing = it.processing + 1, processProgress = 0f, pendingThumbnail = picture ?: it.pendingThumbnail) }
+                }
                 application.appScope.launch {
                     // The photo is saved at once; its video is added when the 1.5 s after it are there, gathered meanwhile (the ring keeps only a few seconds)
                     var waiting = wantMotion
                     val clipping = if (wantMotion) async { engine.motionClip(photo) } else null
                     val uri = try {
-                        val saved = try {
-                            media.savePhoto(photo.bytes, photo.takenAt, photo.crop, mirror, photo.longExposureNs)?.also {
+                        val saved = if (series != null) {
+                            val (taken, shot) = series
+                            try {
+                                // Developed in the queue's turn, then saved with its EXIF (the place too, where it was known at the shot)
+                                val processed = shot.develop(taken, photo.orientation, photo.takenAt, mirror) { share ->
+                                    if (newestSeries == seriesId) _ui.update { it.copy(processProgress = share) }
+                                }
+                                if (processed == null) {
+                                    _photoLost.tryEmit(Unit)
+                                    null
+                                } else {
+                                    media.saveProcessed(processed.bytes, photo.takenAt, processed.exif, place)
+                                }
+                            } finally {
+                                shot.close()
+                                release()
+                                _ui.update {
+                                    val newest = newestSeries == seriesId
+                                    it.copy(
+                                        processing = (it.processing - 1).coerceAtLeast(0),
+                                        processProgress = if (newest) null else it.processProgress,
+                                        pendingThumbnail = if (newest) null else it.pendingThumbnail,
+                                    )
+                                }
+                            }
+                        } else try {
+                            // The tests' note (D35, until v0.4.0's release): why Photo's photo is the camera's own
+                            val why = if (photoMode) mapOf(ExifInterface.TAG_USER_COMMENT to "hal: ${photo.notSeries ?: notOwn ?: "no series"}") else null
+                            media.savePhoto(photo.bytes, photo.takenAt, photo.crop, mirror, photo.longExposureNs, tags = why)?.also {
                                 // Its DNG beside it, named as the photo (after it: the thumbnail shows the photo at once); none without the photo
                                 photo.raw?.let { raw -> if (media.saveRaw(raw, photo.takenAt) == null) _dngNotSaved.tryEmit(Unit) }
                             }
@@ -1803,6 +1912,8 @@ class ViewfinderViewModel(app: Application) : AndroidViewModel(app) {
     private companion object {
         /** A copy of the live picture that takes longer isn't waited for: the live picture fades out instead before the change goes on. */
         const val FREEZE_WAIT_MS = 100L
+        /** The live picture's long side in the thumbnail while its photo is developed. */
+        const val PENDING_THUMBNAIL_PX = 256
         /** Pro's metering steps this often. */
         const val PRO_STEP_MS = 100L
         /** A change of Pro's exposure smaller than this (in natural log, about 6 %) isn't sent. */

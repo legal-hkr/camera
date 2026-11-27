@@ -44,7 +44,8 @@ data class CameraSettings(
     val volumeKeys: VolumeKeys = VolumeKeys.SHUTTER,
     /** QR codes recognized in Photo mode (Settings › Photos). */
     val qrCodes: Boolean = true,
-    val motionPhoto: MotionPhoto = MotionPhoto.AUTO,
+    /** Off unless chosen (D30, 26 Nov 2026): with it a session may lack the raw stream of Photo's own processing. */
+    val motionPhoto: MotionPhoto = MotionPhoto.OFF,
     /** Front camera photos saved as the preview shows them, mirrored (Settings › Photos). */
     val mirror: Boolean = false,
     /** The shutter's click (Settings › Photos); played anyway where the law wants it. */
@@ -90,7 +91,7 @@ class Preferences(private val context: Context) {
         timerFlash = this[TIMER_FLASH] ?: false,
         volumeKeys = this[VOLUME_KEYS]?.let { name -> VolumeKeys.entries.firstOrNull { it.name == name } } ?: VolumeKeys.SHUTTER,
         qrCodes = this[QR_CODES] ?: true,
-        motionPhoto = this[MOTION_PHOTO]?.let { name -> MotionPhoto.entries.firstOrNull { it.name == name } } ?: MotionPhoto.AUTO,
+        motionPhoto = this[MOTION_PHOTO]?.let { name -> MotionPhoto.entries.firstOrNull { it.name == name } } ?: MotionPhoto.OFF,
         mirror = this[MIRROR] ?: false,
         shutterSound = this[SHUTTER_SOUND] ?: true,
         videoHevc = this[VIDEO_HEVC] ?: true,

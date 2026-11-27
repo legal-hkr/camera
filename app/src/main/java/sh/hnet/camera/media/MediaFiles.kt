@@ -72,15 +72,19 @@ class MediaFiles(private val context: Context) {
     val last: StateFlow<LastShot?> = _last.asStateFlow()
 
     /** Writes a finished JPEG (Ultra HDR or plain), cut to [crop] first when the camera had no size of the shot's aspect, and publishes it; null when the storage refused it. */
-    suspend fun savePhoto(bytes: ByteArray, takenAt: Long, crop: PixelSize? = null, mirror: Boolean = false, exposureNs: Long? = null): Uri? =
-        writePhoto(bytes, takenAt, FileNames.photo(takenAt), crop, mirror, exposureNs, mark = null)?.also { show(it, "image/jpeg", takenAt = takenAt) }
+    suspend fun savePhoto(bytes: ByteArray, takenAt: Long, crop: PixelSize? = null, mirror: Boolean = false, exposureNs: Long? = null, tags: Map<String, String>? = null): Uri? =
+        writePhoto(bytes, takenAt, FileNames.photo(takenAt), crop, mirror, exposureNs, mark = null, tags = tags)?.also { show(it, "image/jpeg", takenAt = takenAt) }
+
+    /** A photo of the app's own development (LOGIKA §38), already framed and encoded: written with its EXIF [tags] (and the place, where known). */
+    suspend fun saveProcessed(bytes: ByteArray, takenAt: Long, tags: Map<String, String>, location: Location?): Uri? =
+        writePhoto(bytes, takenAt, FileNames.photo(takenAt), crop = null, mirror = false, mark = null, tags = tags, location = location)?.also { show(it, "image/jpeg", takenAt = takenAt) }
 
     /**
      * A burst's frame [index] (0 the cover), written as it comes (LOGIKA §18): named and marked as Google's camera does (D12), cut and mirrored as a photo is.
      * The cover is shown in the thumbnail, the others only counted there.
      */
     suspend fun saveBurstFrame(bytes: ByteArray, takenAt: Long, burst: BurstFiles, index: Int, show: Boolean): Uri? {
-        val uri = writePhoto(bytes, takenAt, FileNames.burst(burst.startedAt, index), burst.crop, burst.mirror) { MotionPhotoWriter.markBurst(it, burst.id, primary = index == 0) ?: it }
+        val uri = writePhoto(bytes, takenAt, FileNames.burst(burst.startedAt, index), burst.crop, burst.mirror, mark = { MotionPhotoWriter.markBurst(it, burst.id, primary = index == 0) ?: it })
             ?: return null
         if (show) show(uri, "image/jpeg", burst = 1, takenAt = takenAt) else counted(uri, "image/jpeg", takenAt)
         return uri
@@ -90,7 +94,10 @@ class MediaFiles(private val context: Context) {
     fun burstSaved(cover: Uri, frames: Int) = _last.update { if (it?.uri == cover) it.copy(burst = frames) else it }
 
     /** [exposureNs]: a time the camera's EXIF couldn't hold, written over its own. */
-    private suspend fun writePhoto(bytes: ByteArray, takenAt: Long, name: String, crop: PixelSize?, mirror: Boolean, exposureNs: Long? = null, mark: ((ByteArray) -> ByteArray)?): Uri? = withContext(Dispatchers.IO) {
+    private suspend fun writePhoto(
+        bytes: ByteArray, takenAt: Long, name: String, crop: PixelSize?, mirror: Boolean, exposureNs: Long? = null, mark: ((ByteArray) -> ByteArray)?,
+        tags: Map<String, String>? = null, location: Location? = null,
+    ): Uri? = withContext(Dispatchers.IO) {
         val values = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, name)
             put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
@@ -110,6 +117,9 @@ class MediaFiles(private val context: Context) {
             }
             exposureNs?.let { ns ->
                 runCatching { resolver.openFileDescriptor(uri, "rw")!!.use { StillCrop.setExposure(it, ns) } }.onFailure { Log.w(TAG, "Exposure not written: ${it.javaClass.simpleName}") }
+            }
+            tags?.let { values ->
+                runCatching { resolver.openFileDescriptor(uri, "rw")!!.use { StillCrop.setTags(it, values, location) } }.onFailure { Log.w(TAG, "EXIF not written: ${it.javaClass.simpleName}") }
             }
             resolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
             uri

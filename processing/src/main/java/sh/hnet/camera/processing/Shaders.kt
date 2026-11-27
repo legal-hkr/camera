@@ -397,6 +397,7 @@ layout(binding = 0) uniform sampler2D fused;
 layout(r32f, binding = 0) writeonly uniform highp image2D dst;
 layout(rgba32f, binding = 1) writeonly uniform highp image2D moments;
 uniform float black;
+uniform float blackSoft;
 uniform float scale;
 uniform float contrast;
 uniform float midtones;
@@ -404,7 +405,10 @@ uniform ivec2 size;
 void main() {
     ivec2 p = ivec2(gl_GlobalInvocationID.xy);
     if (p.x >= size.x || p.y >= size.y) return;
-    float v = clamp((texelFetch(fused, p, 0).r - black) * scale, 0.0, 1.0);
+    float x = texelFetch(fused, p, 0).r;
+    // The black point taken off fully at black, less toward white (blackSoft 0: every level shifted)
+    float lowered = blackSoft > 0.0 ? x - black * pow(clamp((1.0 - x) / max(1.0 - black, 1e-3), 0.0, 1.0), blackSoft) : x - black;
+    float v = clamp(lowered * scale, 0.0, 1.0);
     v = v - contrast * sin(6.283185307179586 * v) / 6.283185307179586;
     v = v + midtones * v * (1.0 - v) * (1.0 - v);
     imageStore(dst, p, vec4(v));

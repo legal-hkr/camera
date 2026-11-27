@@ -37,7 +37,21 @@ class MathTest {
     @Test
     fun cameraToSrgbWithTheLooksTintMatchesThePrototype() {
         val expected = d(1.829504895, -0.6628826053, -0.1151759095, -0.2577742254, 1.285983181, -0.04294421158, 0.00264339373, -0.9288978453, 1.921066946)
-        assertArrayEquals(expected, ColorMath.cameraToSrgb(meta, d(0.591796875, 1.0, 0.5634765625), Look()), 1e-5)
+        // v17's tint, the numbers the prototype gave with it (daylight: no warm-light tint)
+        val v17 = Look(color = floatArrayOf(1.0513f, 0f, 0f, 0f, 0.9853f, 0f, 0f, 0f, 0.9949f))
+        assertArrayEquals(expected, ColorMath.cameraToSrgb(meta, d(0.591796875, 1.0, 0.5634765625), v17), 1e-5)
+    }
+
+    @Test
+    fun warmLightGetsTheWarmTintInFull() {
+        // The evening's lamp (neutral blue/red 0.5): every row of the matrix times the warm gains; daylight's (0.95) none
+        val lamp = d(0.757, 1.0, 0.378)
+        val plain = ColorMath.cameraToSrgb(meta, lamp, Look(warmTint = null))
+        val warm = ColorMath.cameraToSrgb(meta, lamp, Look())
+        val gains = d(1.06, 0.96, 1.0)
+        assertArrayEquals(DoubleArray(9) { plain[it] * gains[it / 3] }, warm, 1e-5)
+        val day = d(0.591796875, 1.0, 0.5634765625)
+        assertArrayEquals(ColorMath.cameraToSrgb(meta, day, Look(warmTint = null)), ColorMath.cameraToSrgb(meta, day, Look()), 1e-12)
     }
 
     @Test

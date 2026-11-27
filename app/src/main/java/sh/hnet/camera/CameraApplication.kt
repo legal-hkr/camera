@@ -9,6 +9,7 @@ import sh.hnet.camera.camera.CameraEngine
 import sh.hnet.camera.media.BurstSaver
 import sh.hnet.camera.media.CaptureOutput
 import sh.hnet.camera.media.MediaFiles
+import sh.hnet.camera.media.PhotoProcessor
 
 class CameraApplication : Application() {
     /** Work that outlives a screen; lives as long as the process. */
@@ -22,6 +23,9 @@ class CameraApplication : Application() {
     val media: MediaFiles by lazy { MediaFiles(this) }
 
     val captures: CaptureOutput by lazy { CaptureOutput(this) }
+
+    /** Photo's own processing on the GPU (LOGIKA §38): one queue for the process, whichever screen took the photos. */
+    val processor: PhotoProcessor by lazy { PhotoProcessor(this) }
     val bursts: BurstSaver by lazy { BurstSaver(this, media, appScope) }
 
     /** The Night suggestion closed: hidden until the app starts again (SPEC §9.1). */

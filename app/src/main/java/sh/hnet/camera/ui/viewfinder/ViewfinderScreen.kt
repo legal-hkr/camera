@@ -7,6 +7,7 @@ import android.app.Activity
 import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.Context
+import android.graphics.Bitmap
 import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
@@ -309,7 +310,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
     var keepOn by remember { mutableStateOf(true) }
     // A tapped focus that ends because the phone turned isn't use either
     // Use is what the user changes: not what the scene or the phone changes by itself (a dark scene's suggestion coming and going, a code found, progress)
-    LaunchedEffect(ui.copy(rotation = 0, focus = null, nightSuggested = false, pointAtCode = false, gatherProgress = null, nightProgress = null, processing = 0), busy) { used() }
+    LaunchedEffect(ui.copy(rotation = 0, focus = null, nightSuggested = false, pointAtCode = false, gatherProgress = null, processProgress = null, processing = 0, pendingThumbnail = null), busy) { used() }
     // Back in front (the screen on again, back from another app): a use, so the hold starts over
     LifecycleEventEffect(Lifecycle.Event.ON_START) { used() }
     // The time of the last use read in the effect only: a touch mustn't recompose the whole viewfinder
@@ -946,7 +947,7 @@ private fun Viewfinder(viewModel: ViewfinderViewModel, entry: Entry, onOpenSetti
                 if (capture != null) {
                     RowButton(R.drawable.ic_close, stringResource(R.string.button_cancel), turn, Modifier.align(Alignment.CenterStart).padding(start = 34.dp)) { onCancel?.invoke() }
                 } else {
-                    Thumbnail(last, turn, { ui.processing + burstsSaving.value }, ui.nightProgress, Modifier.align(Alignment.CenterStart).padding(start = 34.dp)) { shot ->
+                    Thumbnail(last, ui.pendingThumbnail, turn, { ui.processing + burstsSaving.value }, ui.processProgress, Modifier.align(Alignment.CenterStart).padding(start = 34.dp)) { shot ->
                         if (entry.locked) reviewSecure(context, activity, viewModel.sessionShots(), shot) else openInGallery(context, shot)
                     }
                 }
@@ -1165,9 +1166,12 @@ private fun ExposureRuler(steps: Int, stepEv: Double, stepsPerThird: Int, limits
     )
 }
 
-/** The thumbnail of the newest own shot (SPEC §8.1); a tap hands it to the gallery with the rest to swipe through. */
+/**
+ * The thumbnail of the newest own shot (SPEC §8.1); a tap hands it to the gallery with the rest to swipe through. [pending]: the live picture of a photo
+ * still being developed (D25), shown until its file is saved.
+ */
 @Composable
-private fun Thumbnail(last: LastShot?, turn: Float, processing: () -> Int, progress: Float?, modifier: Modifier, onOpen: (LastShot) -> Unit) {
+private fun Thumbnail(last: LastShot?, pending: Bitmap?, turn: Float, processing: () -> Int, progress: Float?, modifier: Modifier, onOpen: (LastShot) -> Unit) {
     val colors = MaterialTheme.colorScheme
     val label = stringResource(R.string.tooltip_last_shot)
     // The alignment goes on a box of our own: TooltipBox doesn't pass it to the row
@@ -1186,7 +1190,7 @@ private fun Thumbnail(last: LastShot?, turn: Float, processing: () -> Int, progr
                     .clickable(enabled = last != null, role = Role.Button) { last?.let(onOpen) }
                     .semantics { contentDescription = label },
             ) {
-                val bitmap = last?.thumbnail
+                val bitmap = pending ?: last?.thumbnail
                 if (bitmap != null) Image(bitmap.asImageBitmap(), contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize().rotate(turn))
                 else Icon(painterResource(R.drawable.ic_photo_library), contentDescription = null, tint = IconButtonDefaults.iconButtonColors().disabledContentColor, modifier = Modifier.rotate(turn))
             }
@@ -1207,14 +1211,14 @@ private fun Thumbnail(last: LastShot?, turn: Float, processing: () -> Int, progr
         val waiting = processing()
         if (waiting > 0) {
             Box(
-                Modifier.align(Alignment.TopEnd).offset(x = 8.dp, y = (-8).dp).size(26.dp).background(colors.surfaceContainerHigh, CircleShape),
+                Modifier.align(Alignment.TopEnd).offset(x = 8.dp, y = (-8).dp).size(26.dp).rotate(turn).background(colors.surfaceContainerHigh, CircleShape),
                 contentAlignment = Alignment.Center,
             ) {
                 val value = progress
                 if (value != null) CircularWavyProgressIndicator(progress = { value }, modifier = Modifier.size(20.dp))
                 else CircularWavyProgressIndicator(modifier = Modifier.size(20.dp))
             }
-            Badge(Modifier.align(Alignment.TopStart).offset(x = (-6).dp, y = (-6).dp), containerColor = colors.primary, contentColor = colors.onPrimary) { Text("$waiting") }
+            Badge(Modifier.align(Alignment.TopStart).offset(x = (-6).dp, y = (-6).dp).rotate(turn), containerColor = colors.primary, contentColor = colors.onPrimary) { Text("$waiting") }
         }
     }
 }

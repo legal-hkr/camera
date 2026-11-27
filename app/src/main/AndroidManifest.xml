@@ -10,6 +10,11 @@
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
 
+    <!-- Photo's own processing (LOGIKA §38, D31): a few seconds of developing after each photo go on when the app is left; no notification permission is
+         asked for (the service runs without its notification shown) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROCESSING" />
+
     <uses-feature android:name="android.hardware.camera.any" android:required="true" />
 
     <application
@@ -89,6 +94,12 @@
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </activity>
+
+        <!-- While photos are being developed (Android 15+: the media processing kind) -->
+        <service
+            android:name=".media.ProcessingService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProcessing" />
 
         <!-- A QR code's business card handed to the contacts app as a vCard file (cache/share only) -->
         <provider

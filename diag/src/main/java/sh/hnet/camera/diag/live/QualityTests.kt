@@ -57,7 +57,6 @@ import sh.hnet.camera.diag.R
 import sh.hnet.camera.processing.Developed
 import sh.hnet.camera.processing.Developer
 import sh.hnet.camera.processing.FrameMeta
-import sh.hnet.camera.processing.RawFrame
 import sh.hnet.camera.processing.from
 
 /** A lens behind a logical camera (or the camera itself when it has none) and the logical camera's zoom ratio at which it shows its own field of view. */
@@ -545,10 +544,11 @@ class QualityTests(context: Context, private val preview: PreviewHost) {
     }
 
     /**
-     * The app's own development on the GPU against the computer prototype (LOGIKA §38.2): at 1× the camera's photo, a series of 8 RAW frames at the
-     * metered exposure saved as DNGs, and the first frame developed by `:processing` (the same code the camera app uses) – its picture as a lossless PNG,
-     * the numbers it measured, each step's time and the metadata it read from Camera2. On a computer the prototype develops the same DNG and the two
-     * pictures are compared pixel by pixel.
+     * The app's own development on the GPU against the computer prototype (LOGIKA §38.2), and the data to tune it: at 1× the camera's photo (the
+     * reference to compare with), a series of 8 RAW frames at the metered exposure saved as DNGs, each frame also uploaded to the GPU straight from the
+     * camera's buffer as the app does, and the series merged and developed by `:processing` (the camera app's code) – its picture as a lossless PNG and as
+     * Ultra HDR, the numbers it measured, each step's time and the metadata it read from Camera2. On a computer the prototype develops the same DNGs and
+     * the pictures are compared pixel by pixel. A frame the development can't describe says why (a camera whose photos stay the camera's own).
      */
     private suspend fun process(id: String): JsonObject {
         // The previous run ended the app during the GPU development: this run only says where (the report is written when a test returns)
@@ -563,74 +563,115 @@ class QualityTests(context: Context, private val preview: PreviewHost) {
         val lenses = lenses(id)
         val folder = "process_${Media.stamp()}_cam$id"
         val surface = preview.surface(previewSize(map(chars)))
-        val kept = ArrayList<RawFrame>()
-        // Each kept frame's DNG number (a frame without its capture result has no DNG and isn't kept)
-        val numbers = ArrayList<Int>()
-        var metadata: JsonObject? = null
-        val captured = manager.withCamera(id) { device, thread ->
-            buildJsonObject {
-                put("folder", "${Media.REPORT_DIR}/$folder")
-                val reference = photo(device, thread, surface, chars, 1f, folder, "z1.0_camera.jpg")
-                put("camera", reference)
-                val active = reference["activePhysicalId"]?.let { (it as? JsonPrimitive)?.content }
-                val lens = lenses.firstOrNull { it.id == active } ?: lenses.minBy { abs(ln(it.zoom)) }
-                put("raw", probe {
-                    rawBursts(device, thread, surface, lens, 1f, 8, listOf(0), folder, "z1.0") { index, image, result ->
-                        rawFrame(image, result, lens)?.let {
-                            kept += it
-                            numbers += index
-                        }
-                        if (index == 1) metadata = camera2Metadata(lens.chars, result)
-                    }
-                })
-            }
-        }
-        if (kept.isEmpty()) return buildJsonObject {
-            captured.forEach { (k, v) -> put(k, v) }
-            put("gpu", buildJsonObject { put("skipped", "no RAW frame with Bayer metadata") })
-        }
-        val gpu = try {
-            gpuDevelopment(kept, numbers, folder, metadata)
+        processSteps.edit(commit = true) { putString("step", "GPU context") }
+        val developer = try {
+            withContext(Dispatchers.Default) { Developer() }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Throwable) {
-            // Out of memory is an Error, which probe would let through and close the app with
             processSteps.edit(commit = true) { clear() }
-            buildJsonObject { put("error", "${e.javaClass.simpleName}: ${e.message}") }
+            return buildJsonObject { put("gpu", buildJsonObject { put("error", "${e.javaClass.simpleName}: ${e.message}") }) }
         }
-        return buildJsonObject {
-            captured.forEach { (k, v) -> put(k, v) }
-            put("gpu", gpu)
+        try {
+            var series: Developer.Series? = null
+            // Each uploaded frame's DNG number (a frame without its capture result has no DNG and isn't uploaded)
+            val numbers = ArrayList<Int>()
+            var first: FrameMeta? = null
+            var metadata: JsonObject? = null
+            val refused = ArrayList<String>()
+            val captured = manager.withCamera(id) { device, thread ->
+                buildJsonObject {
+                    put("folder", "${Media.REPORT_DIR}/$folder")
+                    val reference = photo(device, thread, surface, chars, 1f, folder, "z1.0_camera.jpg")
+                    put("camera", reference)
+                    val active = reference["activePhysicalId"]?.let { (it as? JsonPrimitive)?.content }
+                    val lens = lenses.firstOrNull { it.id == active } ?: lenses.minBy { abs(ln(it.zoom)) }
+                    put("lens", lens.id)
+                    put("raw", probe {
+                        rawBursts(device, thread, surface, lens, 1f, 8, listOf(0), folder, "z1.0") { index, image, result ->
+                            if (index == 1) metadata = camera2Metadata(lens.chars, result)
+                            val orientation = exifOrientation(lens.chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0)
+                            val meta = FrameMeta.from(lens.chars, result, image.width, image.height, orientation)
+                            if (meta == null) {
+                                refused += whyNoMeta(lens.chars, result, image.width, image.height)
+                                return@rawBursts
+                            }
+                            processSteps.edit(commit = true) { putString("step", "uploading frame $index") }
+                            val into = series ?: developer.series(8, image.width, image.height).also { series = it }
+                            val plane = image.planes[0]
+                            if (into.add(plane.buffer, plane.rowStride, meta)) {
+                                numbers += index
+                                if (first == null) first = meta
+                            }
+                        }
+                    })
+                    if (refused.isNotEmpty()) put("framesNotDescribed", jsonOf(refused.distinct()))
+                }
+            }
+            val into = series
+            val meta = first
+            if (into == null || meta == null) {
+                processSteps.edit(commit = true) { clear() }
+                return buildJsonObject {
+                    captured.forEach { (k, v) -> put(k, v) }
+                    put("gpu", buildJsonObject { put("skipped", "no RAW frame the development can describe") })
+                }
+            }
+            val gpu = try {
+                gpuDevelopment(developer, into, numbers, folder, meta, metadata)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                // Out of memory is an Error, which probe would let through and close the app with
+                processSteps.edit(commit = true) { clear() }
+                buildJsonObject { put("error", "${e.javaClass.simpleName}: ${e.message}") }
+            }
+            val result = buildJsonObject {
+                captured.forEach { (k, v) -> put(k, v) }
+                put("gpu", gpu)
+            }
+            // Next to the scene's files too: the app's report keeps only a test's last run, and a walk has many scenes
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    Media.writeDownload(resolver, folder, "report.json", "application/json") { it.write(Json.encodeToString(JsonObject.serializer(), result).toByteArray()) }
+                }
+            }
+            return result
+        } finally {
+            withContext(Dispatchers.Default) { developer.close() }
         }
     }
 
+    /** Why a RAW frame can't be described for the development (what [FrameMeta.from] needs): the size, the color filter, the neutral point. */
+    private fun whyNoMeta(chars: CameraCharacteristics, result: CaptureResult, width: Int, height: Int): String {
+        val pre = chars.get(CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE)
+        val pixel = chars.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)
+        val cfa = chars.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT)
+        val neutral = result.get(CaptureResult.SENSOR_NEUTRAL_COLOR_POINT)
+        return "image ${width}x$height, pre-correction ${pre?.width()}x${pre?.height()}, pixel array ${pixel?.width}x${pixel?.height}, cfa $cfa, neutral ${neutral != null}, " +
+            "white ${chars.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL)}, black pattern ${chars.get(CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN) != null}, " +
+            "color matrix ${chars.get(CameraCharacteristics.SENSOR_COLOR_TRANSFORM1) != null}"
+    }
+
     /**
-     * The GPU development of the series' first frame alone and of the whole series merged: both PNGs, their numbers and times, the merge's reference and
-     * tile shifts (a binary file: int16 y, x per tile, frame after frame); errors (out of memory too) go to the report.
+     * The series merged and developed: its PNG, numbers and times, the merge's reference and tile shifts (a binary file: int16 y, x per tile, frame after
+     * frame); errors (out of memory too) go to the report.
      */
-    private suspend fun gpuDevelopment(frames: List<RawFrame>, numbers: List<Int>, folder: String, metadata: JsonObject?): JsonObject {
-        val names = listOf(String.format(Locale.ROOT, "z1.0_ev0_%02d_gpu.png", numbers.first()), "z1.0_ev0_merged_gpu.png")
-        val parts = ArrayList<Pair<String, JsonObject>>()
-        // On Android a direct buffer is on the Java heap: the 8 frames' copies take 200 MB of it (the app's large heap), so each picture is saved and
-        // let go before the next development
-        val renderer = withContext(Dispatchers.Default) {
-            processSteps.edit(commit = true) { putString("step", "GPU context") }
-            Developer().use { developer ->
-                listOf(frames.take(1), frames).forEachIndexed { index, series ->
-                    val developed = developer.develop(series) { step, bytes ->
-                        processSteps.edit(commit = true) { putString("step", "${series.size} frames: $step (GPU memory held: ${bytes / 1_000_000} MB)") }
-                    }
-                    parts += (if (index == 0) "single" else "merged") to saveDeveloped(developed, folder, names[index], numbers, frames.first().meta.orientation)
-                }
-                developer.renderer
-            }
+    private suspend fun gpuDevelopment(developer: Developer, series: Developer.Series, numbers: List<Int>, folder: String, meta: FrameMeta, metadata: JsonObject?): JsonObject {
+        val frames = series.frames
+        val (developed, renderer) = withContext(Dispatchers.Default) {
+            developer.develop(series) { step, bytes ->
+                processSteps.edit(commit = true) { putString("step", "$frames frames: $step (GPU memory held: ${bytes / 1_000_000} MB)") }
+            } to developer.renderer
         }
+        val merged = saveDeveloped(developed, folder, "z1.0_ev0_merged_gpu.png", numbers, meta.orientation)
         processSteps.edit(commit = true) { clear() }
         return buildJsonObject {
             put("renderer", renderer)
-            put("frames", frames.size)
-            parts.forEach { (key, value) -> put(key, value) }
-            put("meta", metaJson(frames.first().meta))
+            put("frames", frames)
+            put("fallback", developed.fallback)
+            put("merged", merged)
+            put("meta", metaJson(meta))
             metadata?.let { put("camera2", it) }
         }
     }
@@ -747,23 +788,6 @@ class QualityTests(context: Context, private val preview: PreviewHost) {
         2 -> (height - 1 - y) * width + (width - 1 - x)
         3 -> x * width + (width - 1 - y)
         else -> y * width + x
-    }
-
-    /** A RAW image's samples copied out (rows packed) with its metadata, or null without a Bayer pattern. */
-    private fun rawFrame(image: Image, result: CaptureResult, lens: Lens): RawFrame? {
-        val plane = image.planes[0]
-        val rowBytes = image.width * 2
-        val out = ByteBuffer.allocateDirect(rowBytes * image.height).order(ByteOrder.nativeOrder())
-        val row = ByteArray(rowBytes)
-        for (y in 0 until image.height) {
-            plane.buffer.position(y * plane.rowStride)
-            plane.buffer.get(row)
-            out.put(row)
-        }
-        out.flip()
-        val orientation = exifOrientation(lens.chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0)
-        val meta = FrameMeta.from(lens.chars, result, image.width, image.height, orientation) ?: return null
-        return RawFrame(image.width, image.height, out.asShortBuffer(), meta)
     }
 
     /** What `:processing` read, for the comparison with the DNG's tags. */

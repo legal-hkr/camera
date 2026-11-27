@@ -12,16 +12,20 @@ import java.nio.ByteOrder
 
 /**
  * An OpenGL ES 3.1 context of its own (no window: a 1 × 1 pbuffer) for compute shaders, used from one thread only – the one that made it. Programs are
- * compiled once and kept; textures are made and deleted by the caller ([Texture.close]).
+ * compiled once and kept; textures are made and deleted by the caller ([Texture.close]). With [share], its textures are the other context's too (a series'
+ * frames uploaded on one thread while another develops); what one context wrote is seen by the other once it has finished ([finish]).
  */
-internal class Gpu : AutoCloseable {
+internal class Gpu(share: Gpu? = null) : AutoCloseable {
     private val display = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
     private val context: android.opengl.EGLContext
     private val surface: android.opengl.EGLSurface
     private val programs = HashMap<String, Int>()
 
-    /** Every texture made and not yet closed: a development that fails half-way closes what it left ([closeAll]). */
+    /** Every texture made and not yet closed: a development that fails half-way closes what it left ([closeAll]). A shared one may be closed on the other thread. */
     private val live = LinkedHashSet<Texture>()
+    private val forget: (Texture) -> Unit = { synchronized(live) { live -= it } }
+
+    private fun keep(texture: Texture) = texture.also { synchronized(live) { live += it } }
 
     init {
         check(EGL14.eglInitialize(display, IntArray(1), 0, IntArray(1), 0)) { "EGL not initialized" }
@@ -32,7 +36,7 @@ internal class Gpu : AutoCloseable {
             val found = IntArray(1)
             EGL14.eglChooseConfig(display, intArrayOf(EGL14.EGL_RENDERABLE_TYPE, EGLExt.EGL_OPENGL_ES3_BIT_KHR, EGL14.EGL_SURFACE_TYPE, EGL14.EGL_PBUFFER_BIT, EGL14.EGL_NONE), 0, configs, 0, 1, found, 0)
             val config = checkNotNull(configs[0]) { "no OpenGL ES 3 configuration" }
-            made = EGL14.eglCreateContext(display, config, EGL14.EGL_NO_CONTEXT, intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 3, EGL14.EGL_NONE), 0)
+            made = EGL14.eglCreateContext(display, config, share?.context ?: EGL14.EGL_NO_CONTEXT, intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 3, EGL14.EGL_NONE), 0)
             check(made != EGL14.EGL_NO_CONTEXT) { "no EGL context (0x${Integer.toHexString(EGL14.eglGetError())})" }
             pbuffer = EGL14.eglCreatePbufferSurface(display, config, intArrayOf(EGL14.EGL_WIDTH, 1, EGL14.EGL_HEIGHT, 1, EGL14.EGL_NONE), 0)
             check(pbuffer != EGL14.EGL_NO_SURFACE) { "no EGL surface (0x${Integer.toHexString(EGL14.eglGetError())})" }
@@ -62,7 +66,7 @@ internal class Gpu : AutoCloseable {
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_NEAREST)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
-        return Texture(id[0], width, height, format, onClose = { live -= it }).also { live += it }
+        return keep(Texture(id[0], width, height, format, onClose = forget))
     }
 
     /** An array of [layers] textures of one size (the frames of a series), each filled by [uploadLayer]. */
@@ -73,20 +77,26 @@ internal class Gpu : AutoCloseable {
         GLES30.glTexStorage3D(GLES30.GL_TEXTURE_2D_ARRAY, 1, format, width, height, layers)
         GLES20.glTexParameteri(GLES30.GL_TEXTURE_2D_ARRAY, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_NEAREST)
         GLES20.glTexParameteri(GLES30.GL_TEXTURE_2D_ARRAY, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_NEAREST)
-        return Texture(id[0], width, height, format, layers, GLES30.GL_TEXTURE_2D_ARRAY, onClose = { live -= it }).also { live += it }
+        // Not left bound: a binding in this context would keep the array alive after the other context deleted it
+        GLES20.glBindTexture(GLES30.GL_TEXTURE_2D_ARRAY, 0)
+        return keep(Texture(id[0], width, height, format, layers, GLES30.GL_TEXTURE_2D_ARRAY, onClose = forget))
     }
 
-    fun uploadLayer(texture: Texture, layer: Int, format: Int, type: Int, data: Buffer, alignment: Int = 4) {
+    /** Fills one layer from client memory; [rowLength] the source's row in pixels where its rows are padded (0: packed). */
+    fun uploadLayer(texture: Texture, layer: Int, format: Int, type: Int, data: Buffer, alignment: Int = 4, rowLength: Int = 0) {
         GLES20.glBindTexture(GLES30.GL_TEXTURE_2D_ARRAY, texture.id)
         GLES20.glPixelStorei(GLES20.GL_UNPACK_ALIGNMENT, alignment)
+        GLES20.glPixelStorei(GLES30.GL_UNPACK_ROW_LENGTH, rowLength)
         GLES30.glTexSubImage3D(GLES30.GL_TEXTURE_2D_ARRAY, 0, 0, 0, layer, texture.width, texture.height, 1, format, type, data.position(0))
+        GLES20.glPixelStorei(GLES30.GL_UNPACK_ROW_LENGTH, 0)
+        GLES20.glBindTexture(GLES30.GL_TEXTURE_2D_ARRAY, 0)
     }
 
-    /** Closes every texture still open (after a failed development). */
-    fun closeAll() = live.toList().forEach { it.close() }
+    /** Closes every texture of this context still open (after a failed development). */
+    fun closeAll() = synchronized(live) { live.toList() }.forEach { it.close() }
 
     /** The bytes the open textures take (for reports: how close a development comes to the phone's memory). */
-    val liveBytes: Long get() = live.sumOf { it.width.toLong() * it.height * it.layers * bytesPerPixel(it.format) }
+    val liveBytes: Long get() = synchronized(live) { live.sumOf { it.width.toLong() * it.height * it.layers * bytesPerPixel(it.format) } }
 
     private fun bytesPerPixel(format: Int) = when (format) {
         GLES30.GL_R16UI -> 2
@@ -248,7 +258,9 @@ internal class Texture(
     val target: Int = GLES20.GL_TEXTURE_2D,
     private val onClose: (Texture) -> Unit,
 ) : AutoCloseable {
-    private var closed = false
+    @Volatile
+    var closed = false
+        private set
 
     override fun close() {
         if (closed) return

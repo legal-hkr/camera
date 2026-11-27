@@ -48,7 +48,7 @@ object StillCrop {
     }
 
     /** The gain map is smaller than the picture (a quarter on the Pixel): the same region at its scale, with the map's numbers kept. */
-    private fun editGainmap(map: Gainmap, source: Bitmap, x: Int, y: Int, width: Int, height: Int, flip: Matrix?): Gainmap {
+    fun editGainmap(map: Gainmap, source: Bitmap, x: Int, y: Int, width: Int, height: Int, flip: Matrix?): Gainmap {
         val contents = map.gainmapContents
         val sx = contents.width.toDouble() / source.width
         val sy = contents.height.toDouble() / source.height
@@ -86,6 +86,14 @@ object StillCrop {
         val ms = exposureNs / 1_000_000
         exif.setAttribute(ExifInterface.TAG_EXPOSURE_TIME, "$ms/1000")
         if (exif.getAttribute(ExifInterface.TAG_SHUTTER_SPEED_VALUE) != null) exif.setAttribute(ExifInterface.TAG_SHUTTER_SPEED_VALUE, "${(-log2(ms / 1000.0) * 1000).roundToLong()}/1000")
+        exif.saveAttributes()
+    }
+
+    /** The app's own photo's EXIF (LOGIKA §38): [tags] as they are, and the place where known. */
+    fun setTags(file: ParcelFileDescriptor, tags: Map<String, String>, location: Location?) {
+        val exif = ExifInterface(file.fileDescriptor)
+        for ((tag, value) in tags) exif.setAttribute(tag, value)
+        location?.let { exif.setGpsInfo(it) }
         exif.saveAttributes()
     }
 

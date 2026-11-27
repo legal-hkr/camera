@@ -7,7 +7,7 @@ import android.opengl.GLES30
  * the first three frames is the reference, every other frame is aligned to it tile by tile from the coarsest pyramid level to the finest, then each
  * 2 × 2 position's plane is merged in the frequency domain. The result is the merged planes (padded, one per position).
  */
-internal class Merge(private val gpu: Gpu, private val frames: List<RawFrame>, private val mark: (String) -> Unit) {
+internal class Merge(private val gpu: Gpu, private val frames: List<FrameMeta>, private val width: Int, private val height: Int, private val mark: (String) -> Unit) {
     /**
      * The merged series: [parities] (four padded images, one per tile parity, the four positions' planes in their channels – [Shaders.UNPLANE] adds
      * them), the reference's index, how much of the other frames the tiles used, each other frame's shifts.
@@ -16,23 +16,22 @@ internal class Merge(private val gpu: Gpu, private val frames: List<RawFrame>, p
 
     private class Level(val factor: Int, val tile: Int, val stride: Int, val radius: Int, val l2: Boolean)
 
-    private val meta = frames.first().meta
-    private val width = frames.first().width
-    private val height = frames.first().height
     private val planeWidth = width / 2
     private val planeHeight = height / 2
     private val paddedWidth = planeWidth + 2 * PAD + Math.floorMod(-(planeWidth + 2 * PAD), STRIDE)
     private val paddedHeight = planeHeight + 2 * PAD + Math.floorMod(-(planeHeight + 2 * PAD), STRIDE)
     /** Each frame's own black level and range (the prototype normalizes each DNG by its own tags). */
-    private fun range(layer: Int) = frames[layer].meta.let { it.white - it.black.average().toFloat() }
+    private fun range(layer: Int) = frames[layer].let { it.white - it.black.average().toFloat() }
 
-    fun run(raws: Texture): Result {
+    /** [chosen] hears the reference as soon as it is known (a failure after it develops that frame alone). */
+    fun run(raws: Texture, chosen: (Int) -> Unit = {}): Result {
         mark("merge: pyramids")
         val pyramids = frames.indices.map { pyramid(raws, it) }
         try {
             mark("merge: reference")
             val sharpness = (0 until minOf(3, frames.size)).map { sharpness(pyramids[it][0]) }
             val reference = sharpness.indices.maxBy { sharpness[it] }
+            chosen(reference)
             val others = frames.indices.filter { it != reference }
             mark("merge: alignment")
             val (tilesX, tilesY) = grid(paddedWidth, paddedHeight, TILE, STRIDE)
@@ -62,7 +61,7 @@ internal class Merge(private val gpu: Gpu, private val frames: List<RawFrame>, p
         val gray = gpu.texture(paddedWidth, paddedHeight, GLES30.GL_R32F)
         gpu.run(Shaders.GRAY_PAD, paddedWidth, paddedHeight, samplers = listOf(raws), images = listOf(gray)) {
             int("layer", layer)
-            vec("black", *frames[layer].meta.black)
+            vec("black", *frames[layer].black)
             float("range", range(layer))
             int("pad", PAD)
             ints("planeSize", planeWidth, planeHeight)
@@ -175,11 +174,11 @@ internal class Merge(private val gpu: Gpu, private val frames: List<RawFrame>, p
                     int("count", frames.size)
                     int("referenceLayer", reference)
                     ints("order", *IntArray(8) { others.getOrElse(it) { 0 } })
-                    vec4s("blacks", FloatArray(32) { frames.getOrNull(it / 4)?.meta?.black?.get(it % 4) ?: 0f })
+                    vec4s("blacks", FloatArray(32) { frames.getOrNull(it / 4)?.black?.get(it % 4) ?: 0f })
                     floats("ranges", FloatArray(8) { if (it < frames.size) range(it) else 1f })
                     // The reference's noise profile, as the prototype's merge takes it
-                    float("noiseS", frames[reference].meta.noiseS.toFloat())
-                    float("noiseO", frames[reference].meta.noiseO.toFloat())
+                    float("noiseS", frames[reference].noiseS.toFloat())
+                    float("noiseO", frames[reference].noiseO.toFloat())
                     float("temporal", TEMPORAL)
                     float("spatial", SPATIAL)
                 }

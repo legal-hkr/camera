@@ -28,7 +28,11 @@ class Developed(
     val merge: MergeReport?,
     /** Each finer step's time (the GPU finished at every mark), for finding where the time goes. */
     val profileMs: Map<String, Double> = emptyMap(),
-)
+) {
+    /** The series' merge failed: this is its reference frame developed alone. */
+    var fallback: Boolean = false
+        internal set
+}
 
 /**
  * An Ultra HDR gain map (ISO 21496-1 / Android's `Gainmap`): [values] one byte per pixel, [width] × [height] (a quarter of the picture), encoded as
@@ -43,60 +47,183 @@ class GainMap(val width: Int, val height: Int, val values: ByteArray, val maxSto
 class MergeReport(val reference: Int, val used: Double, val shifts: List<IntArray>, val tilesX: Int, val tilesY: Int, val sharpness: List<Double>)
 
 /**
- * Develops RAW frames on the GPU (OpenGL ES 3.1 compute) the way the computer prototype does (`develop.py`, the owner's accepted look). One GPU context
- * on a thread of its own; [develop] blocks the caller until the picture is done. Close it to free the context.
+ * Develops RAW frames on the GPU (OpenGL ES 3.1 compute) the way the computer prototype does (`develop.py`, the owner's accepted look). Two GPU contexts
+ * sharing their textures, each on a thread of its own: one takes a series' frames as they come ([series], [Series.add]), the other develops ([develop]) –
+ * so a new series' frames go to the GPU while an earlier one is still being developed. Its programs stay compiled while it lives; close it to free both.
  */
 class Developer : AutoCloseable {
     private val executor: ExecutorService = Executors.newSingleThreadExecutor { Thread(it, "processing-gpu") }
-    private val gpu: Gpu = try {
-        executor.submit(Callable { Gpu() }).get()
-    } catch (e: ExecutionException) {
-        executor.shutdown()
-        throw e.cause ?: e
+    private val uploader: ExecutorService = Executors.newSingleThreadExecutor { Thread(it, "processing-upload") }
+    private val gpu: Gpu
+    private val uploads: Gpu
+
+    init {
+        val made = try {
+            executor.submit(Callable { Gpu() }).get()
+        } catch (e: ExecutionException) {
+            executor.shutdown()
+            uploader.shutdown()
+            throw e.cause ?: e
+        }
+        gpu = made
+        uploads = try {
+            uploader.submit(Callable { Gpu(share = made) }).get()
+        } catch (e: ExecutionException) {
+            runCatching { executor.submit { made.close() }.get() }
+            executor.shutdown()
+            uploader.shutdown()
+            throw e.cause ?: e
+        }
     }
 
     /** The GPU's name, for reports. */
     val renderer: String get() = executor.submit(Callable { gpu.renderer }).get()
 
     /**
-     * [frames] (one, or a series of the same size and exposure) developed with [look]: a series is merged first (the sharpest of its first three the
-     * reference, whose metadata the development takes). [progress] hears each step's name and the GPU memory the development holds as it starts (on the
-     * GPU's thread).
+     * A series of up to [count] frames of [width] × [height] (one is developed alone, more are merged), its frames added as they come. Close it if it is
+     * never developed.
      */
-    fun develop(frames: List<RawFrame>, look: Look = Look(), progress: (step: String, gpuBytes: Long) -> Unit = { _, _ -> }): Developed = try {
-        require(frames.isNotEmpty() && frames.size <= 8) { "1 to 8 frames" }
-        require(frames.all { it.width == frames[0].width && it.height == frames[0].height }) { "frames of different sizes" }
+    fun series(count: Int, width: Int, height: Int): Series {
+        require(count in 1..8) { "1 to 8 frames" }
+        return Series(count, width, height)
+    }
+
+    /**
+     * A series on its way to the GPU: [add] uploads a frame (blocking until the GPU has its copy: the caller's buffer may go back right after), [develop]
+     * takes the frames added so far.
+     */
+    inner class Series internal constructor(val capacity: Int, val width: Int, val height: Int) : AutoCloseable {
+        internal val raws: Texture = onUploader {
+            uploads.textureArray(width, height, capacity, GLES30.GL_R16UI).also { made ->
+                // Out of memory shows only as the GL's error
+                uploads.error().takeIf { it != GLES30.GL_NO_ERROR }?.let { error ->
+                    made.close()
+                    error("frames not allocated (GL 0x${Integer.toHexString(error)})")
+                }
+            }
+        }
+        internal val metas = ArrayList<FrameMeta>()
+
+        /** Frames added so far. */
+        val frames: Int get() = synchronized(metas) { metas.size }
+
+        /** A frame's 16-bit samples ([rowStride] bytes from one row's start to the next) with its metadata; false once the series is full or closed. */
+        fun add(samples: ByteBuffer, rowStride: Int, meta: FrameMeta): Boolean {
+            val layer = synchronized(metas) { if (metas.size >= capacity || raws.closed) return false else metas.size }
+            require(rowStride >= width * 2 && rowStride % 2 == 0) { "row stride $rowStride" }
+            onUploader {
+                uploads.uploadLayer(raws, layer, GLES30.GL_RED_INTEGER, GLES30.GL_UNSIGNED_SHORT, samples, alignment = 2, rowLength = rowStride / 2)
+                // Finished here before the developing context reads it
+                uploads.finish()
+                uploads.error().takeIf { it != GLES30.GL_NO_ERROR }?.let { error("frame not uploaded (GL 0x${Integer.toHexString(it)})") }
+            }
+            synchronized(metas) { metas += meta }
+            return true
+        }
+
+        override fun close() {
+            if (!raws.closed) runCatching { onUploader { raws.close() } }
+        }
+    }
+
+    /**
+     * [series] (one frame, or a series of the same size and exposure) developed with [look]: a series is merged first (the sharpest of its first three the
+     * reference, whose metadata the development takes). [progress] hears each step's name and the GPU memory the development holds as it starts (on the
+     * GPU's thread). A series whose merge fails is developed again from its reference frame alone ([Developed.fallback]). The series is closed by it.
+     */
+    fun develop(series: Series, look: Look = Look(), progress: (step: String, gpuBytes: Long) -> Unit = { _, _ -> }): Developed = try {
         executor.submit(Callable {
+            val metas = synchronized(series.metas) { series.metas.toList() }
             try {
-                Pass(gpu, frames, look, progress).run()
-            } catch (e: Throwable) {
-                // Whatever the failed step left on the GPU goes now, not with the context
-                gpu.closeAll()
-                throw e
+                require(metas.isNotEmpty()) { "no frames" }
+                val pass = Pass(gpu, series.raws, metas, series.width, series.height, look, progress)
+                try {
+                    // A GL error (out of memory most likely) leaves a broken picture without an exception: a failure as any other
+                    pass.run().also { check(it.stats["glError"] == 0.0) { "GL error 0x${Integer.toHexString(it.stats["glError"]?.toInt() ?: 0)}" } }
+                } catch (e: Throwable) {
+                    // Whatever the failed step left on the GPU goes now, not with the context
+                    gpu.closeAll()
+                    // The merge failed while the frames are still there: the reference alone (it was the sharpest of the first three, else the first)
+                    if (metas.size == 1 || series.raws.closed) throw e
+                    val layer = pass.reference ?: 0
+                    try {
+                        Pass(gpu, series.raws, listOf(metas[layer]), series.width, series.height, look, progress, layer = layer).run().also {
+                            check(it.stats["glError"] == 0.0) { "GL error 0x${Integer.toHexString(it.stats["glError"]?.toInt() ?: 0)}" }
+                            it.fallback = true
+                        }
+                    } catch (again: Throwable) {
+                        gpu.closeAll()
+                        again.addSuppressed(e)
+                        throw again
+                    }
+                }
+            } finally {
+                series.raws.close()
             }
         }).get()
     } catch (e: ExecutionException) {
         throw e.cause ?: e
     }
 
+    /** [frames] (one, or a series of the same size) uploaded and developed: the computer comparison's way in (packed rows). */
+    fun develop(frames: List<RawFrame>, look: Look = Look(), progress: (step: String, gpuBytes: Long) -> Unit = { _, _ -> }): Developed {
+        require(frames.isNotEmpty() && frames.size <= 8) { "1 to 8 frames" }
+        require(frames.all { it.width == frames[0].width && it.height == frames[0].height }) { "frames of different sizes" }
+        val series = series(frames.size, frames[0].width, frames[0].height)
+        try {
+            for (frame in frames) {
+                val bytes = ByteBuffer.allocateDirect(frame.samples.capacity() * 2).order(ByteOrder.nativeOrder())
+                bytes.asShortBuffer().put(frame.samples.duplicate().position(0) as java.nio.ShortBuffer)
+                series.add(bytes, frame.width * 2, frame.meta)
+            }
+        } catch (e: Throwable) {
+            series.close()
+            throw e
+        }
+        return develop(series, look, progress)
+    }
+
+    private fun <T> onUploader(block: () -> T): T = try {
+        uploader.submit(Callable(block)).get()
+    } catch (e: ExecutionException) {
+        throw e.cause ?: e
+    }
+
     override fun close() {
+        runCatching { uploader.submit { uploads.close() }.get() }
         runCatching { executor.submit { gpu.close() }.get() }
+        uploader.shutdown()
         executor.shutdown()
     }
 }
 
-/** One development, step by step; every texture is closed as soon as the next step has what it needs. */
-private class Pass(private val gpu: Gpu, private val series: List<RawFrame>, private val look: Look, private val progress: (String, Long) -> Unit) {
+/**
+ * One development, step by step; every texture is closed as soon as the next step has what it needs. [raws] holds the frames as 16-bit layers (closed once
+ * merged); a single frame is its [layer].
+ */
+private class Pass(
+    private val gpu: Gpu,
+    private val raws: Texture,
+    private val series: List<FrameMeta>,
+    private val width: Int,
+    private val height: Int,
+    private val look: Look,
+    private val progress: (String, Long) -> Unit,
+    private val layer: Int = 0,
+) {
     private val times = LinkedHashMap<String, Double>()
     private val stats = LinkedHashMap<String, Double>()
-    private val width = series[0].width
-    private val height = series[0].height
 
     /** The frame whose metadata the development takes: the series' reference once it is known. */
-    private var meta = series[0].meta
+    private var meta = series[0]
     private val frames = series.size
 
+    /** The series' reference once the merge chose it. */
+    var reference: Int? = null
+        private set
+
     private var peakBytes = 0L
+    private var report: MergeReport? = null
 
     private inline fun <T> timed(name: String, block: () -> T): T {
         mark(name.removeSuffix("Ms"))
@@ -108,22 +235,18 @@ private class Pass(private val gpu: Gpu, private val series: List<RawFrame>, pri
     }
 
     fun run(): Developed {
-        // The frames as raw 16-bit layers; a series merged into one normalized mosaic, a single frame only normalized
-        val raws = gpu.textureArray(width, height, frames, GLES30.GL_R16UI)
-        var report: MergeReport? = null
-        val normalized = raws.use {
-            timed("uploadMs") { series.forEachIndexed { layer, frame -> gpu.uploadLayer(it, layer, GLES30.GL_RED_INTEGER, GLES30.GL_UNSIGNED_SHORT, frame.samples, alignment = 2) } }
-            if (frames == 1) {
-                timed("normalizeMs") { normalize(it) }
-            } else {
-                val merged = timed("mergeMs") { Merge(gpu, series, ::mark).run(it) }
-                meta = series[merged.reference].meta
-                report = MergeReport(merged.reference, merged.used, merged.shifts, merged.tiles.first, merged.tiles.second, merged.sharpness)
-                stats["reference"] = merged.reference.toDouble()
-                stats["otherFramesUsed"] = merged.used
-                it.close()
-                timed("unplaneMs") { unplane(merged.parities, merged.tiles) }
-            }
+        // A series merged into one normalized mosaic (the frames let go once merged), a single frame only normalized
+        val normalized = if (frames == 1) {
+            timed("normalizeMs") { normalize(raws) }
+        } else {
+            val merged = timed("mergeMs") { Merge(gpu, series, width, height, ::mark).run(raws) { reference = it } }
+            meta = series[merged.reference]
+            val report = MergeReport(merged.reference, merged.used, merged.shifts, merged.tiles.first, merged.tiles.second, merged.sharpness)
+            this.report = report
+            stats["reference"] = merged.reference.toDouble()
+            stats["otherFramesUsed"] = merged.used
+            raws.close()
+            timed("unplaneMs") { unplane(merged.parities, merged.tiles) }
         }
         val (cells, cellsX, cellsY) = timed("cellsMs") { cells(normalized) }
         val neutral = timed("neutralMs") { neutral(cells, cellsX, cellsY) }
@@ -217,7 +340,7 @@ private class Pass(private val gpu: Gpu, private val series: List<RawFrame>, pri
     private fun normalize(raws: Texture): Texture {
         val out = gpu.texture(width, height, GLES30.GL_R32F)
         gpu.run(Shaders.NORMALIZE, width, height, samplers = listOf(raws), images = listOf(out)) {
-            int("layer", 0)
+            int("layer", layer)
             vec("black", *meta.black)
             float("range", meta.white - meta.black.average().toFloat())
             ints("size", width, height)
@@ -414,7 +537,9 @@ private class Pass(private val gpu: Gpu, private val series: List<RawFrame>, pri
         val values = small.use { gpu.read(it, 1) }
         val black = Stats.percentile(values, blackPercentile)
         val top = Stats.percentile(values, look.stretchPercentile.toDouble())
-        val scale = (look.stretchWhite / maxOf(top - black, 1e-3)).coerceIn(1.0, look.maxStretch.toDouble())
+        // With a soft black point the top keeps most of its level: the stretch from what is left of it
+        val lowered = if (look.blackSoft > 0f) top - black * ((1 - top) / maxOf(1 - black, 1e-3)).coerceIn(0.0, 1.0).pow(look.blackSoft.toDouble()) else top - black
+        val scale = (look.stretchWhite / maxOf(lowered, 1e-3)).coerceIn(1.0, look.maxStretch.toDouble())
         stats["black"] = black
         stats["top"] = top
         stats["stretch"] = scale
@@ -422,6 +547,7 @@ private class Pass(private val gpu: Gpu, private val series: List<RawFrame>, pri
         val moments = gpu.texture(w, h, GLES30.GL_RGBA32F)
         gpu.run(Shaders.CURVE, w, h, samplers = listOf(fused), images = listOf(curve, moments)) {
             float("black", black.toFloat())
+            float("blackSoft", look.blackSoft)
             float("scale", scale.toFloat())
             float("contrast", look.contrast)
             float("midtones", look.midtones)

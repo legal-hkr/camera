@@ -296,4 +296,7 @@
     <string name="button_undo">Undo</string>
     <string name="value_shutter_fraction">1/%1$d s</string>
     <string name="value_shutter_seconds">%1$s s</string>
+    <!-- Photo's own processing: the foreground service's notification while photos are developed -->
+    <string name="channel_processing">Photo processing</string>
+    <string name="msg_processing">Developing photos</string>
 </resources>

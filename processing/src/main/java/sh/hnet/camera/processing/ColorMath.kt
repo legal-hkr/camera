@@ -84,6 +84,11 @@ internal object ColorMath {
         val toXyz = cameraToXyz(meta, neutral)
         var m = multiply(XYZ_D50_TO_SRGB, toXyz).map { it / neutral[1] }.toDoubleArray()
         look.color?.let { tint -> m = multiply(DoubleArray(9) { tint[it].toDouble() }, m) }
+        look.warmTint?.let { gains ->
+            // Warm light: toward the phone's redder, less green warmth, by how far the neutral's blue is below its red
+            val warmth = ((look.warmFrom - (neutral[2] / neutral[1]) / (neutral[0] / neutral[1])) / (look.warmFrom - look.warmFull)).coerceIn(0.0, 1.0)
+            if (warmth > 0) m = DoubleArray(9) { m[it] * (1 + warmth * (gains[it / 3] - 1)) }
+        }
         return m
     }
 }

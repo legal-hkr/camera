@@ -85,6 +85,7 @@ dependencies {
     }
 
     implementation(project(":capabilities"))
+    implementation(project(":processing"))
 
     testImplementation(libs.junit)
 }

@@ -64,8 +64,22 @@ internal object Stats {
         val blurred = blur(small, width, height, 1.5)
         val bright = maxOf(percentile(blurred, look.whitePercentile.toDouble()), 1e-5)
         val short = look.white / bright
-        val logAverage = exp(blurred.sumOf { ln(maxOf(it.toDouble(), 1e-5)) } / blurred.size)
-        val long = key / maxOf(logAverage, 1e-5)
+        // In single precision as NumPy takes the logs of a float32 picture (the darker part's threshold is a percentile of them)
+        val logs = FloatArray(blurred.size) { ln(maxOf(blurred[it], 1e-5f)) }
+        val logAverage = exp(logs.sumOf { it.toDouble() } / logs.size)
+        var long = key / maxOf(logAverage, 1e-5)
+        if (look.shadowKey > 0f) {
+            // The darker part of the scene on its own (snow and white walls made the whole-scene average bright), lifted at most shadowRatio over the highlights
+            val threshold = percentile(logs, look.shadowShare.toDouble())
+            var sum = 0.0
+            var count = 0
+            for (v in logs) if (v.toDouble() <= threshold) {
+                sum += v
+                count++
+            }
+            val darkAverage = exp(sum / maxOf(count, 1))
+            long = maxOf(long, minOf(look.shadowKey / maxOf(darkAverage, 1e-5), short * look.shadowRatio))
+        }
         return short to (long / short).coerceIn(1.0, look.maxRatio.toDouble())
     }
 
