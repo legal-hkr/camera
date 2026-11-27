@@ -23,6 +23,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.SegmentedListItem
 import androidx.compose.material3.Text
 import androidx.compose.material3.ToggleButton
+import androidx.compose.material3.ToggleButtonDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -235,6 +236,8 @@ private fun <T> ChoiceRow(
                         checked = value == chosen,
                         // Also the shown choice when the remembered value isn't offered here (60 fps from a backup): a tap writes it
                         onCheckedChange = { onChoose(value) },
+                        // One container level above the row (the owner, 27 Nov 2026): M3's unchecked surfaceContainer is the row's own color, so the choices not taken vanished into it
+                        colors = ToggleButtonDefaults.colors(containerColor = MaterialTheme.colorScheme.surfaceContainerHighest),
                         shapes = when (index) {
                             0 -> ButtonGroupDefaults.connectedLeadingButtonShapes()
                             values.lastIndex -> ButtonGroupDefaults.connectedTrailingButtonShapes()

@@ -22,8 +22,8 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.CornerBasedShape
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Badge
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -203,7 +203,8 @@ fun SettingsGroup(title: String? = null, content: SettingsGroupScope.() -> Unit)
 @Composable
 fun groupShapes(index: Int, count: Int): ListItemShapes {
     val segmented = ListItemDefaults.segmentedShapes(index, count)
-    if (count > 1) return segmented
+    // A selected or checked row keeps its segment's shape (the owner, 27 Nov 2026): M3 Expressive rounds it whole, and the group fell apart
+    if (count > 1) return segmented.copy(selectedShape = segmented.shape)
     val first = ListItemDefaults.segmentedShapes(0, 2).shape as? CornerBasedShape ?: return segmented
     val last = ListItemDefaults.segmentedShapes(1, 2).shape as? CornerBasedShape ?: return segmented
     val outer = first.copy(bottomStart = last.bottomStart, bottomEnd = last.bottomEnd)
@@ -217,21 +218,28 @@ fun groupShapes(index: Int, count: Int): ListItemShapes {
     )
 }
 
-/** Segments on surfaceContainer, so a group stands out from the page as one block. */
+/** Segments on surfaceContainer, so a group stands out from the page as one block; a selected or checked row keeps the colors of the others (the owner, 27 Nov 2026: its switch, checkbox or radio shows the state, M3 Expressive's secondaryContainer only said it again). */
 @Composable
-fun settingsRowColors(): ListItemColors =
-    ListItemDefaults.segmentedColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
+fun settingsRowColors(): ListItemColors {
+    val colors = ListItemDefaults.segmentedColors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
+    return colors.copy(
+        selectedContainerColor = colors.containerColor,
+        selectedContentColor = colors.contentColor,
+        selectedLeadingContentColor = colors.leadingContentColor,
+        selectedTrailingContentColor = colors.trailingContentColor,
+        selectedOverlineContentColor = colors.overlineContentColor,
+        selectedSupportingContentColor = colors.supportingContentColor,
+    )
+}
 
-/** The tonal leading icon box of a row; [error] for a row reporting a problem. */
+/** The leading icon of a row as M3's list "leading avatar" (the owner, 27 Nov 2026: instead of the family's 12 dp square on secondaryContainer, which hardly stood out from the row): a 40 dp circle on primaryContainer; [error] for a row reporting a problem. */
 @Composable
 fun RowIcon(@DrawableRes icon: Int, error: Boolean = false) {
-    val container = if (error) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.secondaryContainer
-    val content = if (error) MaterialTheme.colorScheme.onErrorContainer else MaterialTheme.colorScheme.onSecondaryContainer
     Box(
-        Modifier.size(40.dp).clip(RoundedCornerShape(12.dp)).background(container),
+        Modifier.size(40.dp).clip(CircleShape).background(if (error) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.primaryContainer),
         contentAlignment = Alignment.Center,
     ) {
-        Icon(painterResource(icon), contentDescription = null, tint = content)
+        Icon(painterResource(icon), contentDescription = null, tint = if (error) MaterialTheme.colorScheme.onErrorContainer else MaterialTheme.colorScheme.onPrimaryContainer)
     }
 }
 

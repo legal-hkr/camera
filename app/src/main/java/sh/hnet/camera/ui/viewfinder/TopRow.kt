@@ -39,6 +39,7 @@ import androidx.compose.material3.SliderState
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.ToggleButton
+import androidx.compose.material3.ToggleButtonDefaults
 import androidx.compose.material3.TooltipAnchorPosition
 import androidx.compose.material3.TooltipBox
 import androidx.compose.material3.TooltipDefaults
@@ -294,6 +295,8 @@ private fun <T> Toggles(values: List<T>, chosen: T, description: @Composable (T)
                     else -> ButtonGroupDefaults.connectedMiddleButtonShapes()
                 },
                 contentPadding = ButtonDefaults.ExtraSmallContentPadding,
+                // One container level above the row (the owner, 27 Nov 2026): M3's unchecked surfaceContainer is the row's own color, so the choices not taken vanished into it
+                colors = ToggleButtonDefaults.colors(containerColor = MaterialTheme.colorScheme.surfaceContainerHighest),
                 // 52 dp each, wider where the text needs it ("1080p")
                 modifier = Modifier.widthIn(min = 52.dp).height(40.dp).semantics {
                     role = Role.RadioButton
@@ -440,7 +443,8 @@ fun QuickSettings(state: PanelState, actions: PanelActions) {
             }
         }
         actions.onSettings?.let { onSettings ->
-            FilledTonalButton(onClick = onSettings, modifier = Modifier.fillMaxWidth().height(48.dp)) {
+            // 56 dp as the family's other full-width buttons (the owner, 27 Nov 2026)
+            FilledTonalButton(onClick = onSettings, modifier = Modifier.fillMaxWidth().height(56.dp)) {
                 Icon(painterResource(R.drawable.ic_settings), contentDescription = null, modifier = Modifier.size(ButtonDefaults.IconSize))
                 Spacer(Modifier.width(ButtonDefaults.IconSpacing))
                 Text(stringResource(R.string.button_panel_settings))

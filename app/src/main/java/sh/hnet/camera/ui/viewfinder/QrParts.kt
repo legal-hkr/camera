@@ -16,9 +16,7 @@ import android.provider.Settings
 import androidx.activity.compose.LocalActivity
 import androidx.annotation.DrawableRes
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
@@ -28,7 +26,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -55,6 +52,7 @@ import kotlin.math.hypot
 import sh.hnet.camera.R
 import sh.hnet.camera.camera.QrContent
 import sh.hnet.camera.capabilities.model.Point
+import sh.hnet.camera.ui.components.RowIcon
 
 /** The QR corners (SPEC §5.5): at each corner of the code two 22 dp arms along its edges, a 3.5 dp `primary` core in a 7 dp `surface` outline. */
 @Composable
@@ -110,9 +108,8 @@ fun QrSheet(content: QrContent, locked: Boolean, onDismiss: () -> Unit, onNoApp:
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = colors.surfaceContainerLow) {
         Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp).padding(bottom = 16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Box(Modifier.size(40.dp).background(colors.secondaryContainer, RoundedCornerShape(12.dp)), contentAlignment = Alignment.Center) {
-                    Icon(painterResource(qrIcon(content)), contentDescription = null, tint = colors.onSecondaryContainer)
-                }
+                // As a row's leading icon (the owner, 27 Nov 2026: M3's leading avatar)
+                RowIcon(qrIcon(content))
                 Spacer(Modifier.width(16.dp))
                 Text(
                     stringResource(
